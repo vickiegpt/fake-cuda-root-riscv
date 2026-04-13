@@ -1,0 +1,4 @@
+{
+  "cuda" : { "version" : "12.9.79" },
+  "cuda_cudart" : { "version" : "12.9.79" }
+}

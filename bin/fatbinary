@@ -1,0 +1,4 @@
+#!/bin/bash
+# Fake fatbinary - pass through or create minimal fatbin
+# Just exit successfully, clang handles fatbin creation
+exit 0

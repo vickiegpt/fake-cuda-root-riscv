@@ -1,0 +1,63 @@
+#!/bin/bash
+# Fake nvcc wrapper using clang++ with NVPTX target (hetGPU/ZLUDA flow)
+CLANG=/usr/bin/clang++-20
+CUDA_HOME=/home/ubuntu/fake_cuda
+ARCH="sm_80"
+
+# Handle --version specially
+for arg in "$@"; do
+    if [ "$arg" = "--version" ] || [ "$arg" = "-V" ]; then
+        echo "nvcc: NVIDIA (R) Cuda compiler driver"
+        echo "Copyright (c) 2005-2024 NVIDIA Corporation"
+        echo "Built on hetGPU PACC RISC-V backend"
+        echo "Cuda compilation tools, release 12.9, V12.9.79"
+        echo "Build cuda_12.9.r12.9/compiler.hetgpu_pacc_0"
+        exit 0
+    fi
+done
+
+# Filter nvcc-only flags, extract arch
+ARGS=()
+SKIP_NEXT=0
+for arg in "$@"; do
+    if [ $SKIP_NEXT -eq 1 ]; then SKIP_NEXT=0; continue; fi
+    case "$arg" in
+        # nvcc flags whose next argument should also be skipped (passed to sub-tools)
+        -gencode|-Xcompiler|-Xcudafe|-Xlinker|-Xptxas|-Xnvlink|-Xfatbin)
+            SKIP_NEXT=1 ;;
+        # nvcc flags with embedded value — extract arch
+        -gencode=*|-Xcompiler=*|-Xptxas=*)
+            arch_code=$(echo "$arg" | grep -oP "sm_\d+" | head -1)
+            [ -n "$arch_code" ] && ARCH="$arch_code"
+            ;;
+        # Architecture flags
+        --gpu-architecture=*|-arch=*)
+            arch_code=$(echo "$arg" | grep -oP "sm_\d+" | head -1)
+            [ -n "$arch_code" ] && ARCH="$arch_code"
+            ;;
+        # nvcc-specific flags clang does not understand — drop silently
+        --expt-extended-lambda|--expt-relaxed-constexpr|--use_fast_math|-use_fast_math|--keep|-compress-all|-Wnvlink*|-extra-device-vectorization|--ptx|--cubin|--fatbin|--dopt=*|--generate-dependencies-with-compile|--generate-nonsystem-deps|--dependency-output|-rdc=*|--relocatable-device-code=*|--source-in-ptx|--threads=*|-threads=*|--default-stream=*|--display-error-number|--no-cuda-version-check|-Xcuda-fatbinary=*|-Xfatbin=*)
+            ;;
+        --keep-dir=*|-keep-dir=*)
+            ;;
+        --keep-dir|-keep-dir)
+            SKIP_NEXT=1 ;;
+        # Pass everything else to clang (including __CUDA_NO_HALF_OPERATORS__ etc.)
+        *)
+            ARGS+=("$arg") ;;
+    esac
+done
+
+exec "$CLANG" \
+    -DTHRUST_IGNORE_CUB_VERSION_CHECK \
+    -D__CUDACC_VER_MAJOR__=12 \
+    -D__CUDACC_VER_MINOR__=9 \
+    -D__CUDACC_VER_BUILD__=0 \
+    -D__CUDACC_VER_BUILD_ID__=0 \
+    --cuda-gpu-arch="$ARCH" \
+    --cuda-path="$CUDA_HOME" \
+    -I"$CUDA_HOME/include" \
+    --gcc-install-dir=/usr/lib/gcc/riscv64-linux-gnu/13 \
+    -Wno-unknown-cuda-version \
+    -Wno-unknown-warning-option \
+    "${ARGS[@]}"

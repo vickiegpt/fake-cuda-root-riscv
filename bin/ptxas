@@ -1,0 +1,27 @@
+#!/bin/bash
+# Wrapper that translates clang ptxas args to hetGPU ptxas format
+PTXAS_BIN=/home/ubuntu/Documents/hetGPU_pacc/target/release/ptxas
+
+OUTPUT="" INPUT="" GPU_NAME="sm_80"
+ARGV=("$@"); i=0
+while [ $i -lt ${#ARGV[@]} ]; do
+    arg="${ARGV[$i]}"
+    case "$arg" in
+        --output-file=*) OUTPUT="${arg#--output-file=}" ;;
+        --output-file)   OUTPUT="${ARGV[$((i+1))]}"; i=$((i+1)) ;;
+        -o=*)            OUTPUT="${arg#-o=}" ;;
+        -o)              OUTPUT="${ARGV[$((i+1))]}"; i=$((i+1)) ;;
+        --gpu-name=*)    GPU_NAME="${arg#--gpu-name=}" ;;
+        --gpu-name)      GPU_NAME="${ARGV[$((i+1))]}"; i=$((i+1)) ;;
+        -arch=*)         GPU_NAME="${arg#-arch=}" ;;
+        -m64|-v|-O*|-lineinfo|--lineinfo) ;;
+        -*)              ;;
+        *.s|*.ptx)       INPUT="$arg" ;;
+    esac
+    i=$((i+1))
+done
+
+[ -z "$INPUT" ] && { echo "ptxas: no input file" >&2; exit 1; }
+[ -z "$OUTPUT" ] && OUTPUT="${INPUT%.s}.o"
+
+exec "$PTXAS_BIN" "--output=$OUTPUT" "--gpu-name=$GPU_NAME" "$INPUT"
