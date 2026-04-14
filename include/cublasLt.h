@@ -905,6 +905,17 @@ typedef enum {
   CUBLASLT_MATMUL_INNER_SHAPE_END
 } cublasLtMatmulInnerShape_t;
 
+/** Scaling mode for per-matrix scaling (added in CUDA 12.8/12.9) */
+typedef enum {
+  CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F = 0,
+  CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3 = 1,
+  CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0 = 2,
+  CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F = 3,   /* CUDA 12.9: rowwise scaling */
+  CUBLASLT_MATMUL_MATRIX_SCALE_VEC128_32F = 4,      /* CUDA 12.9: 1x128 blockwise */
+  CUBLASLT_MATMUL_MATRIX_SCALE_BLK128x128_32F = 5,  /* CUDA 12.9: 128x128 blockwise */
+  CUBLASLT_MATMUL_MATRIX_SCALE_END
+} cublasLtMatmulMatrixScale_t;
+
 /** Pointer mode to use for alpha/beta */
 typedef enum {
   /** matches CUBLAS_POINTER_MODE_HOST, pointer targets a single value host memory */
@@ -1513,6 +1524,12 @@ typedef enum {
    * int32_t *, default: NULL
    * */
   CUBLASLT_MATMUL_DESC_ATOMIC_SYNC_OUT_COUNTERS_POINTER = 30,
+
+  /** Scaling mode for matrix A (added in CUDA 12.8) */
+  CUBLASLT_MATMUL_DESC_A_SCALE_MODE = 31,
+
+  /** Scaling mode for matrix B (added in CUDA 12.8) */
+  CUBLASLT_MATMUL_DESC_B_SCALE_MODE = 32,
 } cublasLtMatmulDescAttributes_t;
 
 /** Internal. Do not use directly.
