@@ -16,19 +16,55 @@ for arg in "$@"; do
     fi
 done
 
-# Filter nvcc-only flags, extract arch
+host_query() {
+    case "$1" in
+        --version)
+            exec "$CLANG" --version
+            ;;
+        *dumpfullversion*|*dumpversion*)
+            exec /usr/bin/g++ -dumpfullversion -dumpversion
+            ;;
+    esac
+}
+
+append_xcompiler_arg() {
+    host_query "$1"
+
+    # llama.cpp joins host warning flags into one -Xcompiler argument. Split that
+    # back into clang arguments so CMake's CUDA checks and final builds agree.
+    read -r -a split_xcompiler_arg <<< "$1"
+    ARGS+=("${split_xcompiler_arg[@]}")
+}
+
+# Filter nvcc-only flags, extract arch, and pass usable host flags to clang.
 ARGS=()
-SKIP_NEXT=0
-for arg in "$@"; do
-    if [ $SKIP_NEXT -eq 1 ]; then SKIP_NEXT=0; continue; fi
+while [ "$#" -gt 0 ]; do
+    arg="$1"
+    shift
+
     case "$arg" in
-        # nvcc flags whose next argument should also be skipped (passed to sub-tools)
-        -gencode|-Xcompiler|-Xcudafe|-Xlinker|-Xptxas|-Xnvlink|-Xfatbin)
-            SKIP_NEXT=1 ;;
-        # nvcc flags with embedded value — extract arch
-        -gencode=*|-Xcompiler=*|-Xptxas=*)
+        # nvcc flags whose next argument is consumed by an nvcc sub-tool.
+        -gencode|-Xcudafe|-Xlinker|-Xptxas|-Xnvlink|-Xfatbin)
+            if [ "$#" -gt 0 ]; then
+                next_arg="$1"
+                shift
+                arch_code=$(echo "$next_arg" | grep -oP "sm_\d+" | head -1)
+                [ -n "$arch_code" ] && ARCH="$arch_code"
+            fi
+            ;;
+        -Xcompiler)
+            if [ "$#" -gt 0 ]; then
+                append_xcompiler_arg "$1"
+                shift
+            fi
+            ;;
+        # nvcc flags with embedded value.
+        -gencode=*|-Xptxas=*)
             arch_code=$(echo "$arg" | grep -oP "sm_\d+" | head -1)
             [ -n "$arch_code" ] && ARCH="$arch_code"
+            ;;
+        -Xcompiler=*)
+            append_xcompiler_arg "${arg#-Xcompiler=}"
             ;;
         # Architecture flags
         --gpu-architecture=*|-arch=*)
@@ -36,12 +72,13 @@ for arg in "$@"; do
             [ -n "$arch_code" ] && ARCH="$arch_code"
             ;;
         # nvcc-specific flags clang does not understand — drop silently
-        --expt-extended-lambda|--expt-relaxed-constexpr|--use_fast_math|-use_fast_math|--keep|-compress-all|-Wnvlink*|-extra-device-vectorization|--ptx|--cubin|--fatbin|--dopt=*|--generate-dependencies-with-compile|--generate-nonsystem-deps|--dependency-output|-rdc=*|--relocatable-device-code=*|--source-in-ptx|--threads=*|-threads=*|--default-stream=*|--display-error-number|--no-cuda-version-check|-Xcuda-fatbinary=*|-Xfatbin=*)
+        --expt-extended-lambda|--expt-relaxed-constexpr|-extended-lambda|--use_fast_math|-use_fast_math|--keep|-compress-all|-compress-mode=*|--compress-mode=*|-Wnvlink*|-extra-device-vectorization|--ptx|--cubin|--fatbin|--dopt=*|--generate-dependencies-with-compile|--generate-nonsystem-deps|--dependency-output|-rdc=*|--relocatable-device-code=*|--source-in-ptx|--threads=*|-threads=*|--default-stream=*|--display-error-number|--no-cuda-version-check|-Xcuda-fatbinary=*|-Xfatbin=*)
             ;;
         --keep-dir=*|-keep-dir=*)
             ;;
         --keep-dir|-keep-dir)
-            SKIP_NEXT=1 ;;
+            [ "$#" -gt 0 ] && shift
+            ;;
         # Pass everything else to clang (including __CUDA_NO_HALF_OPERATORS__ etc.)
         *)
             ARGS+=("$arg") ;;
@@ -50,6 +87,7 @@ done
 
 exec "$CLANG" \
     -DTHRUST_IGNORE_CUB_VERSION_CHECK \
+    -D_CG_LIMIT_INCLUDED_DEPENDENCIES \
     -D__CUDACC_VER_MAJOR__=12 \
     -D__CUDACC_VER_MINOR__=9 \
     -D__CUDACC_VER_BUILD__=0 \
