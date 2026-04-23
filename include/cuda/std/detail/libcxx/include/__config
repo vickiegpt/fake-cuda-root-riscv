@@ -1622,8 +1622,12 @@ _LIBCUDACXX_FUNC_VIS extern "C" void __sanitizer_annotate_contiguous_container(
 
 #define _LIBCUDACXX_NO_RUNTIME_LOCK_FREE
 
-// CUDA Atomics supersede host atomics in order to insert the host/device dispatch layer
-#if defined(_LIBCUDACXX_COMPILER_NVCC) || defined(_LIBCUDACXX_COMPILER_NVRTC) || defined(_LIBCUDACXX_COMPILER_PGI)
+// CUDA Atomics supersede host atomics in order to insert the host/device dispatch layer.
+// Our fake-CUDA toolchain also drives device-only compilation through clang,
+// which defines __CUDACC__ but not the NVCC/NVRTC/PGI compiler markers used
+// by upstream libcu++. Treat that path as CUDA-capable so cuda/std/atomic
+// pulls in atomic_cuda.h instead of the host-only fallback.
+#if defined(_LIBCUDACXX_COMPILER_NVCC) || defined(_LIBCUDACXX_COMPILER_NVRTC) || defined(_LIBCUDACXX_COMPILER_PGI) || defined(__CUDACC__)
 #  define _LIBCUDACXX_HAS_CUDA_ATOMIC_IMPL
 #endif
 
