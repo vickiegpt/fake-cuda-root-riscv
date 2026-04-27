@@ -361,7 +361,7 @@ __device__ __forceinline__ void LoadDirectWarpStriped(
     #pragma unroll
     for (int ITEM = 0; ITEM < ITEMS_PER_THREAD; ITEM++)
     {
-        new(&items[ITEM]) InputT(block_itr[warp_offset + tid + (ITEM * CUB_PTX_WARP_THREADS)]);
+        items[ITEM] = InputT(block_itr[warp_offset + tid + (ITEM * CUB_PTX_WARP_THREADS)]);
     }
 }
 
@@ -398,7 +398,7 @@ __device__ __forceinline__ void LoadDirectWarpStriped(
     {
         if (warp_offset + tid + (ITEM * CUB_PTX_WARP_THREADS) < valid_items)
         {
-            new(&items[ITEM]) InputT(block_itr[warp_offset + tid + (ITEM * CUB_PTX_WARP_THREADS)]);
+            items[ITEM] = InputT(block_itr[warp_offset + tid + (ITEM * CUB_PTX_WARP_THREADS)]);
         }
     }
 }
@@ -1303,4 +1303,3 @@ struct BlockLoadType
 
 
 CUB_NAMESPACE_END
-
