@@ -5,6 +5,7 @@ This is the native RISC-V `libcuda.so.1` layer for Lanxin bring-up. It opens the
 Current boundary:
 
 - Real: NVIDIA device-node open, RM client/device/subdevice alloc, RM-backed sysmem alloc/map/free for `cuMemAlloc`, device enumeration, context handles, stream/event handles, CUDA memory accounting, `cuMemcpy*`, `cuMemset*`, pointer attributes, module/link/library/kernel code-load handles, and `cuGetProcAddress`.
+- Real management surface: a minimal `libnvidia-ml.so.1` plus `bin/nvidia-smi` now report driver/CUDA version, GPU name, UUID, PCI bus ID, memory totals/free/used from the shim accounting path, PCIe link information from sysfs, and process discovery by scanning `/proc/*/fd` for NVIDIA device nodes.
 - Real RM channel scaffold: `NV01_MEMORY_VIRTUAL` GPU VA, notifier sysmem + error ctxdma, GPFIFO sysmem CPU/GPU mapping, client-allocated UserD sysmem, `BLACKWELL_CHANNEL_GPFIFO_B` alloc, bind, schedule, work-submit-token, and a GPFIFO NOP submit by writing UserD `GPPut`.
 - Real RM object/pushbuffer scaffold: compute object allocation probes `BLACKWELL_COMPUTE_B/A`, falls back through Hopper/Ampere classes, calls `NV906F_CTRL_GET_CLASS_ENGINEID`, writes a C46F-format compute `SET_OBJECT` + `NO_OPERATION` + `PIPE_NOP` pushbuffer, and submits it through the existing GPFIFO ring.
 - Real staging for the next launch layer: `cuLaunchKernel` now stages a launch packet into RM system memory mapped into the channel VASpace: module code-object bytes, a QMD-shaped descriptor, captured `CU_LAUNCH_PARAM_BUFFER_*` argument bytes, and a completion record. The GPFIFO `GPPut` update is the current doorbell.
@@ -17,6 +18,9 @@ Build:
 cd /home/ubuntu/fake_cuda
 ./nvidia_driver_shim/build.sh
 LD_LIBRARY_PATH=/home/ubuntu/fake_cuda/lib64 ./nvidia_driver_shim/build/cuda_probe
+./bin/nvidia-smi
+./bin/nvidia-smi -L
+./bin/nvidia-smi --query-gpu=index,name,uuid,pci.bus_id,memory.total,memory.used,memory.free --format=csv,noheader,nounits
 LANXIN_NVIDIA_CUDA_TRACE=1 ./nvidia_driver_shim/build/launch_probe
 LANXIN_NVIDIA_CUDA_TRACE=1 LANXIN_NVIDIA_CUDA_QMD_SUBMIT=1 ./nvidia_driver_shim/build/launch_probe
 LANXIN_NVIDIA_CUDA_TRACE=1 LANXIN_NVIDIA_CUDA_STRICT_LAUNCH=1 ./nvidia_driver_shim/build/launch_probe

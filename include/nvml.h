@@ -113,6 +113,14 @@ typedef struct {
     unsigned long long used;
 } nvmlMemory_t;
 
+typedef struct nvmlUtilization_st {
+    unsigned int gpu;
+    unsigned int memory;
+} nvmlUtilization_t;
+
+#define NVML_TEMPERATURE_GPU 0
+#define NVML_VALUE_NOT_AVAILABLE ((unsigned long long)-1)
+
 /* ===== Function declarations ===== */
 
 /* Init/shutdown */
@@ -139,6 +147,8 @@ nvmlReturn_t nvmlDeviceGetEccMode(nvmlDevice_t device, nvmlEnableState_t *curren
 nvmlReturn_t nvmlDeviceGetUUID(nvmlDevice_t device, char *uuid, unsigned int length);
 nvmlReturn_t nvmlDeviceGetFanSpeed(nvmlDevice_t device, unsigned int *speed);
 nvmlReturn_t nvmlDeviceGetTemperature(nvmlDevice_t device, unsigned int sensorType, unsigned int *temp);
+nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t device, nvmlUtilization_t *utilization);
+nvmlReturn_t nvmlDeviceGetPowerUsage(nvmlDevice_t device, unsigned int *power);
 
 /* Process info */
 nvmlReturn_t nvmlDeviceGetComputeRunningProcesses(nvmlDevice_t device, unsigned int *infoCount, nvmlProcessInfo_t *infos);
@@ -150,6 +160,8 @@ nvmlReturn_t nvmlDeviceGetNvLinkRemoteDeviceType(nvmlDevice_t device, unsigned i
 nvmlReturn_t nvmlDeviceGetNvLinkRemotePciInfo_v2(nvmlDevice_t device, unsigned int link, nvmlPciInfo_t *pci);
 
 /* System info */
+nvmlReturn_t nvmlSystemGetDriverVersion(char *version, unsigned int length);
+nvmlReturn_t nvmlSystemGetCudaDriverVersion(int *cudaDriverVersion);
 nvmlReturn_t nvmlSystemGetCudaDriverVersion_v2(int *cudaDriverVersion);
 
 /* GPU Fabric */

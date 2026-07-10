@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SMI="$ROOT/nvidia_driver_shim/build/nvidia-smi"
+
+if [[ ! -x "$SMI" || "$ROOT/nvidia_driver_shim/nvidia_smi.c" -nt "$SMI" || "$ROOT/nvidia_driver_shim/libnvidia_ml.c" -nt "$SMI" ]]; then
+  "$ROOT/nvidia_driver_shim/build.sh" >/dev/null
+fi
+
+export LD_LIBRARY_PATH="$ROOT/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$SMI" "$@"
