@@ -207,7 +207,15 @@ static void test_module_and_launch(const char *path)
              "cuOccupancyMaxPotentialBlockSizeWithFlags");
     check_ok(cuOccupancyAvailableDynamicSMemPerBlock(&dyn_smem, fn, 1, 128),
              "cuOccupancyAvailableDynamicSMemPerBlock");
-    check_ok(cuLaunchKernel(fn, 1, 1, 1, 1, 1, 1, 0, NULL, NULL, NULL), "cuLaunchKernel");
+    uint64_t arg0 = 0x1122334455667788ULL;
+    size_t arg_size = sizeof(arg0);
+    void *launch_extra[] = {
+        CU_LAUNCH_PARAM_BUFFER_POINTER, &arg0,
+        CU_LAUNCH_PARAM_BUFFER_SIZE, &arg_size,
+        CU_LAUNCH_PARAM_END,
+    };
+    check_ok(cuLaunchKernel(fn, 2, 1, 1, 32, 1, 1, 16, NULL, NULL, launch_extra),
+             "cuLaunchKernel");
     CUlaunchConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.gridDimX = 1;

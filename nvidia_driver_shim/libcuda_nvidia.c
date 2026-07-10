@@ -137,6 +137,14 @@
 #define RM_COMPUTE_SET_OBJECT 0x0000u
 #define RM_COMPUTE_NO_OPERATION 0x0100u
 #define RM_COMPUTE_PIPE_NOP 0x1a2cu
+#define LANXIN_QMD_STAGING_MAGIC 0x4c584e56514d4431ULL
+#define LANXIN_QMD_STAGING_VERSION 1u
+#define LANXIN_COMPLETION_MAGIC 0x4c584e56434d5031ULL
+#define LANXIN_COMPLETION_PENDING 1u
+#define LANXIN_COMPLETION_DONE 2u
+#define LANXIN_COMPLETION_TIMEOUT 3u
+#define LANXIN_LAUNCH_PARAM_EXTRA_BUFFER 1u
+#define LANXIN_LAUNCH_PARAM_POINTER_ARRAY 2u
 
 typedef uint8_t rm_bool;
 typedef uint32_t rm_u32;
@@ -371,6 +379,66 @@ typedef struct {
     rm_u32 engineID;
 } rm_get_class_engine_id_params_t;
 
+struct rm_stage_buffer {
+    rm_handle memory;
+    rm_p64 linear;
+    rm_u64 gpu_va;
+    void *cpu;
+    size_t size;
+    int map_fd;
+};
+
+struct lanxin_qmd_staging_desc {
+    rm_u64 magic;
+    rm_u32 version;
+    rm_u32 size;
+    rm_u64 launch_id;
+    rm_u32 grid[3];
+    rm_u32 block[3];
+    rm_u32 shared_mem_bytes;
+    rm_u32 flags;
+    rm_u64 code_va;
+    rm_u64 code_bytes;
+    rm_u64 qmd_va;
+    rm_u64 params_va;
+    rm_u64 params_bytes;
+    rm_u64 completion_va;
+    rm_u64 module_image_bytes;
+    rm_u64 module_image_hash;
+    rm_u64 function_name_hash;
+    rm_u32 compute_class;
+    rm_u32 class_engine_id;
+    rm_u32 param_flags;
+    rm_u32 reserved0;
+    rm_u64 reserved[8];
+};
+
+struct lanxin_launch_completion {
+    rm_u64 magic;
+    rm_u64 launch_id;
+    rm_u32 status;
+    rm_u32 reserved0;
+    rm_u64 gpfifo_put;
+    rm_u64 timestamp_ns;
+    rm_u64 reserved[4];
+};
+
+struct launch_staging {
+    struct rm_stage_buffer qmd;
+    struct rm_stage_buffer params;
+    struct rm_stage_buffer completion;
+    unsigned long long launch_id;
+};
+
+struct launch_request {
+    rm_u32 grid[3];
+    rm_u32 block[3];
+    rm_u32 shared_mem_bytes;
+    const void *params;
+    size_t params_size;
+    rm_u32 param_flags;
+};
+
 struct CUctx_st {
     uint32_t magic;
     CUdevice dev;
@@ -400,6 +468,9 @@ struct CUmod_st {
     const void *image;
     void *owned_image;
     size_t image_size;
+    struct rm_stage_buffer code;
+    size_t staged_code_bytes;
+    rm_u64 image_hash;
     struct CUfunc_st *functions;
     struct module_global *globals;
     struct CUmod_st *next;
@@ -409,6 +480,8 @@ struct CUfunc_st {
     uint32_t magic;
     char *name;
     CUmodule module;
+    rm_u64 name_hash;
+    struct launch_staging launch;
     struct CUfunc_st *next;
 };
 
@@ -530,6 +603,9 @@ static __thread CUcontext tls_current_ctx;
 static __thread CUcontext tls_ctx_stack[32];
 static __thread int tls_ctx_depth;
 
+static bool valid_module(CUmodule module);
+static bool valid_function(CUfunction function);
+
 static int env_enabled(const char *name)
 {
     const char *value = getenv(name);
@@ -568,6 +644,31 @@ static int env_disabled(const char *name)
 {
     const char *value = getenv(name);
     return value != NULL && strcmp(value, "0") == 0;
+}
+
+static rm_u64 fnv1a64_bytes(const void *data, size_t size)
+{
+    const unsigned char *bytes = (const unsigned char *)data;
+    rm_u64 hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < size; i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static rm_u64 fnv1a64_str(const char *text)
+{
+    return text != NULL ? fnv1a64_bytes(text, strlen(text)) : 0;
+}
+
+static rm_u64 now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (rm_u64)ts.tv_sec * 1000000000ULL + (rm_u64)ts.tv_nsec;
 }
 
 static unsigned long rm_iowr(unsigned int nr, size_t size)
@@ -1130,6 +1231,210 @@ static int rm_compute_init_locked(void)
     return -1;
 }
 
+static void rm_stage_release_locked(struct rm_stage_buffer *buf)
+{
+    if (buf == NULL || buf->memory == 0) {
+        return;
+    }
+    rm_unmap_dma_locked(g.rm_vaspace, buf->memory, buf->gpu_va, buf->size);
+    rm_unmap_cpu_locked(buf->memory, buf->linear, buf->cpu, buf->size);
+    rm_free_object_locked(g.rm_client, g.rm_device, buf->memory);
+    if (buf->map_fd > 0) {
+        close(buf->map_fd);
+    }
+    memset(buf, 0, sizeof(*buf));
+}
+
+static int rm_stage_alloc_locked(struct rm_stage_buffer *buf, size_t size, const char *label)
+{
+    if (buf == NULL) {
+        return -1;
+    }
+    size_t mapped_size = page_align_size(size);
+    if (buf->memory != 0 && buf->cpu != NULL && buf->gpu_va != 0 && buf->size >= mapped_size) {
+        memset(buf->cpu, 0, buf->size);
+        return 0;
+    }
+    rm_stage_release_locked(buf);
+    if (rm_channel_init_locked() != 0) {
+        return -1;
+    }
+    int map_fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
+    if (map_fd < 0) {
+        tracef("%s map fd open failed errno=%d", label, errno);
+        return -1;
+    }
+
+    rm_u32 flags = RM_NVOS02_FLAGS_PHYSICALITY_NONCONTIGUOUS |
+                   RM_NVOS02_FLAGS_LOCATION_PCI |
+                   RM_NVOS02_FLAGS_COHERENCY_WRITE_COMBINE |
+                   RM_NVOS02_FLAGS_GPU_CACHEABLE_YES |
+                   RM_NVOS02_FLAGS_MAPPING_NO_MAP;
+    buf->memory = g.next_rm_handle++;
+    buf->size = mapped_size;
+    buf->map_fd = map_fd;
+    if (rm_alloc_memory_locked(g.gpu_fd, buf->map_fd, &buf->memory,
+                               RM_NV01_MEMORY_SYSTEM, flags, mapped_size, label) != 0 ||
+        rm_map_cpu_locked(buf->map_fd, buf->memory, mapped_size,
+                          &buf->linear, &buf->cpu, label) != 0 ||
+        rm_map_dma_locked(g.rm_vaspace, buf->memory, mapped_size,
+                          &buf->gpu_va, label) != 0) {
+        rm_stage_release_locked(buf);
+        return -1;
+    }
+    memset(buf->cpu, 0, mapped_size);
+    tracef("%s staged handle=0x%x cpu=%p gpu_va=0x%llx bytes=%zu",
+           label, buf->memory, buf->cpu, (unsigned long long)buf->gpu_va, mapped_size);
+    return 0;
+}
+
+static size_t launch_code_stage_limit(void)
+{
+    unsigned long long limit = env_ull("LANXIN_NVIDIA_CUDA_CODE_STAGE_MAX_BYTES", 16ULL * 1024ULL * 1024ULL);
+    if (limit == 0) {
+        limit = 1;
+    }
+    return (size_t)limit;
+}
+
+static int rm_stage_module_code_locked(CUmodule module)
+{
+    if (!valid_module(module)) {
+        return -1;
+    }
+    if (module->image_hash == 0 && module->image != NULL && module->image_size != 0) {
+        module->image_hash = fnv1a64_bytes(module->image, module->image_size);
+    } else if (module->image_hash == 0) {
+        module->image_hash = fnv1a64_str(module->name);
+    }
+    size_t copy_bytes = module->image != NULL ? module->image_size : 0;
+    size_t limit = launch_code_stage_limit();
+    if (copy_bytes > limit) {
+        copy_bytes = limit;
+    }
+    if (copy_bytes == 0) {
+        copy_bytes = 64;
+    }
+    if (rm_stage_alloc_locked(&module->code, copy_bytes, "rm_stage_code_object") != 0) {
+        return -1;
+    }
+    if (module->image != NULL && module->image_size != 0) {
+        memcpy(module->code.cpu, module->image, copy_bytes);
+    } else {
+        snprintf((char *)module->code.cpu, module->code.size, "lanxin fake cuda code object: %s",
+                 module->name != NULL ? module->name : "<module>");
+    }
+    module->staged_code_bytes = copy_bytes;
+    __sync_synchronize();
+    tracef("RM staged code object module=%s image_bytes=%zu staged=%zu hash=0x%016llx gpu_va=0x%llx",
+           module->name != NULL ? module->name : "<module>", module->image_size, module->staged_code_bytes,
+           (unsigned long long)module->image_hash, (unsigned long long)module->code.gpu_va);
+    return 0;
+}
+
+static int rm_prepare_launch_packet_locked(CUfunction f, const struct launch_request *req)
+{
+    if (!valid_function(f) || req == NULL || rm_stage_module_code_locked(f->module) != 0) {
+        return -1;
+    }
+    struct launch_staging *launch = &f->launch;
+    size_t qmd_bytes = page_align_size(sizeof(struct lanxin_qmd_staging_desc));
+    size_t params_bytes = req->params_size != 0 ? req->params_size : 64;
+    size_t completion_bytes = page_align_size(sizeof(struct lanxin_launch_completion));
+    if (rm_stage_alloc_locked(&launch->qmd, qmd_bytes, "rm_stage_qmd") != 0 ||
+        rm_stage_alloc_locked(&launch->params, params_bytes, "rm_stage_params") != 0 ||
+        rm_stage_alloc_locked(&launch->completion, completion_bytes, "rm_stage_completion") != 0) {
+        return -1;
+    }
+
+    if (req->params != NULL && req->params_size != 0) {
+        memcpy(launch->params.cpu, req->params, req->params_size);
+    }
+
+    launch->launch_id = g.next_id++;
+    struct lanxin_launch_completion *completion = (struct lanxin_launch_completion *)launch->completion.cpu;
+    memset(completion, 0, sizeof(*completion));
+    completion->magic = LANXIN_COMPLETION_MAGIC;
+    completion->launch_id = launch->launch_id;
+    completion->status = LANXIN_COMPLETION_PENDING;
+    completion->timestamp_ns = now_ns();
+
+    struct lanxin_qmd_staging_desc *qmd = (struct lanxin_qmd_staging_desc *)launch->qmd.cpu;
+    memset(qmd, 0, sizeof(*qmd));
+    qmd->magic = LANXIN_QMD_STAGING_MAGIC;
+    qmd->version = LANXIN_QMD_STAGING_VERSION;
+    qmd->size = sizeof(*qmd);
+    qmd->launch_id = launch->launch_id;
+    qmd->grid[0] = req->grid[0];
+    qmd->grid[1] = req->grid[1];
+    qmd->grid[2] = req->grid[2];
+    qmd->block[0] = req->block[0];
+    qmd->block[1] = req->block[1];
+    qmd->block[2] = req->block[2];
+    qmd->shared_mem_bytes = req->shared_mem_bytes;
+    qmd->code_va = f->module->code.gpu_va;
+    qmd->code_bytes = f->module->staged_code_bytes;
+    qmd->qmd_va = launch->qmd.gpu_va;
+    qmd->params_va = launch->params.gpu_va;
+    qmd->params_bytes = req->params_size;
+    qmd->completion_va = launch->completion.gpu_va;
+    qmd->module_image_bytes = f->module->image_size;
+    qmd->module_image_hash = f->module->image_hash;
+    qmd->function_name_hash = f->name_hash != 0 ? f->name_hash : fnv1a64_str(f->name);
+    qmd->compute_class = g.rm_compute_class;
+    qmd->class_engine_id = g.rm_compute_class_engine_id;
+    qmd->param_flags = req->param_flags;
+    __sync_synchronize();
+
+    tracef("RM staged QMD launch_id=%llu fn=%s qmd=0x%llx code=0x%llx params=0x%llx/%zu completion=0x%llx grid=%ux%ux%u block=%ux%ux%u",
+           launch->launch_id, f->name != NULL ? f->name : "<unnamed>",
+           (unsigned long long)launch->qmd.gpu_va,
+           (unsigned long long)f->module->code.gpu_va,
+           (unsigned long long)launch->params.gpu_va, req->params_size,
+           (unsigned long long)launch->completion.gpu_va,
+           req->grid[0], req->grid[1], req->grid[2],
+           req->block[0], req->block[1], req->block[2]);
+    return 0;
+}
+
+static int rm_poll_launch_completion_locked(CUfunction f)
+{
+    if (!valid_function(f) || f->launch.completion.cpu == NULL) {
+        return -1;
+    }
+    unsigned long long timeout_ms = env_ull("LANXIN_NVIDIA_CUDA_COMPLETION_TIMEOUT_MS", 10);
+    struct lanxin_launch_completion *completion = (struct lanxin_launch_completion *)f->launch.completion.cpu;
+    rm_u64 start = now_ns();
+    while (completion->magic == LANXIN_COMPLETION_MAGIC &&
+           completion->launch_id == f->launch.launch_id &&
+           completion->status == LANXIN_COMPLETION_PENDING) {
+        rm_u64 elapsed_ns = now_ns() - start;
+        if (elapsed_ns >= timeout_ms * 1000000ULL) {
+            completion->status = LANXIN_COMPLETION_TIMEOUT;
+            tracef("RM launch completion timeout launch_id=%llu status=%u put=%llu",
+                   f->launch.launch_id, completion->status,
+                   (unsigned long long)completion->gpfifo_put);
+            return -1;
+        }
+        usleep(1000);
+    }
+    tracef("RM launch completion observed launch_id=%llu status=%u put=%llu",
+           f->launch.launch_id, completion->status,
+           (unsigned long long)completion->gpfifo_put);
+    return completion->status == LANXIN_COMPLETION_DONE ? 0 : -1;
+}
+
+static void rm_release_function_launch_locked(CUfunction f)
+{
+    if (f == NULL) {
+        return;
+    }
+    rm_stage_release_locked(&f->launch.qmd);
+    rm_stage_release_locked(&f->launch.params);
+    rm_stage_release_locked(&f->launch.completion);
+    f->launch.launch_id = 0;
+}
+
 static int rm_submit_noop_locked(void)
 {
     if (rm_channel_init_locked() != 0) {
@@ -1149,10 +1454,31 @@ static int rm_submit_noop_locked(void)
     return 0;
 }
 
-static int rm_submit_compute_set_object_locked(void)
+static rm_u32 env_u32(const char *name, rm_u32 fallback)
+{
+    unsigned long long value = env_ull(name, fallback);
+    if (value > 0xffffffffULL) {
+        return fallback;
+    }
+    return (rm_u32)value;
+}
+
+static int rm_submit_compute_set_object_locked(CUfunction f, const struct launch_request *req, bool qmd_requested)
 {
     if (rm_compute_init_locked() != 0) {
         return -1;
+    }
+
+    bool qmd_stage = !env_disabled("LANXIN_NVIDIA_CUDA_QMD_STAGE");
+    bool qmd_ready = false;
+    if (qmd_stage && valid_function(f) && req != NULL) {
+        if (rm_prepare_launch_packet_locked(f, req) == 0) {
+            qmd_ready = true;
+        } else if (qmd_requested) {
+            return -1;
+        } else {
+            tracef("RM QMD staging failed; falling back to SET_OBJECT-only PB");
+        }
     }
 
     volatile rm_u32 *gp_words = (volatile rm_u32 *)g.rm_gpfifo_cpu;
@@ -1160,25 +1486,51 @@ static int rm_submit_compute_set_object_locked(void)
     rm_u32 entry = g.rm_gpfifo_put % 32U;
     rm_u32 pb_offset = 0x200u + (entry * 0x40u);
     volatile rm_u32 *pb_words = (volatile rm_u32 *)((volatile uint8_t *)g.rm_gpfifo_cpu + pb_offset);
+    rm_u32 pb_count = 0;
 
-    pb_words[0] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE, RM_COMPUTE_SET_OBJECT,
-                                        1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
-    pb_words[1] = g.rm_compute_class_engine_id;
-    pb_words[2] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE, RM_COMPUTE_NO_OPERATION,
-                                        1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
-    pb_words[3] = 0;
-    pb_words[4] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE, RM_COMPUTE_PIPE_NOP,
-                                        1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
-    pb_words[5] = 0;
+    pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE, RM_COMPUTE_SET_OBJECT,
+                                                 1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+    pb_words[pb_count++] = g.rm_compute_class_engine_id;
 
-    rm_write_gpfifo_entry(gp_words, entry, g.rm_gpfifo_va + pb_offset, 6u * sizeof(rm_u32));
+    rm_u32 qmd_method_lo = env_u32("LANXIN_NVIDIA_CUDA_QMD_METHOD_LO", 0);
+    rm_u32 qmd_method_hi = env_u32("LANXIN_NVIDIA_CUDA_QMD_METHOD_HI", 0);
+    if (qmd_requested && qmd_ready && qmd_method_lo != 0 && qmd_method_hi != 0) {
+        rm_u64 qmd_va = f->launch.qmd.gpu_va;
+        pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE, qmd_method_lo,
+                                                     1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+        pb_words[pb_count++] = (rm_u32)(qmd_va & 0xffffffffu);
+        pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE, qmd_method_hi,
+                                                     1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+        pb_words[pb_count++] = (rm_u32)(qmd_va >> 32);
+        tracef("RM experimental QMD PB uses method_lo=0x%x method_hi=0x%x qmd_va=0x%llx",
+               qmd_method_lo, qmd_method_hi, (unsigned long long)qmd_va);
+    } else if (qmd_requested) {
+        tracef("RM QMD submit requested but no verified method offsets are configured; staged QMD only");
+    }
+
+    pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE, RM_COMPUTE_NO_OPERATION,
+                                                 1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+    pb_words[pb_count++] = 0;
+    pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE, RM_COMPUTE_PIPE_NOP,
+                                                 1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+    pb_words[pb_count++] = 0;
+
+    rm_write_gpfifo_entry(gp_words, entry, g.rm_gpfifo_va + pb_offset, pb_count * sizeof(rm_u32));
     __sync_synchronize();
     g.rm_gpfifo_put = (entry + 1U) % 32U;
     control[0x8c / 4] = g.rm_gpfifo_put;
+    if (qmd_ready && f->launch.completion.cpu != NULL) {
+        struct lanxin_launch_completion *completion = (struct lanxin_launch_completion *)f->launch.completion.cpu;
+        completion->gpfifo_put = g.rm_gpfifo_put;
+    }
     __sync_synchronize();
-    tracef("RM submitted compute SET_OBJECT PB channel=0x%x compute=0x%x class=0x%x put=%u pb=0x%llx token=0x%08x",
+    tracef("RM submitted compute PB channel=0x%x compute=0x%x class=0x%x put=%u words=%u pb=0x%llx token=0x%08x qmd_ready=%d qmd_requested=%d",
            g.rm_channel, g.rm_compute, g.rm_compute_class, g.rm_gpfifo_put,
-           (unsigned long long)(g.rm_gpfifo_va + pb_offset), g.rm_work_submit_token);
+           pb_count, (unsigned long long)(g.rm_gpfifo_va + pb_offset),
+           g.rm_work_submit_token, qmd_ready ? 1 : 0, qmd_requested ? 1 : 0);
+    if (qmd_ready && env_enabled("LANXIN_NVIDIA_CUDA_WAIT_COMPLETION")) {
+        return rm_poll_launch_completion_locked(f);
+    }
     return 0;
 }
 
@@ -2872,6 +3224,7 @@ static CUmodule make_module(const char *name, const void *image, size_t image_si
     module->name = strdup(name != NULL ? name : "<memory>");
     module->image = image;
     module->image_size = image_size;
+    module->image_hash = image != NULL && image_size != 0 ? fnv1a64_bytes(image, image_size) : fnv1a64_str(name);
     if (copy_image && image != NULL && image_size != 0) {
         module->owned_image = malloc(image_size + 1U);
         if (module->owned_image == NULL) {
@@ -3143,6 +3496,10 @@ CUresult CUDAAPI cuModuleUnload(CUmodule hmod)
         }
         prev = &(*prev)->next;
     }
+    for (struct CUfunc_st *fn = hmod->functions; fn != NULL; fn = fn->next) {
+        rm_release_function_launch_locked(fn);
+    }
+    rm_stage_release_locked(&hmod->code);
     pthread_mutex_unlock(&g_lock);
     struct CUfunc_st *fn = hmod->functions;
     while (fn != NULL) {
@@ -3183,6 +3540,7 @@ CUresult CUDAAPI cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const cha
     }
     fn->magic = HANDLE_MAGIC_FUNC;
     fn->name = strdup(name);
+    fn->name_hash = fnv1a64_str(name);
     fn->module = hmod;
     fn->next = hmod->functions;
     hmod->functions = fn;
@@ -3510,27 +3868,101 @@ CUresult CUDAAPI cuKernelGetParamInfo(CUkernel kernel, size_t paramIndex, size_t
     return CUDA_SUCCESS;
 }
 
+static CUresult capture_launch_params(void **kernelParams, void **extra,
+                                      void **params_out, size_t *params_size_out, rm_u32 *flags_out)
+{
+    if (params_out == NULL || params_size_out == NULL || flags_out == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *params_out = NULL;
+    *params_size_out = 0;
+    *flags_out = 0;
+    size_t max_bytes = (size_t)env_ull("LANXIN_NVIDIA_CUDA_PARAM_STAGE_MAX_BYTES", 64ULL * 1024ULL);
+
+    if (extra != NULL) {
+        void *buffer = NULL;
+        size_t buffer_size = 0;
+        for (size_t i = 0; i < 128 && extra[i] != NULL && extra[i] != CU_LAUNCH_PARAM_END; i += 2) {
+            void *key = extra[i];
+            void *value = extra[i + 1];
+            if (key == CU_LAUNCH_PARAM_BUFFER_POINTER) {
+                buffer = value;
+            } else if (key == CU_LAUNCH_PARAM_BUFFER_SIZE && value != NULL) {
+                buffer_size = *(size_t *)value;
+            }
+        }
+        if (buffer != NULL && buffer_size != 0) {
+            if (buffer_size > max_bytes) {
+                buffer_size = max_bytes;
+            }
+            void *copy = malloc(buffer_size);
+            if (copy == NULL) {
+                return CUDA_ERROR_OUT_OF_MEMORY;
+            }
+            memcpy(copy, buffer, buffer_size);
+            *params_out = copy;
+            *params_size_out = buffer_size;
+            *flags_out = LANXIN_LAUNCH_PARAM_EXTRA_BUFFER;
+            return CUDA_SUCCESS;
+        }
+    }
+
+    unsigned long long param_ptr_count = env_ull("LANXIN_NVIDIA_CUDA_KERNEL_PARAM_PTRS", 0);
+    if (kernelParams != NULL && param_ptr_count != 0) {
+        if (param_ptr_count > 256) {
+            param_ptr_count = 256;
+        }
+        size_t bytes = (size_t)param_ptr_count * sizeof(uintptr_t);
+        if (bytes > max_bytes) {
+            bytes = max_bytes - (max_bytes % sizeof(uintptr_t));
+        }
+        if (bytes != 0) {
+            void *copy = calloc(1, bytes);
+            if (copy == NULL) {
+                return CUDA_ERROR_OUT_OF_MEMORY;
+            }
+            uintptr_t *values = (uintptr_t *)copy;
+            size_t n = bytes / sizeof(uintptr_t);
+            for (size_t i = 0; i < n; i++) {
+                values[i] = (uintptr_t)kernelParams[i];
+            }
+            *params_out = copy;
+            *params_size_out = bytes;
+            *flags_out = LANXIN_LAUNCH_PARAM_POINTER_ARRAY;
+            return CUDA_SUCCESS;
+        }
+    }
+    return CUDA_SUCCESS;
+}
+
 CUresult CUDAAPI cuLaunchKernel(CUfunction f,
                                 unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                                 unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
                                 unsigned int sharedMemBytes, CUstream hStream,
                                 void **kernelParams, void **extra)
 {
-    (void)gridDimX;
-    (void)gridDimY;
-    (void)gridDimZ;
-    (void)blockDimX;
-    (void)blockDimY;
-    (void)blockDimZ;
-    (void)sharedMemBytes;
-    (void)kernelParams;
-    (void)extra;
     if (!valid_function(f) || !valid_stream(hStream)) {
         return CUDA_ERROR_INVALID_HANDLE;
     }
+    void *param_copy = NULL;
+    size_t param_size = 0;
+    rm_u32 param_flags = 0;
+    CUresult param_result = capture_launch_params(kernelParams, extra, &param_copy, &param_size, &param_flags);
+    if (param_result != CUDA_SUCCESS) {
+        return param_result;
+    }
+    struct launch_request req = {
+        .grid = {gridDimX, gridDimY, gridDimZ},
+        .block = {blockDimX, blockDimY, blockDimZ},
+        .shared_mem_bytes = sharedMemBytes,
+        .params = param_copy,
+        .params_size = param_size,
+        .param_flags = param_flags,
+    };
     bool noop_success = env_enabled("LANXIN_NVIDIA_CUDA_NOOP_KERNEL");
     bool rm_submit_only = env_enabled("LANXIN_NVIDIA_CUDA_RM_SUBMIT");
     bool rm_pb_submit = env_enabled("LANXIN_NVIDIA_CUDA_PB_SUBMIT");
+    bool rm_qmd_submit = env_enabled("LANXIN_NVIDIA_CUDA_QMD_SUBMIT");
     bool strict_launch = env_enabled("LANXIN_NVIDIA_CUDA_STRICT_LAUNCH");
     bool default_pb_submit = !noop_success && !rm_submit_only && !env_disabled("LANXIN_NVIDIA_CUDA_PB_SUBMIT");
     pthread_mutex_lock(&g_lock);
@@ -3539,18 +3971,20 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f,
     if (init == CUDA_SUCCESS) {
         if (noop_success || rm_submit_only) {
             submit_rc = rm_submit_noop_locked();
-        } else if (rm_pb_submit || default_pb_submit) {
-            submit_rc = rm_submit_compute_set_object_locked();
+        } else if (rm_pb_submit || rm_qmd_submit || default_pb_submit) {
+            submit_rc = rm_submit_compute_set_object_locked(f, &req, rm_qmd_submit);
             if (submit_rc != 0) {
                 submit_rc = rm_submit_noop_locked();
             }
         }
     }
     pthread_mutex_unlock(&g_lock);
-    tracef("RM cuLaunchKernel scaffold(%s) submit_rc=%d noop_success=%d submit_only=%d pb_submit=%d default_pb=%d strict=%d",
+    tracef("RM cuLaunchKernel scaffold(%s) submit_rc=%d noop_success=%d submit_only=%d pb_submit=%d qmd_submit=%d default_pb=%d strict=%d params=%zu flags=0x%x",
            f->name != NULL ? f->name : "<unnamed>", submit_rc,
            noop_success ? 1 : 0, rm_submit_only ? 1 : 0, rm_pb_submit ? 1 : 0,
-           default_pb_submit ? 1 : 0, strict_launch ? 1 : 0);
+           rm_qmd_submit ? 1 : 0, default_pb_submit ? 1 : 0, strict_launch ? 1 : 0,
+           param_size, param_flags);
+    free(param_copy);
     if (submit_rc != 0) {
         if (noop_success) {
             return CUDA_ERROR_UNKNOWN;
@@ -3568,8 +4002,14 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f,
 
 CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f, void **kernelParams, void **extra)
 {
-    (void)config;
-    return cuLaunchKernel(f, 1, 1, 1, 1, 1, 1, 0, NULL, kernelParams, extra);
+    if (config == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    return cuLaunchKernel(f,
+                          config->gridDimX, config->gridDimY, config->gridDimZ,
+                          config->blockDimX, config->blockDimY, config->blockDimZ,
+                          config->sharedMemBytes, config->hStream,
+                          kernelParams, extra);
 }
 
 CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize)

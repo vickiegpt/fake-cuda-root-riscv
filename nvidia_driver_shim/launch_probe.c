@@ -36,10 +36,12 @@ int main(void)
     result = cuLaunchKernel(fn, 1, 1, 1, 1, 1, 1, 0, NULL, NULL, NULL);
     const char *name = NULL;
     cuGetErrorName(result, &name);
-    printf("launch_result=%s noop_env=%s pb_env=%s strict_env=%s rm_submit_env=%s\n",
+    printf("launch_result=%s noop_env=%s pb_env=%s qmd_env=%s wait_env=%s strict_env=%s rm_submit_env=%s\n",
            name ? name : "?",
            getenv("LANXIN_NVIDIA_CUDA_NOOP_KERNEL") ? "set" : "unset",
            getenv("LANXIN_NVIDIA_CUDA_PB_SUBMIT") ? "set" : "unset",
+           getenv("LANXIN_NVIDIA_CUDA_QMD_SUBMIT") ? "set" : "unset",
+           getenv("LANXIN_NVIDIA_CUDA_WAIT_COMPLETION") ? "set" : "unset",
            getenv("LANXIN_NVIDIA_CUDA_STRICT_LAUNCH") ? "set" : "unset",
            getenv("LANXIN_NVIDIA_CUDA_RM_SUBMIT") ? "set" : "unset");
 
