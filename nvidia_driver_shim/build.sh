@@ -24,6 +24,11 @@ mkdir -p "$ROOT/lib64" "$ROOT/nvidia_driver_shim/build"
   "$ROOT/nvidia_driver_shim/launch_probe.c" \
   -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" -l:libcuda_nvidia.so.1
 
+"$CC" -O2 -g -Wall -Wextra -I"$ROOT/include" \
+  -o "$ROOT/nvidia_driver_shim/build/api_probe" \
+  "$ROOT/nvidia_driver_shim/api_probe.c" \
+  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" -l:libcuda_nvidia.so.1
+
 "$CC" -O2 -g -Wall -Wextra \
   -o "$ROOT/nvidia_driver_shim/build/rm_probe" \
   "$ROOT/nvidia_driver_shim/rm_probe.c"
@@ -35,5 +40,6 @@ mkdir -p "$ROOT/lib64" "$ROOT/nvidia_driver_shim/build"
 echo "built $ROOT/lib64/libcuda_nvidia.so.1"
 echo "built $ROOT/nvidia_driver_shim/build/cuda_probe"
 echo "built $ROOT/nvidia_driver_shim/build/launch_probe"
+echo "built $ROOT/nvidia_driver_shim/build/api_probe"
 echo "built $ROOT/nvidia_driver_shim/build/rm_probe"
 echo "built $ROOT/nvidia_driver_shim/build/channel_probe"

@@ -25,6 +25,9 @@
 #undef cuDevicePrimaryCtxReset
 #undef cuDevicePrimaryCtxSetFlags
 #undef cuModuleGetGlobal
+#undef cuLinkCreate
+#undef cuLinkAddData
+#undef cuLinkAddFile
 #undef cuMemGetInfo
 #undef cuMemAlloc
 #undef cuMemAllocPitch
@@ -76,6 +79,9 @@
 #define HANDLE_MAGIC_EVENT 0x4c584556u
 #define HANDLE_MAGIC_MODULE 0x4c584d4fu
 #define HANDLE_MAGIC_FUNC 0x4c58464eu
+#define HANDLE_MAGIC_LINK 0x4c584c4eu
+#define HANDLE_MAGIC_LIBRARY 0x4c584c49u
+#define HANDLE_MAGIC_KERNEL 0x4c584b45u
 
 #define RM_IOCTL_MAGIC 'F'
 #define RM_IOCTL_BASE 200
@@ -392,7 +398,10 @@ struct CUmod_st {
     uint32_t magic;
     char *name;
     const void *image;
+    void *owned_image;
+    size_t image_size;
     struct CUfunc_st *functions;
+    struct module_global *globals;
     struct CUmod_st *next;
 };
 
@@ -401,6 +410,34 @@ struct CUfunc_st {
     char *name;
     CUmodule module;
     struct CUfunc_st *next;
+};
+
+struct CUlinkState_st {
+    uint32_t magic;
+    unsigned int input_count;
+    void *image;
+    size_t image_size;
+};
+
+struct CUlib_st {
+    uint32_t magic;
+    CUmodule module;
+    struct CUkern_st *kernels;
+};
+
+struct CUkern_st {
+    uint32_t magic;
+    char *name;
+    CUlibrary library;
+    CUfunction function;
+    struct CUkern_st *next;
+};
+
+struct module_global {
+    char *name;
+    CUdeviceptr dptr;
+    size_t bytes;
+    struct module_global *next;
 };
 
 struct allocation {
@@ -1426,6 +1463,21 @@ static bool valid_function(CUfunction function)
     return function != NULL && function->magic == HANDLE_MAGIC_FUNC;
 }
 
+static bool valid_link_state(CUlinkState state)
+{
+    return state != NULL && state->magic == HANDLE_MAGIC_LINK;
+}
+
+static bool valid_library(CUlibrary library)
+{
+    return library != NULL && library->magic == HANDLE_MAGIC_LIBRARY;
+}
+
+static bool valid_kernel(CUkernel kernel)
+{
+    return kernel != NULL && kernel->magic == HANDLE_MAGIC_KERNEL;
+}
+
 static CUcontext current_or_primary_locked(void)
 {
     if (valid_ctx(tls_current_ctx)) {
@@ -1435,6 +1487,40 @@ static CUcontext current_or_primary_locked(void)
         g.primary_ctx = make_context_locked(0, g.primary_flags, true);
     }
     return g.primary_ctx;
+}
+
+static char *read_file_bytes(const char *path, size_t *size_out)
+{
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return NULL;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    long len = ftell(fp);
+    if (len < 0) {
+        fclose(fp);
+        return NULL;
+    }
+    rewind(fp);
+    size_t size = (size_t)len;
+    char *buf = calloc(1, size + 1U);
+    if (buf == NULL) {
+        fclose(fp);
+        return NULL;
+    }
+    if (size != 0 && fread(buf, 1, size, fp) != size) {
+        free(buf);
+        fclose(fp);
+        return NULL;
+    }
+    fclose(fp);
+    if (size_out != NULL) {
+        *size_out = size;
+    }
+    return buf;
 }
 
 static bool range_contains(CUdeviceptr base, size_t size, CUdeviceptr ptr, size_t bytes)
@@ -2776,7 +2862,7 @@ CUresult CUDAAPI cuEventElapsedTime_v2(float *pMilliseconds, CUevent hStart, CUe
     return cuEventElapsedTime(pMilliseconds, hStart, hEnd);
 }
 
-static CUmodule make_module(const char *name, const void *image)
+static CUmodule make_module(const char *name, const void *image, size_t image_size, bool copy_image)
 {
     CUmodule module = calloc(1, sizeof(*module));
     if (module == NULL) {
@@ -2785,6 +2871,18 @@ static CUmodule make_module(const char *name, const void *image)
     module->magic = HANDLE_MAGIC_MODULE;
     module->name = strdup(name != NULL ? name : "<memory>");
     module->image = image;
+    module->image_size = image_size;
+    if (copy_image && image != NULL && image_size != 0) {
+        module->owned_image = malloc(image_size + 1U);
+        if (module->owned_image == NULL) {
+            free(module->name);
+            free(module);
+            return NULL;
+        }
+        memcpy(module->owned_image, image, image_size);
+        ((char *)module->owned_image)[image_size] = '\0';
+        module->image = module->owned_image;
+    }
     pthread_mutex_lock(&g_lock);
     module->next = g.modules;
     g.modules = module;
@@ -2800,7 +2898,13 @@ CUresult CUDAAPI cuModuleLoad(CUmodule *module, const char *fname)
     if (access(fname, R_OK) != 0) {
         return CUDA_ERROR_FILE_NOT_FOUND;
     }
-    CUmodule m = make_module(fname, NULL);
+    size_t image_size = 0;
+    char *image = read_file_bytes(fname, &image_size);
+    if (image == NULL) {
+        return CUDA_ERROR_INVALID_IMAGE;
+    }
+    CUmodule m = make_module(fname, image, image_size, true);
+    free(image);
     if (m == NULL) {
         return CUDA_ERROR_OUT_OF_MEMORY;
     }
@@ -2813,7 +2917,19 @@ CUresult CUDAAPI cuModuleLoadData(CUmodule *module, const void *image)
     if (module == NULL || image == NULL) {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    CUmodule m = make_module("<image>", image);
+    size_t image_size = 0;
+    const unsigned char *bytes = (const unsigned char *)image;
+    if (bytes[0] == 0x7f && bytes[1] == 'E' && bytes[2] == 'L' && bytes[3] == 'F') {
+        image_size = 4;
+    } else {
+        image_size = strnlen((const char *)image, 16U * 1024U * 1024U);
+        if (image_size != 16U * 1024U * 1024U) {
+            image_size++;
+        } else {
+            image_size = 0;
+        }
+    }
+    CUmodule m = make_module("<image>", image, image_size, image_size != 0);
     if (m == NULL) {
         return CUDA_ERROR_OUT_OF_MEMORY;
     }
@@ -2832,6 +2948,185 @@ CUresult CUDAAPI cuModuleLoadDataEx(CUmodule *module, const void *image, unsigne
 CUresult CUDAAPI cuModuleLoadFatBinary(CUmodule *module, const void *fatCubin)
 {
     return cuModuleLoadData(module, fatCubin);
+}
+
+static CUresult module_get_or_create_global(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name)
+{
+    if (!valid_module(hmod) || name == NULL || (dptr == NULL && bytes == NULL)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    for (struct module_global *global = hmod->globals; global != NULL; global = global->next) {
+        if (strcmp(global->name, name) == 0) {
+            if (dptr != NULL) {
+                *dptr = global->dptr;
+            }
+            if (bytes != NULL) {
+                *bytes = global->bytes;
+            }
+            return CUDA_SUCCESS;
+        }
+    }
+
+    size_t global_bytes = (size_t)env_ull("LANXIN_NVIDIA_CUDA_GLOBAL_BYTES", 4096);
+    if (global_bytes == 0) {
+        global_bytes = 1;
+    }
+    CUdeviceptr ptr = 0;
+    CUresult result = cuMemAlloc_v2(&ptr, global_bytes);
+    if (result != CUDA_SUCCESS) {
+        return result;
+    }
+    struct module_global *global = calloc(1, sizeof(*global));
+    if (global == NULL) {
+        cuMemFree_v2(ptr);
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    global->name = strdup(name);
+    if (global->name == NULL) {
+        free(global);
+        cuMemFree_v2(ptr);
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    global->dptr = ptr;
+    global->bytes = global_bytes;
+    global->next = hmod->globals;
+    hmod->globals = global;
+    if (dptr != NULL) {
+        *dptr = ptr;
+    }
+    if (bytes != NULL) {
+        *bytes = global_bytes;
+    }
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuModuleGetGlobal_v2(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name)
+{
+    return module_get_or_create_global(dptr, bytes, hmod, name);
+}
+
+CUresult CUDAAPI cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name)
+{
+    return cuModuleGetGlobal_v2(dptr, bytes, hmod, name);
+}
+
+static CUresult link_set_image(CUlinkState state, const void *data, size_t size)
+{
+    if (!valid_link_state(state) || (data == NULL && size != 0)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    const char fallback[] = "LANXIN_FAKE_CUDA_LINK_IMAGE";
+    const void *src = data != NULL ? data : fallback;
+    size_t src_size = data != NULL ? size : sizeof(fallback);
+    if (src_size == 0) {
+        src_size = sizeof(fallback);
+        src = fallback;
+    }
+    void *copy = malloc(src_size + 1U);
+    if (copy == NULL) {
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    memcpy(copy, src, src_size);
+    ((char *)copy)[src_size] = '\0';
+    free(state->image);
+    state->image = copy;
+    state->image_size = src_size;
+    state->input_count++;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuLinkCreate_v2(unsigned int numOptions, CUjit_option *options, void **optionValues, CUlinkState *stateOut)
+{
+    (void)numOptions;
+    (void)options;
+    (void)optionValues;
+    if (stateOut == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUlinkState state = calloc(1, sizeof(*state));
+    if (state == NULL) {
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    state->magic = HANDLE_MAGIC_LINK;
+    *stateOut = state;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuLinkCreate(unsigned int numOptions, CUjit_option *options, void **optionValues, CUlinkState *stateOut)
+{
+    return cuLinkCreate_v2(numOptions, options, optionValues, stateOut);
+}
+
+CUresult CUDAAPI cuLinkAddData_v2(CUlinkState state, CUjitInputType type, void *data, size_t size, const char *name,
+                                  unsigned int numOptions, CUjit_option *options, void **optionValues)
+{
+    (void)type;
+    (void)name;
+    (void)numOptions;
+    (void)options;
+    (void)optionValues;
+    return link_set_image(state, data, size);
+}
+
+CUresult CUDAAPI cuLinkAddData(CUlinkState state, CUjitInputType type, void *data, size_t size, const char *name,
+                               unsigned int numOptions, CUjit_option *options, void **optionValues)
+{
+    return cuLinkAddData_v2(state, type, data, size, name, numOptions, options, optionValues);
+}
+
+CUresult CUDAAPI cuLinkAddFile_v2(CUlinkState state, CUjitInputType type, const char *path,
+                                  unsigned int numOptions, CUjit_option *options, void **optionValues)
+{
+    (void)type;
+    (void)numOptions;
+    (void)options;
+    (void)optionValues;
+    if (!valid_link_state(state) || path == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    size_t size = 0;
+    char *data = read_file_bytes(path, &size);
+    if (data == NULL) {
+        return CUDA_ERROR_FILE_NOT_FOUND;
+    }
+    CUresult result = link_set_image(state, data, size);
+    free(data);
+    return result;
+}
+
+CUresult CUDAAPI cuLinkAddFile(CUlinkState state, CUjitInputType type, const char *path,
+                               unsigned int numOptions, CUjit_option *options, void **optionValues)
+{
+    return cuLinkAddFile_v2(state, type, path, numOptions, options, optionValues);
+}
+
+CUresult CUDAAPI cuLinkComplete(CUlinkState state, void **cubinOut, size_t *sizeOut)
+{
+    if (!valid_link_state(state) || cubinOut == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (state->image == NULL) {
+        CUresult result = link_set_image(state, NULL, 0);
+        if (result != CUDA_SUCCESS) {
+            return result;
+        }
+    }
+    *cubinOut = state->image;
+    if (sizeOut != NULL) {
+        *sizeOut = state->image_size;
+    }
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuLinkDestroy(CUlinkState state)
+{
+    if (!valid_link_state(state)) {
+        return CUDA_ERROR_INVALID_HANDLE;
+    }
+    free(state->image);
+    state->magic = 0;
+    free(state);
+    return CUDA_SUCCESS;
 }
 
 CUresult CUDAAPI cuModuleUnload(CUmodule hmod)
@@ -2856,7 +3151,16 @@ CUresult CUDAAPI cuModuleUnload(CUmodule hmod)
         free(fn);
         fn = next;
     }
+    struct module_global *global = hmod->globals;
+    while (global != NULL) {
+        struct module_global *next = global->next;
+        cuMemFree_v2(global->dptr);
+        free(global->name);
+        free(global);
+        global = next;
+    }
     free(hmod->name);
+    free(hmod->owned_image);
     hmod->magic = 0;
     free(hmod);
     return CUDA_SUCCESS;
@@ -2950,6 +3254,262 @@ CUresult CUDAAPI cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attri
     return valid_function(hfunc) ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 
+CUresult CUDAAPI cuFuncSetCacheConfig(CUfunction hfunc, CUfunc_cache config)
+{
+    (void)config;
+    return valid_function(hfunc) ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+CUresult CUDAAPI cuFuncSetSharedMemConfig(CUfunction hfunc, CUsharedconfig config)
+{
+    (void)config;
+    return valid_function(hfunc) ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+static CUresult make_library_from_module(CUlibrary *library, CUmodule module)
+{
+    if (library == NULL || !valid_module(module)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUlibrary lib = calloc(1, sizeof(*lib));
+    if (lib == NULL) {
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    lib->magic = HANDLE_MAGIC_LIBRARY;
+    lib->module = module;
+    *library = lib;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuLibraryLoadData(CUlibrary *library, const void *code,
+                                   CUjit_option *jitOptions, void **jitOptionsValues, unsigned int numJitOptions,
+                                   CUlibraryOption *libraryOptions, void **libraryOptionValues, unsigned int numLibraryOptions)
+{
+    (void)jitOptions;
+    (void)jitOptionsValues;
+    (void)numJitOptions;
+    (void)libraryOptions;
+    (void)libraryOptionValues;
+    (void)numLibraryOptions;
+    if (library == NULL || code == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUmodule module = NULL;
+    CUresult result = cuModuleLoadData(&module, code);
+    if (result != CUDA_SUCCESS) {
+        return result;
+    }
+    result = make_library_from_module(library, module);
+    if (result != CUDA_SUCCESS) {
+        cuModuleUnload(module);
+    }
+    return result;
+}
+
+CUresult CUDAAPI cuLibraryLoadFromFile(CUlibrary *library, const char *fileName,
+                                       CUjit_option *jitOptions, void **jitOptionsValues, unsigned int numJitOptions,
+                                       CUlibraryOption *libraryOptions, void **libraryOptionValues, unsigned int numLibraryOptions)
+{
+    (void)jitOptions;
+    (void)jitOptionsValues;
+    (void)numJitOptions;
+    (void)libraryOptions;
+    (void)libraryOptionValues;
+    (void)numLibraryOptions;
+    if (library == NULL || fileName == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUmodule module = NULL;
+    CUresult result = cuModuleLoad(&module, fileName);
+    if (result != CUDA_SUCCESS) {
+        return result;
+    }
+    result = make_library_from_module(library, module);
+    if (result != CUDA_SUCCESS) {
+        cuModuleUnload(module);
+    }
+    return result;
+}
+
+CUresult CUDAAPI cuLibraryUnload(CUlibrary library)
+{
+    if (!valid_library(library)) {
+        return CUDA_ERROR_INVALID_HANDLE;
+    }
+    CUkernel kernel = library->kernels;
+    while (kernel != NULL) {
+        CUkernel next = kernel->next;
+        free(kernel->name);
+        kernel->magic = 0;
+        free(kernel);
+        kernel = next;
+    }
+    CUmodule module = library->module;
+    library->magic = 0;
+    free(library);
+    if (valid_module(module)) {
+        return cuModuleUnload(module);
+    }
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuLibraryGetKernel(CUkernel *pKernel, CUlibrary library, const char *name)
+{
+    if (pKernel == NULL || !valid_library(library) || name == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    for (CUkernel kernel = library->kernels; kernel != NULL; kernel = kernel->next) {
+        if (strcmp(kernel->name, name) == 0) {
+            *pKernel = kernel;
+            return CUDA_SUCCESS;
+        }
+    }
+    CUfunction function = NULL;
+    CUresult result = cuModuleGetFunction(&function, library->module, name);
+    if (result != CUDA_SUCCESS) {
+        return result;
+    }
+    CUkernel kernel = calloc(1, sizeof(*kernel));
+    if (kernel == NULL) {
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    kernel->name = strdup(name);
+    if (kernel->name == NULL) {
+        free(kernel);
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    kernel->magic = HANDLE_MAGIC_KERNEL;
+    kernel->library = library;
+    kernel->function = function;
+    kernel->next = library->kernels;
+    library->kernels = kernel;
+    *pKernel = kernel;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuLibraryGetKernelCount(unsigned int *count, CUlibrary lib)
+{
+    if (count == NULL || !valid_library(lib)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsigned int n = 0;
+    for (CUkernel kernel = lib->kernels; kernel != NULL; kernel = kernel->next) {
+        n++;
+    }
+    *count = n;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuLibraryEnumerateKernels(CUkernel *kernels, unsigned int numKernels, CUlibrary lib)
+{
+    if ((kernels == NULL && numKernels != 0) || !valid_library(lib)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsigned int i = 0;
+    for (CUkernel kernel = lib->kernels; kernel != NULL && i < numKernels; kernel = kernel->next) {
+        kernels[i++] = kernel;
+    }
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuLibraryGetModule(CUmodule *pMod, CUlibrary library)
+{
+    if (pMod == NULL || !valid_library(library)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *pMod = library->module;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuKernelGetFunction(CUfunction *pFunc, CUkernel kernel)
+{
+    if (pFunc == NULL || !valid_kernel(kernel)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *pFunc = kernel->function;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuKernelGetLibrary(CUlibrary *pLib, CUkernel kernel)
+{
+    if (pLib == NULL || !valid_kernel(kernel)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *pLib = kernel->library;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuLibraryGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUlibrary library, const char *name)
+{
+    if (!valid_library(library)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    return cuModuleGetGlobal_v2(dptr, bytes, library->module, name);
+}
+
+CUresult CUDAAPI cuLibraryGetManaged(CUdeviceptr *dptr, size_t *bytes, CUlibrary library, const char *name)
+{
+    return cuLibraryGetGlobal(dptr, bytes, library, name);
+}
+
+CUresult CUDAAPI cuLibraryGetUnifiedFunction(void **fptr, CUlibrary library, const char *symbol)
+{
+    if (fptr == NULL || !valid_library(library) || symbol == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUkernel kernel = NULL;
+    CUresult result = cuLibraryGetKernel(&kernel, library, symbol);
+    if (result != CUDA_SUCCESS) {
+        return result;
+    }
+    *fptr = (void *)kernel->function;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuKernelGetAttribute(int *pi, CUfunction_attribute attrib, CUkernel kernel, CUdevice dev)
+{
+    (void)dev;
+    if (pi == NULL || !valid_kernel(kernel)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    return cuFuncGetAttribute(pi, attrib, kernel->function);
+}
+
+CUresult CUDAAPI cuKernelSetAttribute(CUfunction_attribute attrib, int val, CUkernel kernel, CUdevice dev)
+{
+    (void)dev;
+    if (!valid_kernel(kernel)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    return cuFuncSetAttribute(kernel->function, attrib, val);
+}
+
+CUresult CUDAAPI cuKernelSetCacheConfig(CUkernel kernel, CUfunc_cache config, CUdevice dev)
+{
+    (void)config;
+    (void)dev;
+    return valid_kernel(kernel) ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+CUresult CUDAAPI cuKernelGetName(const char **name, CUkernel hfunc)
+{
+    if (name == NULL || !valid_kernel(hfunc)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *name = hfunc->name;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuKernelGetParamInfo(CUkernel kernel, size_t paramIndex, size_t *paramOffset, size_t *paramSize)
+{
+    if (!valid_kernel(kernel) || paramOffset == NULL || paramSize == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *paramOffset = paramIndex * sizeof(void *);
+    *paramSize = sizeof(void *);
+    return CUDA_SUCCESS;
+}
+
 CUresult CUDAAPI cuLaunchKernel(CUfunction f,
                                 unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                                 unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
@@ -2971,26 +3531,39 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f,
     bool noop_success = env_enabled("LANXIN_NVIDIA_CUDA_NOOP_KERNEL");
     bool rm_submit_only = env_enabled("LANXIN_NVIDIA_CUDA_RM_SUBMIT");
     bool rm_pb_submit = env_enabled("LANXIN_NVIDIA_CUDA_PB_SUBMIT");
-    if (noop_success || rm_submit_only || rm_pb_submit) {
-        pthread_mutex_lock(&g_lock);
-        CUresult init = ensure_initialized_locked();
-        int submitted = -1;
-        if (init == CUDA_SUCCESS) {
-            submitted = rm_pb_submit ? rm_submit_compute_set_object_locked() : rm_submit_noop_locked();
+    bool strict_launch = env_enabled("LANXIN_NVIDIA_CUDA_STRICT_LAUNCH");
+    bool default_pb_submit = !noop_success && !rm_submit_only && !env_disabled("LANXIN_NVIDIA_CUDA_PB_SUBMIT");
+    pthread_mutex_lock(&g_lock);
+    CUresult init = ensure_initialized_locked();
+    int submit_rc = -1;
+    if (init == CUDA_SUCCESS) {
+        if (noop_success || rm_submit_only) {
+            submit_rc = rm_submit_noop_locked();
+        } else if (rm_pb_submit || default_pb_submit) {
+            submit_rc = rm_submit_compute_set_object_locked();
+            if (submit_rc != 0) {
+                submit_rc = rm_submit_noop_locked();
+            }
         }
-        pthread_mutex_unlock(&g_lock);
-        tracef("RM cuLaunchKernel scaffold(%s) submitted=%d noop_success=%d submit_only=%d pb_submit=%d",
-               f->name != NULL ? f->name : "<unnamed>", submitted,
-               noop_success ? 1 : 0, rm_submit_only ? 1 : 0, rm_pb_submit ? 1 : 0);
-        if (submitted != 0 && noop_success) {
+    }
+    pthread_mutex_unlock(&g_lock);
+    tracef("RM cuLaunchKernel scaffold(%s) submit_rc=%d noop_success=%d submit_only=%d pb_submit=%d default_pb=%d strict=%d",
+           f->name != NULL ? f->name : "<unnamed>", submit_rc,
+           noop_success ? 1 : 0, rm_submit_only ? 1 : 0, rm_pb_submit ? 1 : 0,
+           default_pb_submit ? 1 : 0, strict_launch ? 1 : 0);
+    if (submit_rc != 0) {
+        if (noop_success) {
             return CUDA_ERROR_UNKNOWN;
         }
-        if (noop_success) {
-            return CUDA_SUCCESS;
+        if (strict_launch || rm_submit_only) {
+            return CUDA_ERROR_NOT_SUPPORTED;
         }
+        return CUDA_SUCCESS;
+    }
+    if (rm_submit_only || strict_launch) {
         return CUDA_ERROR_NOT_SUPPORTED;
     }
-    return CUDA_ERROR_NOT_SUPPORTED;
+    return CUDA_SUCCESS;
 }
 
 CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f, void **kernelParams, void **extra)
@@ -3017,6 +3590,53 @@ CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, CUf
     return CUDA_SUCCESS;
 }
 
+CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize, unsigned int flags)
+{
+    (void)flags;
+    return cuOccupancyMaxActiveBlocksPerMultiprocessor(numBlocks, func, blockSize, dynamicSMemSize);
+}
+
+CUresult CUDAAPI cuOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize, CUfunction func,
+                                                  CUoccupancyB2DSize blockSizeToDynamicSMemSize,
+                                                  size_t dynamicSMemSize, int blockSizeLimit)
+{
+    (void)func;
+    (void)blockSizeToDynamicSMemSize;
+    (void)dynamicSMemSize;
+    if (minGridSize == NULL || blockSize == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    int chosen = blockSizeLimit > 0 && blockSizeLimit < 256 ? blockSizeLimit : 256;
+    if (chosen < 1) {
+        chosen = 1;
+    }
+    *blockSize = chosen;
+    *minGridSize = g.sm_count > 0 ? g.sm_count : DEFAULT_SM_COUNT;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuOccupancyMaxPotentialBlockSizeWithFlags(int *minGridSize, int *blockSize, CUfunction func,
+                                                           CUoccupancyB2DSize blockSizeToDynamicSMemSize,
+                                                           size_t dynamicSMemSize, int blockSizeLimit,
+                                                           unsigned int flags)
+{
+    (void)flags;
+    return cuOccupancyMaxPotentialBlockSize(minGridSize, blockSize, func,
+                                            blockSizeToDynamicSMemSize, dynamicSMemSize, blockSizeLimit);
+}
+
+CUresult CUDAAPI cuOccupancyAvailableDynamicSMemPerBlock(size_t *dynamicSmemSize, CUfunction func, int numBlocks, int blockSize)
+{
+    (void)func;
+    (void)numBlocks;
+    (void)blockSize;
+    if (dynamicSmemSize == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *dynamicSmemSize = 48U * 1024U;
+    return CUDA_SUCCESS;
+}
+
 CUresult CUDAAPI cuGetErrorName(CUresult error, const char **pStr)
 {
     if (pStr == NULL) {
@@ -3031,6 +3651,11 @@ CUresult CUDAAPI cuGetErrorName(CUresult error, const char **pStr)
     case CUDA_ERROR_INVALID_DEVICE: *pStr = "CUDA_ERROR_INVALID_DEVICE"; break;
     case CUDA_ERROR_INVALID_CONTEXT: *pStr = "CUDA_ERROR_INVALID_CONTEXT"; break;
     case CUDA_ERROR_INVALID_HANDLE: *pStr = "CUDA_ERROR_INVALID_HANDLE"; break;
+    case CUDA_ERROR_FILE_NOT_FOUND: *pStr = "CUDA_ERROR_FILE_NOT_FOUND"; break;
+    case CUDA_ERROR_INVALID_IMAGE: *pStr = "CUDA_ERROR_INVALID_IMAGE"; break;
+    case CUDA_ERROR_INVALID_PTX: *pStr = "CUDA_ERROR_INVALID_PTX"; break;
+    case CUDA_ERROR_NO_BINARY_FOR_GPU: *pStr = "CUDA_ERROR_NO_BINARY_FOR_GPU"; break;
+    case CUDA_ERROR_JIT_COMPILER_NOT_FOUND: *pStr = "CUDA_ERROR_JIT_COMPILER_NOT_FOUND"; break;
     case CUDA_ERROR_NOT_FOUND: *pStr = "CUDA_ERROR_NOT_FOUND"; break;
     case CUDA_ERROR_NOT_SUPPORTED: *pStr = "CUDA_ERROR_NOT_SUPPORTED"; break;
     default: *pStr = "CUDA_ERROR_UNKNOWN"; break;
@@ -3052,6 +3677,11 @@ CUresult CUDAAPI cuGetErrorString(CUresult error, const char **pStr)
     case CUDA_ERROR_INVALID_DEVICE: *pStr = "invalid device"; break;
     case CUDA_ERROR_INVALID_CONTEXT: *pStr = "invalid context"; break;
     case CUDA_ERROR_INVALID_HANDLE: *pStr = "invalid handle"; break;
+    case CUDA_ERROR_FILE_NOT_FOUND: *pStr = "file not found"; break;
+    case CUDA_ERROR_INVALID_IMAGE: *pStr = "invalid image"; break;
+    case CUDA_ERROR_INVALID_PTX: *pStr = "invalid PTX"; break;
+    case CUDA_ERROR_NO_BINARY_FOR_GPU: *pStr = "no binary for GPU"; break;
+    case CUDA_ERROR_JIT_COMPILER_NOT_FOUND: *pStr = "JIT compiler not found"; break;
     case CUDA_ERROR_NOT_FOUND: *pStr = "not found"; break;
     case CUDA_ERROR_NOT_SUPPORTED: *pStr = "operation not supported by this shim"; break;
     default: *pStr = "unknown CUDA error"; break;
@@ -3177,16 +3807,49 @@ static const struct proc_entry proc_table[] = {
     PROC_ENTRY(cuModuleLoadData),
     PROC_ENTRY(cuModuleLoadDataEx),
     PROC_ENTRY(cuModuleLoadFatBinary),
+    PROC_ENTRY(cuModuleGetGlobal),
+    PROC_ENTRY(cuModuleGetGlobal_v2),
     PROC_ENTRY(cuModuleUnload),
     PROC_ENTRY(cuModuleGetFunction),
     PROC_ENTRY(cuModuleGetFunctionCount),
+    PROC_ENTRY(cuLinkCreate),
+    PROC_ENTRY(cuLinkCreate_v2),
+    PROC_ENTRY(cuLinkAddData),
+    PROC_ENTRY(cuLinkAddData_v2),
+    PROC_ENTRY(cuLinkAddFile),
+    PROC_ENTRY(cuLinkAddFile_v2),
+    PROC_ENTRY(cuLinkComplete),
+    PROC_ENTRY(cuLinkDestroy),
     PROC_ENTRY(cuFuncGetName),
     PROC_ENTRY(cuFuncGetModule),
     PROC_ENTRY(cuFuncGetAttribute),
     PROC_ENTRY(cuFuncSetAttribute),
+    PROC_ENTRY(cuFuncSetCacheConfig),
+    PROC_ENTRY(cuFuncSetSharedMemConfig),
+    PROC_ENTRY(cuLibraryLoadData),
+    PROC_ENTRY(cuLibraryLoadFromFile),
+    PROC_ENTRY(cuLibraryUnload),
+    PROC_ENTRY(cuLibraryGetKernel),
+    PROC_ENTRY(cuLibraryGetKernelCount),
+    PROC_ENTRY(cuLibraryEnumerateKernels),
+    PROC_ENTRY(cuLibraryGetModule),
+    PROC_ENTRY(cuKernelGetFunction),
+    PROC_ENTRY(cuKernelGetLibrary),
+    PROC_ENTRY(cuLibraryGetGlobal),
+    PROC_ENTRY(cuLibraryGetManaged),
+    PROC_ENTRY(cuLibraryGetUnifiedFunction),
+    PROC_ENTRY(cuKernelGetAttribute),
+    PROC_ENTRY(cuKernelSetAttribute),
+    PROC_ENTRY(cuKernelSetCacheConfig),
+    PROC_ENTRY(cuKernelGetName),
+    PROC_ENTRY(cuKernelGetParamInfo),
     PROC_ENTRY(cuLaunchKernel),
     PROC_ENTRY(cuLaunchKernelEx),
     PROC_ENTRY(cuOccupancyMaxActiveBlocksPerMultiprocessor),
+    PROC_ENTRY(cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags),
+    PROC_ENTRY(cuOccupancyMaxPotentialBlockSize),
+    PROC_ENTRY(cuOccupancyMaxPotentialBlockSizeWithFlags),
+    PROC_ENTRY(cuOccupancyAvailableDynamicSMemPerBlock),
     PROC_ENTRY(cuGetErrorName),
     PROC_ENTRY(cuGetErrorString),
 };
