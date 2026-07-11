@@ -8,7 +8,7 @@ Current boundary:
 - Real management surface: a minimal `libnvidia-ml.so.1` plus `bin/nvidia-smi` now report driver/CUDA version, GPU name, UUID, PCI bus ID, memory totals/free/used from the shim accounting path, PCIe link information from sysfs, and process discovery by scanning `/proc/*/fd` for NVIDIA device nodes.
 - Real RM channel scaffold: `NV01_MEMORY_VIRTUAL` GPU VA, notifier sysmem + error ctxdma, GPFIFO sysmem CPU/GPU mapping, client-allocated UserD sysmem, `BLACKWELL_USERMODE_A` doorbell mapping, `BLACKWELL_CHANNEL_GPFIFO_B` alloc, bind, schedule, work-submit-token, and DoorbellKickoff-style submission by writing UserD `GPPut` then the USERMODE doorbell token.
 - Real RM object/pushbuffer scaffold: compute object allocation probes `BLACKWELL_COMPUTE_B/A`, falls back through Hopper/Ampere classes, calls `NV906F_CTRL_GET_CLASS_ENGINEID`, writes a C46F-format compute `SET_OBJECT` + `NO_OPERATION` + `PIPE_NOP` pushbuffer, submits a paired progress-tracker semaphore pushbuffer, and verifies HOST consumption through a completion record.
-- Real staging for the next launch layer: `cuLaunchKernel` now stages a launch packet into RM system memory mapped into the channel VASpace: module code-object bytes, a 256-byte QMD descriptor, captured `CU_LAUNCH_PARAM_BUFFER_*` argument bytes, and a completion record. `cuModuleLoadData` keeps full ELF images by deriving their size from ELF program/section headers and unwraps `__fatBinC_Wrapper_t` payloads before staging. The QMD path emits `SET_PROGRAM_REGION_A/B`, `SET_QMD_VERSION`, `SET_CWD_SLOT_COUNT`, and `SEND_PCAS_A/B/SEND_SIGNALING_PCAS_B` before the progress tracker.
+- Real staging for the next launch layer: `cuLaunchKernel` now stages a launch packet into RM system memory mapped into the channel VASpace: module code-object bytes, a 256-byte QMD descriptor, captured `CU_LAUNCH_PARAM_BUFFER_*` argument bytes, and a completion record. `cuModuleLoadData` keeps full ELF images by deriving their size from ELF program/section headers and unwraps `__fatBinC_Wrapper_t` payloads before staging. `cuModuleGetFunction` parses CUDA ELF64 sections such as `.text.<kernel>`, `.nv.info.<kernel>`, and `.nv.constant0.<kernel>` to feed QMD program offset, register count, static shared memory, local memory, const memory, and SASS version. The QMD path emits `SET_PROGRAM_REGION_A/B`, `SET_QMD_VERSION`, `SET_CWD_SLOT_COUNT`, and `SEND_PCAS_A/B/SEND_SIGNALING_PCAS_B` before the progress tracker.
 - Provisional: `cuModuleLoad*`, `cuLink*`, `cuLibrary*`, and `cuKernel*` accept PTX/cubin/fatbin-like payloads and route functions/kernels into the launch scaffold, but the shim does not yet execute CUDA code objects/SASS with a verified NVIDIA hardware QMD release. By default, `cuLaunchKernel` stages the launch packet, submits the safe compute pushbuffer through RM, verifies progress completion when requested, and returns `CUDA_SUCCESS` so loader/runtime smoke tests can run end-to-end. `LANXIN_NVIDIA_CUDA_QMD_SUBMIT=1 LANXIN_NVIDIA_CUDA_STRICT_LAUNCH=1` now submits the staged QMD through real PCAS methods and requires the QMD release semaphore; it currently returns `CUDA_ERROR_NOT_SUPPORTED` when the QMD release does not arrive.
 - Known boundary: simple CPU BAR1 mapping of `NV01_MEMORY_LOCAL_USER` VRAM returns `NV_ERR_NOT_SUPPORTED` on this driver path, so current `cuMemAlloc` uses RM-backed sysmem rather than mappable VRAM.
 
@@ -26,6 +26,7 @@ LANXIN_NVIDIA_CUDA_TRACE=1 LANXIN_NVIDIA_CUDA_WAIT_COMPLETION=1 ./nvidia_driver_
 LANXIN_NVIDIA_CUDA_TRACE=1 LANXIN_NVIDIA_CUDA_QMD_SUBMIT=1 LANXIN_NVIDIA_CUDA_STRICT_LAUNCH=1 ./nvidia_driver_shim/build/launch_probe
 LANXIN_NVIDIA_CUDA_TRACE=1 ./nvidia_driver_shim/build/api_probe
 LANXIN_NVIDIA_CUDA_TRACE=1 ./nvidia_driver_shim/build/module_image_probe
+LANXIN_NVIDIA_CUDA_TRACE=1 LANXIN_NVIDIA_CUDA_MODULE_IMAGE_LAUNCH=1 LANXIN_NVIDIA_CUDA_WAIT_COMPLETION=1 ./nvidia_driver_shim/build/module_image_probe
 ./nvidia_driver_shim/build/channel_probe
 ```
 
@@ -40,6 +41,9 @@ Useful environment overrides:
 - `LANXIN_NVIDIA_CUDA_QMD_STAGE=0` disables QMD/code/params/completion staging. Staging is enabled by default.
 - `LANXIN_NVIDIA_CUDA_QMD_SUBMIT=1` requests the experimental QMD pushbuffer path using the C0C0/C7C0 PCAS method sequence.
 - `LANXIN_NVIDIA_CUDA_QMD_REQUIRE_PCAS=0` clears QMDV01_06 bit 204 for A/B testing. The default sets `REQUIRE_SCHEDULING_PCAS` because this path submits through PCAS.
+- `LANXIN_NVIDIA_CUDA_QMD_PROGRAM_OFFSET=0x...` overrides the parsed `.text.<kernel>` file offset written to QMD `PROGRAM_OFFSET`.
+- `LANXIN_NVIDIA_CUDA_QMD_LOCAL_MEM_BYTES=0` overrides parsed `.nv.info.<kernel>` local-memory bytes.
+- `LANXIN_NVIDIA_CUDA_QMD_REGISTER_COUNT=32` and `LANXIN_NVIDIA_CUDA_QMD_SASS_VERSION=120` override parsed cubin metadata.
 - `LANXIN_NVIDIA_CUDA_IMAGE_SCAN_MAX_BYTES=67108864` caps loader-side in-memory image probing for `cuModuleLoadData`.
 - `LANXIN_NVIDIA_CUDA_CODE_STAGE_MAX_BYTES=16777216` caps how many module image bytes are copied into RM-mapped code-object staging memory.
 - `LANXIN_NVIDIA_CUDA_WAIT_COMPLETION=1` polls the staged completion record after doorbell. In the default safe pushbuffer path this verifies HOST progress; with `LANXIN_NVIDIA_CUDA_QMD_SUBMIT=1 LANXIN_NVIDIA_CUDA_STRICT_LAUNCH=1` it also requires the QMD release semaphore.

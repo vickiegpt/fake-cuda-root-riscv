@@ -177,6 +177,21 @@
 #define LANXIN_COMPLETION_TIMEOUT 3u
 #define LANXIN_LAUNCH_PARAM_EXTRA_BUFFER 1u
 #define LANXIN_LAUNCH_PARAM_POINTER_ARRAY 2u
+#define LANXIN_ELF_EM_CUDA 190u
+#define LANXIN_ELF_SHT_PROGBITS 1u
+#define LANXIN_ELF_SHT_SYMTAB 2u
+#define LANXIN_ELF_SHT_STRTAB 3u
+#define LANXIN_ELF_SHT_NOBITS 8u
+#define LANXIN_ELF_SHT_CUDA_INFO 0x70000000u
+#define LANXIN_ELF_SHF_ALLOC 0x2ULL
+#define LANXIN_ELF_SHF_EXECINSTR 0x4ULL
+#define LANXIN_ELF_STT_FUNC 2u
+#define LANXIN_ELF_STT_CUDA_FUNC 10u
+#define LANXIN_EIATTR_REGCOUNT 0x2f04u
+#define LANXIN_EIATTR_REGCOUNT_ALT 0x0401u
+#define LANXIN_EIATTR_MAX_THREADS 0x0504u
+#define LANXIN_EIATTR_SMEM_SIZE 0x0808u
+#define LANXIN_EIATTR_LMEM_SIZE 0x0a04u
 
 typedef uint8_t rm_bool;
 typedef uint32_t rm_u32;
@@ -436,6 +451,24 @@ struct rm_stage_buffer {
     int map_fd;
 };
 
+struct lanxin_kernel_metadata {
+    bool valid;
+    rm_u64 text_file_offset;
+    rm_u64 text_size;
+    rm_u64 text_addr;
+    rm_u64 symbol_value;
+    rm_u64 symbol_size;
+    rm_u64 const0_file_offset;
+    rm_u64 const0_size;
+    rm_u32 qmd_program_offset;
+    rm_u32 reg_count;
+    rm_u32 static_shared_mem_bytes;
+    rm_u32 local_mem_bytes;
+    rm_u32 const_mem_bytes;
+    rm_u32 max_threads_per_block;
+    rm_u32 sm_version;
+};
+
 struct lanxin_qmd_staging_desc {
     rm_u64 magic;
     rm_u32 version;
@@ -457,8 +490,20 @@ struct lanxin_qmd_staging_desc {
     rm_u32 compute_class;
     rm_u32 class_engine_id;
     rm_u32 param_flags;
+    rm_u32 metadata_flags;
+    rm_u64 text_file_offset;
+    rm_u64 text_size;
+    rm_u64 const0_file_offset;
+    rm_u64 const0_size;
+    rm_u32 qmd_program_offset;
+    rm_u32 reg_count;
+    rm_u32 static_shared_mem_bytes;
+    rm_u32 local_mem_bytes;
+    rm_u32 const_mem_bytes;
+    rm_u32 max_threads_per_block;
+    rm_u32 sm_version;
     rm_u32 reserved0;
-    rm_u64 reserved[8];
+    rm_u64 reserved[4];
 };
 
 struct lanxin_launch_completion {
@@ -534,6 +579,7 @@ struct CUfunc_st {
     char *name;
     CUmodule module;
     rm_u64 name_hash;
+    struct lanxin_kernel_metadata metadata;
     struct launch_staging launch;
     struct CUfunc_st *next;
 };
@@ -778,6 +824,12 @@ static size_t probe_elf_image_size(const unsigned char *bytes)
         uint16_t phnum = rd16le(bytes + 56);
         uint16_t shentsize = rd16le(bytes + 58);
         uint16_t shnum = rd16le(bytes + 60);
+        if (shentsize >= 64 && shoff < limit && shnum < 8192) {
+            rm_u64 shdr_bytes = (rm_u64)shentsize * shnum;
+            if (shdr_bytes <= limit - shoff && shoff + shdr_bytes > max_end) {
+                max_end = (size_t)(shoff + shdr_bytes);
+            }
+        }
         if (phentsize >= 56 && phoff < limit && phnum < 8192) {
             for (uint16_t i = 0; i < phnum; i++) {
                 rm_u64 off = phoff + (rm_u64)i * phentsize;
@@ -814,6 +866,12 @@ static size_t probe_elf_image_size(const unsigned char *bytes)
         uint16_t phnum = rd16le(bytes + 44);
         uint16_t shentsize = rd16le(bytes + 46);
         uint16_t shnum = rd16le(bytes + 48);
+        if (shentsize >= 40 && shoff < limit && shnum < 8192) {
+            rm_u64 shdr_bytes = (rm_u64)shentsize * shnum;
+            if (shdr_bytes <= limit - shoff && shoff + shdr_bytes > max_end) {
+                max_end = (size_t)(shoff + shdr_bytes);
+            }
+        }
         if (phentsize >= 32 && phoff < limit && phnum < 8192) {
             for (uint16_t i = 0; i < phnum; i++) {
                 rm_u64 off = (rm_u64)phoff + (rm_u64)i * phentsize;
@@ -896,6 +954,271 @@ static const void *resolve_module_image(const void *image, size_t *size_out, con
         *kind_out = kind;
     }
     return bytes;
+}
+
+struct elf64_section_view {
+    const unsigned char *header;
+    const char *name;
+    rm_u32 type;
+    rm_u64 flags;
+    rm_u64 addr;
+    rm_u64 offset;
+    rm_u64 size;
+    rm_u32 link;
+    rm_u32 info;
+    rm_u64 entsize;
+    uint16_t index;
+};
+
+static bool range_in_image(rm_u64 offset, rm_u64 size, size_t image_size)
+{
+    return offset <= (rm_u64)image_size && size <= (rm_u64)image_size - offset;
+}
+
+static const char *elf_string_at(const unsigned char *base, rm_u64 size, rm_u32 offset)
+{
+    if (base == NULL || offset >= size) {
+        return NULL;
+    }
+    const char *text = (const char *)base + offset;
+    size_t remain = (size_t)(size - offset);
+    return memchr(text, '\0', remain) != NULL ? text : NULL;
+}
+
+static bool elf_section_from_header(const unsigned char *image, size_t image_size,
+                                    const unsigned char *shdr, uint16_t index,
+                                    const unsigned char *shstr, rm_u64 shstr_size,
+                                    struct elf64_section_view *out)
+{
+    if (image == NULL || shdr == NULL || out == NULL) {
+        return false;
+    }
+    rm_u32 name_off = rd32le(shdr + 0);
+    rm_u32 type = rd32le(shdr + 4);
+    rm_u64 flags = rd64le(shdr + 8);
+    rm_u64 addr = rd64le(shdr + 16);
+    rm_u64 offset = rd64le(shdr + 24);
+    rm_u64 size = rd64le(shdr + 32);
+    rm_u32 link = rd32le(shdr + 40);
+    rm_u32 info = rd32le(shdr + 44);
+    rm_u64 entsize = rd64le(shdr + 56);
+    if (type != LANXIN_ELF_SHT_NOBITS && !range_in_image(offset, size, image_size)) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->header = shdr;
+    out->name = elf_string_at(shstr, shstr_size, name_off);
+    out->type = type;
+    out->flags = flags;
+    out->addr = addr;
+    out->offset = offset;
+    out->size = size;
+    out->link = link;
+    out->info = info;
+    out->entsize = entsize;
+    out->index = index;
+    return true;
+}
+
+static bool kernel_text_name_matches(const char *section_name, const char *kernel_name)
+{
+    const char prefix[] = ".text.";
+    if (section_name == NULL || kernel_name == NULL ||
+        strncmp(section_name, prefix, sizeof(prefix) - 1U) != 0) {
+        return false;
+    }
+    const char *suffix = section_name + sizeof(prefix) - 1U;
+    return strcmp(suffix, kernel_name) == 0;
+}
+
+static bool kernel_named_section_matches(const char *section_name, const char *prefix,
+                                         const char *kernel_name)
+{
+    if (section_name == NULL || prefix == NULL || kernel_name == NULL) {
+        return false;
+    }
+    size_t prefix_len = strlen(prefix);
+    return strncmp(section_name, prefix, prefix_len) == 0 &&
+           strcmp(section_name + prefix_len, kernel_name) == 0;
+}
+
+static void parse_kernel_nv_info(const unsigned char *data, rm_u64 size,
+                                 struct lanxin_kernel_metadata *meta)
+{
+    if (data == NULL || meta == NULL) {
+        return;
+    }
+    rm_u64 off = 0;
+    while (off + 4 <= size) {
+        rm_u32 attr_type = rd16le(data + off);
+        rm_u32 attr_size = rd16le(data + off + 2);
+        off += 4;
+        if (attr_size > size - off) {
+            break;
+        }
+        const unsigned char *payload = data + off;
+        if (attr_size >= 4) {
+            rm_u32 value = rd32le(payload);
+            switch (attr_type) {
+            case LANXIN_EIATTR_REGCOUNT:
+            case LANXIN_EIATTR_REGCOUNT_ALT:
+                meta->reg_count = value;
+                break;
+            case LANXIN_EIATTR_MAX_THREADS:
+                meta->max_threads_per_block = value;
+                break;
+            case LANXIN_EIATTR_SMEM_SIZE:
+                meta->static_shared_mem_bytes = value;
+                break;
+            case LANXIN_EIATTR_LMEM_SIZE:
+                meta->local_mem_bytes = value;
+                break;
+            default:
+                break;
+            }
+        }
+        off += attr_size;
+        off = (off + 3ULL) & ~3ULL;
+    }
+}
+
+static bool module_find_kernel_metadata(CUmodule module, const char *kernel_name,
+                                        struct lanxin_kernel_metadata *meta)
+{
+    if (!valid_module(module) || kernel_name == NULL || meta == NULL ||
+        module->image == NULL || module->image_size < 64) {
+        return false;
+    }
+    const unsigned char *image = (const unsigned char *)module->image;
+    size_t image_size = module->image_size;
+    memset(meta, 0, sizeof(*meta));
+    meta->reg_count = 32;
+    meta->max_threads_per_block = 1024;
+
+    if (image[0] != 0x7f || image[1] != 'E' || image[2] != 'L' || image[3] != 'F' ||
+        image[4] != 2 || image[5] != 1 || rd16le(image + 18) != LANXIN_ELF_EM_CUDA) {
+        return false;
+    }
+
+    rm_u64 shoff = rd64le(image + 40);
+    rm_u32 eflags = rd32le(image + 48);
+    uint16_t shentsize = rd16le(image + 58);
+    uint16_t shnum = rd16le(image + 60);
+    uint16_t shstrndx = rd16le(image + 62);
+    if (shentsize < 64 || shnum == 0 || shnum > 8192 || shstrndx >= shnum ||
+        !range_in_image(shoff, (rm_u64)shentsize * shnum, image_size)) {
+        return false;
+    }
+
+    const unsigned char *shbase = image + shoff;
+    const unsigned char *shstr_hdr = shbase + (rm_u64)shstrndx * shentsize;
+    rm_u64 shstr_off = rd64le(shstr_hdr + 24);
+    rm_u64 shstr_size = rd64le(shstr_hdr + 32);
+    if (!range_in_image(shstr_off, shstr_size, image_size)) {
+        return false;
+    }
+    const unsigned char *shstr = image + shstr_off;
+
+    struct elf64_section_view text = {0};
+    struct elf64_section_view info = {0};
+    struct elf64_section_view const0 = {0};
+    bool have_text = false;
+    bool have_info = false;
+    bool have_const0 = false;
+
+    for (uint16_t i = 0; i < shnum; i++) {
+        struct elf64_section_view sec;
+        const unsigned char *hdr = shbase + (rm_u64)i * shentsize;
+        if (!elf_section_from_header(image, image_size, hdr, i, shstr, shstr_size, &sec) ||
+            sec.name == NULL) {
+            continue;
+        }
+        if (!have_text && kernel_text_name_matches(sec.name, kernel_name) &&
+            sec.type == LANXIN_ELF_SHT_PROGBITS &&
+            (sec.flags & LANXIN_ELF_SHF_EXECINSTR) != 0) {
+            text = sec;
+            have_text = true;
+        } else if (!have_info &&
+                   kernel_named_section_matches(sec.name, ".nv.info.", kernel_name)) {
+            info = sec;
+            have_info = true;
+        } else if (!have_const0 &&
+                   kernel_named_section_matches(sec.name, ".nv.constant0.", kernel_name)) {
+            const0 = sec;
+            have_const0 = true;
+        }
+    }
+
+    for (uint16_t i = 0; i < shnum; i++) {
+        struct elf64_section_view symtab;
+        const unsigned char *hdr = shbase + (rm_u64)i * shentsize;
+        if (!elf_section_from_header(image, image_size, hdr, i, shstr, shstr_size, &symtab) ||
+            symtab.type != LANXIN_ELF_SHT_SYMTAB || symtab.entsize < 24 ||
+            symtab.link >= shnum || symtab.size == 0) {
+            continue;
+        }
+        struct elf64_section_view strtab;
+        const unsigned char *str_hdr = shbase + (rm_u64)symtab.link * shentsize;
+        if (!elf_section_from_header(image, image_size, str_hdr, symtab.link,
+                                     shstr, shstr_size, &strtab) ||
+            strtab.type != LANXIN_ELF_SHT_STRTAB) {
+            continue;
+        }
+        const unsigned char *strbase = image + strtab.offset;
+        rm_u64 sym_count = symtab.size / symtab.entsize;
+        for (rm_u64 j = 0; j < sym_count; j++) {
+            const unsigned char *sym = image + symtab.offset + j * symtab.entsize;
+            const char *sym_name = elf_string_at(strbase, strtab.size, rd32le(sym + 0));
+            rm_u32 sym_type = sym[4] & 0xfu;
+            uint16_t shndx = rd16le(sym + 6);
+            if (sym_name == NULL || strcmp(sym_name, kernel_name) != 0 ||
+                (sym_type != LANXIN_ELF_STT_FUNC && sym_type != LANXIN_ELF_STT_CUDA_FUNC) ||
+                shndx >= shnum) {
+                continue;
+            }
+            struct elf64_section_view sym_sec;
+            const unsigned char *sym_shdr = shbase + (rm_u64)shndx * shentsize;
+            if (elf_section_from_header(image, image_size, sym_shdr, shndx,
+                                        shstr, shstr_size, &sym_sec) &&
+                sym_sec.type == LANXIN_ELF_SHT_PROGBITS &&
+                (sym_sec.flags & LANXIN_ELF_SHF_EXECINSTR) != 0) {
+                text = sym_sec;
+                have_text = true;
+                meta->symbol_value = rd64le(sym + 8);
+                meta->symbol_size = rd64le(sym + 16);
+            }
+        }
+    }
+
+    if (!have_text) {
+        return false;
+    }
+    meta->valid = true;
+    meta->text_file_offset = text.offset;
+    meta->text_size = meta->symbol_size != 0 ? meta->symbol_size : text.size;
+    meta->text_addr = text.addr;
+    meta->sm_version = eflags & 0xffu;
+    if (meta->sm_version == 0 && eflags != 0) {
+        meta->sm_version = eflags;
+    }
+    if (meta->symbol_value != 0 && meta->symbol_value >= text.addr &&
+        meta->symbol_value < text.addr + text.size) {
+        meta->qmd_program_offset = (rm_u32)(text.offset + (meta->symbol_value - text.addr));
+    } else if (meta->symbol_value != 0 && meta->symbol_value < text.size) {
+        meta->qmd_program_offset = (rm_u32)(text.offset + meta->symbol_value);
+    } else {
+        meta->qmd_program_offset = (rm_u32)text.offset;
+    }
+    if (have_info && info.type == LANXIN_ELF_SHT_CUDA_INFO &&
+        range_in_image(info.offset, info.size, image_size)) {
+        parse_kernel_nv_info(image + info.offset, info.size, meta);
+    }
+    if (have_const0 && range_in_image(const0.offset, const0.size, image_size)) {
+        meta->const0_file_offset = const0.offset;
+        meta->const0_size = const0.size;
+        meta->const_mem_bytes = const0.size > 0xffffffffULL ? 0xffffffffu : (rm_u32)const0.size;
+    }
+    return true;
 }
 
 static rm_u64 now_ns(void)
@@ -1622,7 +1945,8 @@ static rm_u32 rm_qmd_u32_clamp(rm_u32 value, rm_u32 fallback)
 
 static rm_u32 rm_qmd_shared_mem_units(rm_u32 bytes)
 {
-    return (bytes + 255u) / 256u;
+    rm_u64 units = ((rm_u64)bytes + 255ULL) / 256ULL;
+    return units > 0x3ffffULL ? 0x3ffffu : (rm_u32)units;
 }
 
 static rm_u64 rm_completion_host_va(const struct launch_staging *launch)
@@ -1805,17 +2129,30 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
 
     rm_u64 params_va = launch->params.gpu_va;
     rm_u64 qmd_release_va = rm_completion_qmd_va(launch);
+    rm_u32 parsed_program_offset = f->metadata.valid ? f->metadata.qmd_program_offset : 0;
+    rm_u32 parsed_reg_count = f->metadata.valid && f->metadata.reg_count != 0 ?
+                              f->metadata.reg_count : 32;
+    rm_u32 parsed_sass_version = f->metadata.valid ? f->metadata.sm_version : 0;
+    rm_u32 parsed_static_smem = f->metadata.valid ? f->metadata.static_shared_mem_bytes : 0;
+    rm_u32 parsed_local_mem = f->metadata.valid ? f->metadata.local_mem_bytes : 0;
+    rm_u32 shared_total = req->shared_mem_bytes + parsed_static_smem;
+    if (shared_total < req->shared_mem_bytes) {
+        shared_total = UINT32_MAX;
+    }
     rm_u32 qmd_version = env_u32("LANXIN_NVIDIA_CUDA_QMD_VERSION", LANXIN_QMD_MINOR_VERSION);
     rm_u32 qmd_major = env_u32("LANXIN_NVIDIA_CUDA_QMD_MAJOR_VERSION", LANXIN_QMD_MAJOR_VERSION);
-    rm_u32 reg_count = env_u32("LANXIN_NVIDIA_CUDA_QMD_REGISTER_COUNT", 32);
-    rm_u32 sass_version = env_u32("LANXIN_NVIDIA_CUDA_QMD_SASS_VERSION", 0);
+    rm_u32 program_offset = env_u32("LANXIN_NVIDIA_CUDA_QMD_PROGRAM_OFFSET",
+                                    parsed_program_offset);
+    rm_u32 reg_count = env_u32("LANXIN_NVIDIA_CUDA_QMD_REGISTER_COUNT", parsed_reg_count);
+    rm_u32 sass_version = env_u32("LANXIN_NVIDIA_CUDA_QMD_SASS_VERSION", parsed_sass_version);
+    rm_u32 local_mem = env_u32("LANXIN_NVIDIA_CUDA_QMD_LOCAL_MEM_BYTES", parsed_local_mem);
 
     rm_qmd_set_bits(qmd, 200, 200, 1);                      /* schedule-on-put-update */
     rm_qmd_set_bits(qmd, 202, 202, 1);                      /* release0 enabled */
     rm_qmd_set_bits(qmd, 204, 204,
                     env_disabled("LANXIN_NVIDIA_CUDA_QMD_REQUIRE_PCAS") ? 0 : 1);
     rm_qmd_set_bits(qmd, 250, 255, 0x3f);                   /* invalidate shader/texture caches */
-    rm_qmd_set_bits(qmd, 256, 287, 0);                      /* program offset from SET_PROGRAM_REGION */
+    rm_qmd_set_bits(qmd, 256, 287, program_offset);         /* program offset from SET_PROGRAM_REGION */
     rm_qmd_set_bits(qmd, 366, 366, 1);                      /* FE sysmembar on release */
     rm_qmd_set_bits(qmd, 368, 369, 1);                      /* CWD sysmembar */
     rm_qmd_set_bits(qmd, 378, 378, 1);                      /* no API call-limit check */
@@ -1825,7 +2162,7 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
     rm_qmd_set_bits(qmd, 448, 479, 0);
     rm_qmd_set_bits(qmd, 480, 495, 0);
     rm_qmd_set_bits(qmd, 496, 511, 0);
-    rm_qmd_set_bits(qmd, 544, 561, rm_qmd_shared_mem_units(req->shared_mem_bytes));
+    rm_qmd_set_bits(qmd, 544, 561, rm_qmd_shared_mem_units(shared_total));
     rm_qmd_set_bits(qmd, 576, 579, qmd_version & 0xfu);
     rm_qmd_set_bits(qmd, 580, 583, qmd_major & 0xfu);
     rm_qmd_set_bits(qmd, 592, 607, block_x);
@@ -1843,6 +2180,7 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
     rm_qmd_set_bits(qmd, 794, 794, 0);                      /* no release reduction */
     rm_qmd_set_bits(qmd, 799, 799, 1);                      /* one-word release */
     rm_qmd_set_bits(qmd, 800, 831, qmd_payload);
+    rm_qmd_set_bits(qmd, 1440, 1463, local_mem & 0xffffffu);
     rm_qmd_set_bits(qmd, 1496, 1503, reg_count);
     rm_qmd_set_bits(qmd, 1528, 1535, sass_version);
 
@@ -1858,7 +2196,7 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
     meta->block[0] = block_x;
     meta->block[1] = block_y;
     meta->block[2] = block_z;
-    meta->shared_mem_bytes = req->shared_mem_bytes;
+    meta->shared_mem_bytes = shared_total;
     meta->code_va = f->module->code.gpu_va;
     meta->code_bytes = f->module->staged_code_bytes;
     meta->qmd_va = launch->qmd.gpu_va;
@@ -1871,6 +2209,18 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
     meta->compute_class = g.rm_compute_class;
     meta->class_engine_id = g.rm_compute_class_engine_id;
     meta->param_flags = req->param_flags;
+    meta->metadata_flags = f->metadata.valid ? 1u : 0u;
+    meta->text_file_offset = f->metadata.text_file_offset;
+    meta->text_size = f->metadata.text_size;
+    meta->const0_file_offset = f->metadata.const0_file_offset;
+    meta->const0_size = f->metadata.const0_size;
+    meta->qmd_program_offset = program_offset;
+    meta->reg_count = reg_count;
+    meta->static_shared_mem_bytes = parsed_static_smem;
+    meta->local_mem_bytes = local_mem;
+    meta->const_mem_bytes = f->metadata.const_mem_bytes;
+    meta->max_threads_per_block = f->metadata.max_threads_per_block;
+    meta->sm_version = sass_version;
 }
 
 static int rm_prepare_launch_packet_locked(CUfunction f, const struct launch_request *req)
@@ -1909,7 +2259,9 @@ static int rm_prepare_launch_packet_locked(CUfunction f, const struct launch_req
     rm_build_hardware_qmd_locked(f, req, launch, completion);
     __sync_synchronize();
 
-    tracef("RM staged hardware QMD launch_id=%llu fn=%s pb=0x%llx qmd=0x%llx code=0x%llx params=0x%llx/%zu completion=0x%llx host_sem=0x%llx qmd_sem=0x%llx grid=%ux%ux%u block=%ux%ux%u qmd_payload=0x%x",
+    struct lanxin_qmd_staging_desc *qmd_meta =
+        (struct lanxin_qmd_staging_desc *)((uint8_t *)launch->qmd.cpu + LANXIN_HW_QMD_BYTES);
+    tracef("RM staged hardware QMD launch_id=%llu fn=%s pb=0x%llx qmd=0x%llx code=0x%llx params=0x%llx/%zu completion=0x%llx host_sem=0x%llx qmd_sem=0x%llx grid=%ux%ux%u block=%ux%ux%u qmd_payload=0x%x meta=%u program_offset=0x%x regs=%u smem=%u local=%u sm=%u",
            launch->launch_id, f->name != NULL ? f->name : "<unnamed>",
            (unsigned long long)launch->pushbuffer.gpu_va,
            (unsigned long long)launch->qmd.gpu_va,
@@ -1920,7 +2272,9 @@ static int rm_prepare_launch_packet_locked(CUfunction f, const struct launch_req
            (unsigned long long)rm_completion_qmd_va(launch),
            req->grid[0], req->grid[1], req->grid[2],
            req->block[0], req->block[1], req->block[2],
-           completion->expected_qmd_done);
+           completion->expected_qmd_done,
+           qmd_meta->metadata_flags, qmd_meta->qmd_program_offset, qmd_meta->reg_count,
+           qmd_meta->shared_mem_bytes, qmd_meta->local_mem_bytes, qmd_meta->sm_version);
     return 0;
 }
 
@@ -4182,6 +4536,20 @@ CUresult CUDAAPI cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const cha
     fn->name = strdup(name);
     fn->name_hash = fnv1a64_str(name);
     fn->module = hmod;
+    if (module_find_kernel_metadata(hmod, name, &fn->metadata)) {
+        tracef("cuModuleGetFunction cubin name=%s text_off=0x%llx text_size=%llu program_offset=0x%x regs=%u static_smem=%u local=%u const0=0x%llx/%llu max_threads=%u sm=%u",
+               name,
+               (unsigned long long)fn->metadata.text_file_offset,
+               (unsigned long long)fn->metadata.text_size,
+               fn->metadata.qmd_program_offset,
+               fn->metadata.reg_count,
+               fn->metadata.static_shared_mem_bytes,
+               fn->metadata.local_mem_bytes,
+               (unsigned long long)fn->metadata.const0_file_offset,
+               (unsigned long long)fn->metadata.const0_size,
+               fn->metadata.max_threads_per_block,
+               fn->metadata.sm_version);
+    }
     fn->next = hmod->functions;
     hmod->functions = fn;
     *hfunc = fn;
@@ -4226,13 +4594,20 @@ CUresult CUDAAPI cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunc
     }
     switch (attrib) {
     case CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK:
-        *pi = 1024;
+        *pi = hfunc->metadata.valid && hfunc->metadata.max_threads_per_block != 0 ?
+              (int)hfunc->metadata.max_threads_per_block : 1024;
         return CUDA_SUCCESS;
     case CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES:
+        *pi = hfunc->metadata.valid ? (int)hfunc->metadata.static_shared_mem_bytes : 0;
+        return CUDA_SUCCESS;
     case CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES:
+        *pi = hfunc->metadata.valid ? (int)hfunc->metadata.const_mem_bytes : 0;
+        return CUDA_SUCCESS;
     case CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES:
+        *pi = hfunc->metadata.valid ? (int)hfunc->metadata.local_mem_bytes : 0;
+        return CUDA_SUCCESS;
     case CU_FUNC_ATTRIBUTE_NUM_REGS:
-        *pi = 0;
+        *pi = hfunc->metadata.valid ? (int)hfunc->metadata.reg_count : 0;
         return CUDA_SUCCESS;
     case CU_FUNC_ATTRIBUTE_PTX_VERSION:
         *pi = 120;
