@@ -568,6 +568,7 @@ struct CUmod_st {
     const void *image;
     void *owned_image;
     size_t image_size;
+    bool kernels_discovered;
     struct rm_stage_buffer code;
     size_t staged_code_bytes;
     rm_u32 staged_code_layout;
@@ -1048,6 +1049,17 @@ static bool kernel_named_section_matches(const char *section_name, const char *p
            strcmp(section_name + prefix_len, kernel_name) == 0;
 }
 
+static const char *kernel_name_from_text_section(const char *section_name)
+{
+    const char prefix[] = ".text.";
+    if (section_name == NULL ||
+        strncmp(section_name, prefix, sizeof(prefix) - 1U) != 0) {
+        return NULL;
+    }
+    const char *name = section_name + sizeof(prefix) - 1U;
+    return name[0] != '\0' ? name : NULL;
+}
+
 static void parse_kernel_nv_info(const unsigned char *data, rm_u64 size,
                                  struct lanxin_kernel_metadata *meta)
 {
@@ -1225,6 +1237,131 @@ static bool module_find_kernel_metadata(CUmodule module, const char *kernel_name
         meta->const_mem_bytes = const0.size > 0xffffffffULL ? 0xffffffffu : (rm_u32)const0.size;
     }
     return true;
+}
+
+static CUfunction module_find_function(CUmodule module, const char *name)
+{
+    if (!valid_module(module) || name == NULL) {
+        return NULL;
+    }
+    for (struct CUfunc_st *fn = module->functions; fn != NULL; fn = fn->next) {
+        if (strcmp(fn->name, name) == 0) {
+            return fn;
+        }
+    }
+    return NULL;
+}
+
+static CUresult module_get_or_create_function(CUfunction *hfunc, CUmodule hmod, const char *name)
+{
+    if (hfunc == NULL || !valid_module(hmod) || name == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUfunction existing = module_find_function(hmod, name);
+    if (existing != NULL) {
+        *hfunc = existing;
+        return CUDA_SUCCESS;
+    }
+    CUfunction fn = calloc(1, sizeof(*fn));
+    if (fn == NULL) {
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    fn->magic = HANDLE_MAGIC_FUNC;
+    fn->name = strdup(name);
+    if (fn->name == NULL) {
+        free(fn);
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    fn->name_hash = fnv1a64_str(name);
+    fn->module = hmod;
+    if (module_find_kernel_metadata(hmod, name, &fn->metadata)) {
+        tracef("cuModuleGetFunction cubin name=%s text_off=0x%llx text_size=%llu program_offset=0x%x regs=%u static_smem=%u local=%u const0=0x%llx/%llu max_threads=%u sm=%u",
+               name,
+               (unsigned long long)fn->metadata.text_file_offset,
+               (unsigned long long)fn->metadata.text_size,
+               fn->metadata.qmd_program_offset,
+               fn->metadata.reg_count,
+               fn->metadata.static_shared_mem_bytes,
+               fn->metadata.local_mem_bytes,
+               (unsigned long long)fn->metadata.const0_file_offset,
+               (unsigned long long)fn->metadata.const0_size,
+               fn->metadata.max_threads_per_block,
+               fn->metadata.sm_version);
+    }
+    fn->next = hmod->functions;
+    hmod->functions = fn;
+    *hfunc = fn;
+    return CUDA_SUCCESS;
+}
+
+static CUresult module_discover_cubin_kernels(CUmodule module)
+{
+    if (!valid_module(module)) {
+        return CUDA_ERROR_INVALID_HANDLE;
+    }
+    if (module->kernels_discovered) {
+        return CUDA_SUCCESS;
+    }
+    if (module->image == NULL || module->image_size < 64) {
+        module->kernels_discovered = true;
+        return CUDA_SUCCESS;
+    }
+
+    const unsigned char *image = (const unsigned char *)module->image;
+    size_t image_size = module->image_size;
+    if (image[0] != 0x7f || image[1] != 'E' || image[2] != 'L' || image[3] != 'F' ||
+        image[4] != 2 || image[5] != 1 || rd16le(image + 18) != LANXIN_ELF_EM_CUDA) {
+        module->kernels_discovered = true;
+        return CUDA_SUCCESS;
+    }
+
+    rm_u64 shoff = rd64le(image + 40);
+    uint16_t shentsize = rd16le(image + 58);
+    uint16_t shnum = rd16le(image + 60);
+    uint16_t shstrndx = rd16le(image + 62);
+    if (shentsize < 64 || shnum == 0 || shnum > 8192 || shstrndx >= shnum ||
+        !range_in_image(shoff, (rm_u64)shentsize * shnum, image_size)) {
+        module->kernels_discovered = true;
+        return CUDA_SUCCESS;
+    }
+
+    const unsigned char *shbase = image + shoff;
+    const unsigned char *shstr_hdr = shbase + (rm_u64)shstrndx * shentsize;
+    rm_u64 shstr_off = rd64le(shstr_hdr + 24);
+    rm_u64 shstr_size = rd64le(shstr_hdr + 32);
+    if (!range_in_image(shstr_off, shstr_size, image_size)) {
+        module->kernels_discovered = true;
+        return CUDA_SUCCESS;
+    }
+    const unsigned char *shstr = image + shstr_off;
+
+    unsigned int discovered = 0;
+    for (uint16_t i = 0; i < shnum; i++) {
+        struct elf64_section_view sec;
+        const unsigned char *hdr = shbase + (rm_u64)i * shentsize;
+        if (!elf_section_from_header(image, image_size, hdr, i, shstr, shstr_size, &sec) ||
+            sec.name == NULL || sec.type != LANXIN_ELF_SHT_PROGBITS ||
+            (sec.flags & LANXIN_ELF_SHF_EXECINSTR) == 0) {
+            continue;
+        }
+        const char *kernel_name = kernel_name_from_text_section(sec.name);
+        if (kernel_name == NULL || module_find_function(module, kernel_name) != NULL) {
+            continue;
+        }
+        CUfunction fn = NULL;
+        CUresult result = module_get_or_create_function(&fn, module, kernel_name);
+        if (result != CUDA_SUCCESS) {
+            return result;
+        }
+        discovered++;
+    }
+
+    module->kernels_discovered = true;
+    if (discovered != 0) {
+        tracef("cuModuleDiscoverKernels module=%s count=%u",
+               module->name != NULL ? module->name : "<module>", discovered);
+    }
+    return CUDA_SUCCESS;
 }
 
 static rm_u64 now_ns(void)
@@ -4275,6 +4412,7 @@ static CUmodule make_module(const char *name, const void *image, size_t image_si
         ((char *)module->owned_image)[image_size] = '\0';
         module->image = module->owned_image;
     }
+    (void)module_discover_cubin_kernels(module);
     pthread_mutex_lock(&g_lock);
     module->next = g.modules;
     g.modules = module;
@@ -4558,47 +4696,17 @@ CUresult CUDAAPI cuModuleUnload(CUmodule hmod)
 
 CUresult CUDAAPI cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name)
 {
-    if (hfunc == NULL || !valid_module(hmod) || name == NULL) {
-        return CUDA_ERROR_INVALID_VALUE;
-    }
-    for (struct CUfunc_st *fn = hmod->functions; fn != NULL; fn = fn->next) {
-        if (strcmp(fn->name, name) == 0) {
-            *hfunc = fn;
-            return CUDA_SUCCESS;
-        }
-    }
-    CUfunction fn = calloc(1, sizeof(*fn));
-    if (fn == NULL) {
-        return CUDA_ERROR_OUT_OF_MEMORY;
-    }
-    fn->magic = HANDLE_MAGIC_FUNC;
-    fn->name = strdup(name);
-    fn->name_hash = fnv1a64_str(name);
-    fn->module = hmod;
-    if (module_find_kernel_metadata(hmod, name, &fn->metadata)) {
-        tracef("cuModuleGetFunction cubin name=%s text_off=0x%llx text_size=%llu program_offset=0x%x regs=%u static_smem=%u local=%u const0=0x%llx/%llu max_threads=%u sm=%u",
-               name,
-               (unsigned long long)fn->metadata.text_file_offset,
-               (unsigned long long)fn->metadata.text_size,
-               fn->metadata.qmd_program_offset,
-               fn->metadata.reg_count,
-               fn->metadata.static_shared_mem_bytes,
-               fn->metadata.local_mem_bytes,
-               (unsigned long long)fn->metadata.const0_file_offset,
-               (unsigned long long)fn->metadata.const0_size,
-               fn->metadata.max_threads_per_block,
-               fn->metadata.sm_version);
-    }
-    fn->next = hmod->functions;
-    hmod->functions = fn;
-    *hfunc = fn;
-    return CUDA_SUCCESS;
+    return module_get_or_create_function(hfunc, hmod, name);
 }
 
 CUresult CUDAAPI cuModuleGetFunctionCount(unsigned int *count, CUmodule mod)
 {
     if (count == NULL || !valid_module(mod)) {
         return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUresult result = module_discover_cubin_kernels(mod);
+    if (result != CUDA_SUCCESS) {
+        return result;
     }
     unsigned int n = 0;
     for (struct CUfunc_st *fn = mod->functions; fn != NULL; fn = fn->next) {
@@ -4678,6 +4786,69 @@ CUresult CUDAAPI cuFuncSetSharedMemConfig(CUfunction hfunc, CUsharedconfig confi
     return valid_function(hfunc) ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 
+static CUkernel library_find_kernel(CUlibrary library, const char *name)
+{
+    if (!valid_library(library) || name == NULL) {
+        return NULL;
+    }
+    for (CUkernel kernel = library->kernels; kernel != NULL; kernel = kernel->next) {
+        if (strcmp(kernel->name, name) == 0) {
+            return kernel;
+        }
+    }
+    return NULL;
+}
+
+static CUresult library_get_or_create_kernel_for_function(CUkernel *pKernel,
+                                                          CUlibrary library,
+                                                          CUfunction function)
+{
+    if (pKernel == NULL || !valid_library(library) || !valid_function(function) ||
+        function->name == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUkernel existing = library_find_kernel(library, function->name);
+    if (existing != NULL) {
+        *pKernel = existing;
+        return CUDA_SUCCESS;
+    }
+    CUkernel kernel = calloc(1, sizeof(*kernel));
+    if (kernel == NULL) {
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    kernel->name = strdup(function->name);
+    if (kernel->name == NULL) {
+        free(kernel);
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    kernel->magic = HANDLE_MAGIC_KERNEL;
+    kernel->library = library;
+    kernel->function = function;
+    kernel->next = library->kernels;
+    library->kernels = kernel;
+    *pKernel = kernel;
+    return CUDA_SUCCESS;
+}
+
+static CUresult library_populate_kernels(CUlibrary library)
+{
+    if (!valid_library(library) || !valid_module(library->module)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUresult result = module_discover_cubin_kernels(library->module);
+    if (result != CUDA_SUCCESS) {
+        return result;
+    }
+    for (struct CUfunc_st *fn = library->module->functions; fn != NULL; fn = fn->next) {
+        CUkernel kernel = NULL;
+        result = library_get_or_create_kernel_for_function(&kernel, library, fn);
+        if (result != CUDA_SUCCESS) {
+            return result;
+        }
+    }
+    return CUDA_SUCCESS;
+}
+
 static CUresult make_library_from_module(CUlibrary *library, CUmodule module)
 {
     if (library == NULL || !valid_module(module)) {
@@ -4689,6 +4860,12 @@ static CUresult make_library_from_module(CUlibrary *library, CUmodule module)
     }
     lib->magic = HANDLE_MAGIC_LIBRARY;
     lib->module = module;
+    CUresult result = library_populate_kernels(lib);
+    if (result != CUDA_SUCCESS) {
+        lib->magic = 0;
+        free(lib);
+        return result;
+    }
     *library = lib;
     return CUDA_SUCCESS;
 }
@@ -4770,39 +4947,27 @@ CUresult CUDAAPI cuLibraryGetKernel(CUkernel *pKernel, CUlibrary library, const 
     if (pKernel == NULL || !valid_library(library) || name == NULL) {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    for (CUkernel kernel = library->kernels; kernel != NULL; kernel = kernel->next) {
-        if (strcmp(kernel->name, name) == 0) {
-            *pKernel = kernel;
-            return CUDA_SUCCESS;
-        }
+    CUkernel existing = library_find_kernel(library, name);
+    if (existing != NULL) {
+        *pKernel = existing;
+        return CUDA_SUCCESS;
     }
     CUfunction function = NULL;
     CUresult result = cuModuleGetFunction(&function, library->module, name);
     if (result != CUDA_SUCCESS) {
         return result;
     }
-    CUkernel kernel = calloc(1, sizeof(*kernel));
-    if (kernel == NULL) {
-        return CUDA_ERROR_OUT_OF_MEMORY;
-    }
-    kernel->name = strdup(name);
-    if (kernel->name == NULL) {
-        free(kernel);
-        return CUDA_ERROR_OUT_OF_MEMORY;
-    }
-    kernel->magic = HANDLE_MAGIC_KERNEL;
-    kernel->library = library;
-    kernel->function = function;
-    kernel->next = library->kernels;
-    library->kernels = kernel;
-    *pKernel = kernel;
-    return CUDA_SUCCESS;
+    return library_get_or_create_kernel_for_function(pKernel, library, function);
 }
 
 CUresult CUDAAPI cuLibraryGetKernelCount(unsigned int *count, CUlibrary lib)
 {
     if (count == NULL || !valid_library(lib)) {
         return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUresult result = library_populate_kernels(lib);
+    if (result != CUDA_SUCCESS) {
+        return result;
     }
     unsigned int n = 0;
     for (CUkernel kernel = lib->kernels; kernel != NULL; kernel = kernel->next) {
@@ -4816,6 +4981,10 @@ CUresult CUDAAPI cuLibraryEnumerateKernels(CUkernel *kernels, unsigned int numKe
 {
     if ((kernels == NULL && numKernels != 0) || !valid_library(lib)) {
         return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUresult result = library_populate_kernels(lib);
+    if (result != CUDA_SUCCESS) {
+        return result;
     }
     unsigned int i = 0;
     for (CUkernel kernel = lib->kernels; kernel != NULL && i < numKernels; kernel = kernel->next) {

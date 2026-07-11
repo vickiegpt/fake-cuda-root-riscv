@@ -6,13 +6,16 @@
 #include <string.h>
 
 #define FATBINC_MAGIC 0x466243b1
-#define SYNTH_ELF_SIZE 0x3c0u
+#define SYNTH_ELF_SIZE 0x580u
 #define SHSTRTAB_OFF 0x40u
-#define TEXT_OFF 0x180u
-#define INFO_OFF 0x200u
+#define TEXT0_OFF 0x180u
+#define INFO0_OFF 0x200u
 #define CONST0_OFF 0x240u
-#define SHDR_OFF 0x280u
-#define SHNUM 5u
+#define TEXT1_OFF 0x280u
+#define INFO1_OFF 0x300u
+#define CONST1_OFF 0x340u
+#define SHDR_OFF 0x380u
+#define SHNUM 8u
 
 typedef struct {
     int magic;
@@ -84,6 +87,12 @@ static int fail(CUresult result, const char *what)
     return 1;
 }
 
+static int fail_count(const char *what, unsigned int got, unsigned int expected)
+{
+    fprintf(stderr, "%s mismatch: got=%u expected>=%u\n", what, got, expected);
+    return 2;
+}
+
 static int check_attr(CUfunction fn, CUfunction_attribute attrib, int expected, const char *name)
 {
     int got = -1;
@@ -122,29 +131,47 @@ static void build_synthetic_cubin(unsigned char *image)
     unsigned char *shstr = image + SHSTRTAB_OFF;
     size_t shcur = 1;
     uint32_t shstr_name = add_shstr(shstr, &shcur, ".shstrtab");
-    uint32_t text_name = add_shstr(shstr, &shcur, ".text.fake_kernel");
-    uint32_t info_name = add_shstr(shstr, &shcur, ".nv.info.fake_kernel");
+    uint32_t text0_name = add_shstr(shstr, &shcur, ".text.fake_kernel");
+    uint32_t info0_name = add_shstr(shstr, &shcur, ".nv.info.fake_kernel");
     uint32_t const0_name = add_shstr(shstr, &shcur, ".nv.constant0.fake_kernel");
+    uint32_t text1_name = add_shstr(shstr, &shcur, ".text.second_kernel");
+    uint32_t info1_name = add_shstr(shstr, &shcur, ".nv.info.second_kernel");
+    uint32_t const1_name = add_shstr(shstr, &shcur, ".nv.constant0.second_kernel");
 
     for (uint32_t i = 0; i < 64; i++) {
-        image[TEXT_OFF + i] = (unsigned char)(0xa0u + (i & 0x1fu));
+        image[TEXT0_OFF + i] = (unsigned char)(0xa0u + (i & 0x1fu));
+    }
+    for (uint32_t i = 0; i < 48; i++) {
+        image[TEXT1_OFF + i] = (unsigned char)(0xc0u + (i & 0x1fu));
     }
 
-    size_t info_cur = 0;
-    write_attr_u32(image + INFO_OFF, &info_cur, 0x2f04, 48);  /* REGCOUNT */
-    write_attr_u32(image + INFO_OFF, &info_cur, 0x0504, 256); /* MAX_THREADS */
-    write_attr_u32(image + INFO_OFF, &info_cur, 0x0808, 128); /* SMEM_SIZE */
-    write_attr_u32(image + INFO_OFF, &info_cur, 0x0a04, 16);  /* LMEM_SIZE */
+    size_t info0_cur = 0;
+    write_attr_u32(image + INFO0_OFF, &info0_cur, 0x2f04, 48);  /* REGCOUNT */
+    write_attr_u32(image + INFO0_OFF, &info0_cur, 0x0504, 256); /* MAX_THREADS */
+    write_attr_u32(image + INFO0_OFF, &info0_cur, 0x0808, 128); /* SMEM_SIZE */
+    write_attr_u32(image + INFO0_OFF, &info0_cur, 0x0a04, 16);  /* LMEM_SIZE */
+
+    size_t info1_cur = 0;
+    write_attr_u32(image + INFO1_OFF, &info1_cur, 0x2f04, 24);  /* REGCOUNT */
+    write_attr_u32(image + INFO1_OFF, &info1_cur, 0x0504, 128); /* MAX_THREADS */
+    write_attr_u32(image + INFO1_OFF, &info1_cur, 0x0808, 64);  /* SMEM_SIZE */
+    write_attr_u32(image + INFO1_OFF, &info1_cur, 0x0a04, 0);   /* LMEM_SIZE */
 
     for (uint32_t i = 0; i < 32; i++) {
         image[CONST0_OFF + i] = (unsigned char)i;
     }
+    for (uint32_t i = 0; i < 16; i++) {
+        image[CONST1_OFF + i] = (unsigned char)(0x80u + i);
+    }
 
     unsigned char *sh = image + SHDR_OFF;
     write_shdr(sh + 1 * 64, shstr_name, 3, 0, 0, SHSTRTAB_OFF, shcur, 0, 0, 1, 0);
-    write_shdr(sh + 2 * 64, text_name, 1, 0x6, 0, TEXT_OFF, 64, 0, 0, 128, 0);
-    write_shdr(sh + 3 * 64, info_name, 0x70000000u, 0, 0, INFO_OFF, info_cur, 0, 2, 4, 0);
+    write_shdr(sh + 2 * 64, text0_name, 1, 0x6, 0, TEXT0_OFF, 64, 0, 0, 128, 0);
+    write_shdr(sh + 3 * 64, info0_name, 0x70000000u, 0, 0, INFO0_OFF, info0_cur, 0, 2, 4, 0);
     write_shdr(sh + 4 * 64, const0_name, 1, 0x2, 0, CONST0_OFF, 32, 0, 0, 4, 0);
+    write_shdr(sh + 5 * 64, text1_name, 1, 0x6, 0, TEXT1_OFF, 48, 0, 0, 128, 0);
+    write_shdr(sh + 6 * 64, info1_name, 0x70000000u, 0, 0, INFO1_OFF, info1_cur, 0, 5, 4, 0);
+    write_shdr(sh + 7 * 64, const1_name, 1, 0x2, 0, CONST1_OFF, 16, 0, 0, 4, 0);
 }
 
 int main(void)
@@ -155,6 +182,15 @@ int main(void)
     CUmodule mod_fatbin = NULL;
     CUfunction fn_elf = NULL;
     CUfunction fn_fatbin = NULL;
+    CUfunction fn_elf_second = NULL;
+    CUfunction fn_fatbin_second = NULL;
+    CUlibrary lib_elf = NULL;
+    CUkernel kernel_fake = NULL;
+    CUkernel kernel_second = NULL;
+    CUkernel kernels[4] = {0};
+    unsigned int function_count_elf = 0;
+    unsigned int function_count_fatbin = 0;
+    unsigned int kernel_count = 0;
 
     build_synthetic_cubin(elf_image);
     fatbin_wrapper_t wrapper = {
@@ -169,13 +205,23 @@ int main(void)
 
     result = cuModuleLoadData(&mod_elf, elf_image);
     if (result != CUDA_SUCCESS) return fail(result, "cuModuleLoadData(elf)");
+    result = cuModuleGetFunctionCount(&function_count_elf, mod_elf);
+    if (result != CUDA_SUCCESS) return fail(result, "cuModuleGetFunctionCount(elf)");
+    if (function_count_elf < 2) return fail_count("function_count_elf", function_count_elf, 2);
     result = cuModuleGetFunction(&fn_elf, mod_elf, "fake_kernel");
     if (result != CUDA_SUCCESS) return fail(result, "cuModuleGetFunction(elf)");
+    result = cuModuleGetFunction(&fn_elf_second, mod_elf, "second_kernel");
+    if (result != CUDA_SUCCESS) return fail(result, "cuModuleGetFunction(elf second)");
 
     result = cuModuleLoadFatBinary(&mod_fatbin, &wrapper);
     if (result != CUDA_SUCCESS) return fail(result, "cuModuleLoadFatBinary(wrapper)");
+    result = cuModuleGetFunctionCount(&function_count_fatbin, mod_fatbin);
+    if (result != CUDA_SUCCESS) return fail(result, "cuModuleGetFunctionCount(fatbin)");
+    if (function_count_fatbin < 2) return fail_count("function_count_fatbin", function_count_fatbin, 2);
     result = cuModuleGetFunction(&fn_fatbin, mod_fatbin, "fake_kernel");
     if (result != CUDA_SUCCESS) return fail(result, "cuModuleGetFunction(fatbin)");
+    result = cuModuleGetFunction(&fn_fatbin_second, mod_fatbin, "second_kernel");
+    if (result != CUDA_SUCCESS) return fail(result, "cuModuleGetFunction(fatbin second)");
 
     if (check_attr(fn_elf, CU_FUNC_ATTRIBUTE_NUM_REGS, 48, "NUM_REGS") ||
         check_attr(fn_elf, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, 256, "MAX_THREADS") ||
@@ -184,9 +230,38 @@ int main(void)
         check_attr(fn_elf, CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES, 32, "CONST_SIZE")) {
         return 2;
     }
+    if (check_attr(fn_elf_second, CU_FUNC_ATTRIBUTE_NUM_REGS, 24, "SECOND_NUM_REGS") ||
+        check_attr(fn_elf_second, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, 128, "SECOND_MAX_THREADS") ||
+        check_attr(fn_elf_second, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, 64, "SECOND_SHARED_SIZE") ||
+        check_attr(fn_elf_second, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, 0, "SECOND_LOCAL_SIZE") ||
+        check_attr(fn_elf_second, CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES, 16, "SECOND_CONST_SIZE")) {
+        return 2;
+    }
+
+    result = cuLibraryLoadData(&lib_elf, elf_image, NULL, NULL, 0, NULL, NULL, 0);
+    if (result != CUDA_SUCCESS) return fail(result, "cuLibraryLoadData(elf)");
+    result = cuLibraryGetKernelCount(&kernel_count, lib_elf);
+    if (result != CUDA_SUCCESS) return fail(result, "cuLibraryGetKernelCount(elf)");
+    if (kernel_count < 2) return fail_count("kernel_count", kernel_count, 2);
+    result = cuLibraryEnumerateKernels(kernels, 4, lib_elf);
+    if (result != CUDA_SUCCESS) return fail(result, "cuLibraryEnumerateKernels(elf)");
+    if (kernels[0] == NULL || kernels[1] == NULL) {
+        fprintf(stderr, "library enumerate did not return two kernels\n");
+        return 2;
+    }
+    result = cuLibraryGetKernel(&kernel_fake, lib_elf, "fake_kernel");
+    if (result != CUDA_SUCCESS) return fail(result, "cuLibraryGetKernel(fake)");
+    result = cuLibraryGetKernel(&kernel_second, lib_elf, "second_kernel");
+    if (result != CUDA_SUCCESS) return fail(result, "cuLibraryGetKernel(second)");
+    if (kernel_fake == kernel_second) {
+        fprintf(stderr, "library kernels alias unexpectedly\n");
+        return 2;
+    }
 
     if (getenv("LANXIN_NVIDIA_CUDA_MODULE_IMAGE_LAUNCH") != NULL) {
-        result = cuLaunchKernel(fn_elf, 1, 1, 1, 1, 1, 1, 0, NULL, NULL, NULL);
+        CUfunction launch_fn = getenv("LANXIN_NVIDIA_CUDA_MODULE_IMAGE_LAUNCH_SECOND") != NULL ?
+                               fn_elf_second : fn_elf;
+        result = cuLaunchKernel(launch_fn, 1, 1, 1, 1, 1, 1, 0, NULL, NULL, NULL);
         if (result != CUDA_SUCCESS) {
             if (!((getenv("LANXIN_NVIDIA_CUDA_STRICT_LAUNCH") != NULL ||
                    getenv("LANXIN_NVIDIA_CUDA_QMD_SUBMIT") != NULL) &&
@@ -196,9 +271,11 @@ int main(void)
         }
     }
 
+    cuLibraryUnload(lib_elf);
     cuModuleUnload(mod_fatbin);
     cuModuleUnload(mod_elf);
 
-    printf("module_image_probe result=ok expected_size=%u kernel=fake_kernel\n", SYNTH_ELF_SIZE);
+    printf("module_image_probe result=ok expected_size=%u kernels=%u library_kernels=%u primary=fake_kernel secondary=second_kernel\n",
+           SYNTH_ELF_SIZE, function_count_elf, kernel_count);
     return 0;
 }
