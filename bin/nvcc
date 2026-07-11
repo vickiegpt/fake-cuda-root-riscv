@@ -33,7 +33,13 @@ append_xcompiler_arg() {
     # llama.cpp joins host warning flags into one -Xcompiler argument. Split that
     # back into clang arguments so CMake's CUDA checks and final builds agree.
     read -r -a split_xcompiler_arg <<< "$1"
-    ARGS+=("${split_xcompiler_arg[@]}")
+    for split_arg in "${split_xcompiler_arg[@]}"; do
+        clean_arg="${split_arg%\"}"
+        clean_arg="${clean_arg#\"}"
+        clean_arg="${clean_arg%\'}"
+        clean_arg="${clean_arg#\'}"
+        [ -n "$clean_arg" ] && ARGS+=("$clean_arg")
+    done
 }
 
 # Filter nvcc-only flags, extract arch, and pass usable host flags to clang.
@@ -52,14 +58,18 @@ while [ "$#" -gt 0 ]; do
                 [ -n "$arch_code" ] && ARCH="$arch_code"
             fi
             ;;
-        -Xcompiler)
+        -Xcompiler|--compiler-options|--compiler-options=*)
+            if [[ "$arg" == --compiler-options=* ]]; then
+                append_xcompiler_arg "${arg#--compiler-options=}"
+                continue
+            fi
             if [ "$#" -gt 0 ]; then
                 append_xcompiler_arg "$1"
                 shift
             fi
             ;;
         # nvcc flags with embedded value.
-        -gencode=*|-Xptxas=*)
+        -gencode=*|-Xptxas=*|--ptxas-options=*)
             arch_code=$(echo "$arg" | grep -oP "sm_\d+" | head -1)
             [ -n "$arch_code" ] && ARCH="$arch_code"
             ;;
@@ -72,7 +82,7 @@ while [ "$#" -gt 0 ]; do
             [ -n "$arch_code" ] && ARCH="$arch_code"
             ;;
         # nvcc-specific flags clang does not understand — drop silently
-        --expt-extended-lambda|--expt-relaxed-constexpr|-extended-lambda|--use_fast_math|-use_fast_math|--keep|-compress-all|-compress-mode=*|--compress-mode=*|-Wnvlink*|-extra-device-vectorization|--ptx|--cubin|--fatbin|--dopt=*|--generate-dependencies-with-compile|--generate-nonsystem-deps|--dependency-output|-rdc=*|--relocatable-device-code=*|--source-in-ptx|--threads=*|-threads=*|--default-stream=*|--display-error-number|--no-cuda-version-check|-Xcuda-fatbinary=*|-Xfatbin=*)
+        --expt-extended-lambda|--expt-relaxed-constexpr|--extended-lambda|-extended-lambda|--use_fast_math|-use_fast_math|--keep|-compress-all|-compress-mode=*|--compress-mode=*|-Wnvlink*|-extra-device-vectorization|--ptx|--cubin|--fatbin|--dopt=*|--generate-dependencies-with-compile|--generate-nonsystem-deps|--dependency-output|-rdc=*|--relocatable-device-code=*|--source-in-ptx|--threads=*|-threads=*|--default-stream=*|--display-error-number|--no-cuda-version-check|-Xcuda-fatbinary=*|-Xfatbin=*|--diag-suppress=*|--ptxas-options=*)
             ;;
         --keep-dir=*|-keep-dir=*)
             ;;

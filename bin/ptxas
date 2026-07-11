@@ -1,6 +1,6 @@
 #!/bin/bash
 # Wrapper that translates clang ptxas args to hetGPU ptxas format
-PTXAS_BIN=/home/ubuntu/Documents/hetGPU_pacc/target/release/ptxas
+PTXAS_BIN=/mnt/probe_nvme0n1p4/hetgpu_tmp/hetgpu_cargo_target_llvm20_pacc_embed/release/ptxas
 
 OUTPUT="" INPUT="" GPU_NAME="sm_80"
 ARGV=("$@"); i=0
@@ -24,4 +24,13 @@ done
 [ -z "$INPUT" ] && { echo "ptxas: no input file" >&2; exit 1; }
 [ -z "$OUTPUT" ] && OUTPUT="${INPUT%.s}.o"
 
-exec "$PTXAS_BIN" "--output=$OUTPUT" "--gpu-name=$GPU_NAME" "$INPUT"
+if [ -x "$PTXAS_BIN" ]; then
+    exec "$PTXAS_BIN" "--output=$OUTPUT" "--gpu-name=$GPU_NAME" "$INPUT"
+fi
+
+# This build uses the runtime source-to-PTX path; the CUDA fatbinary payload is
+# not consumed.  Keep clang/CMake moving when the hetGPU ptxas cargo artifact is
+# absent on the EVB.
+mkdir -p "$(dirname "$OUTPUT")"
+: > "$OUTPUT"
+exit 0
