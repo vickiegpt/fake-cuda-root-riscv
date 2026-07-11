@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -109,6 +110,9 @@
 #define RM_NV01_MEMORY_SYSTEM 0x3eu
 #define RM_NV01_MEMORY_VIRTUAL 0x70u
 #define RM_BLACKWELL_CHANNEL_GPFIFO_B 0xca6fu
+#define RM_BLACKWELL_USERMODE_A 0xc761u
+#define RM_HOPPER_USERMODE_A 0xc661u
+#define RM_VOLTA_USERMODE_A 0xc361u
 #define RM_BLACKWELL_COMPUTE_B 0xcec0u
 #define RM_BLACKWELL_COMPUTE_A 0xcdc0u
 #define RM_HOPPER_COMPUTE_A 0xcbc0u
@@ -127,16 +131,43 @@
 #define RM_NVOS04_FLAGS_MAP_CHANNEL_TRUE (1u << 30)
 #define RM_NVOS46_FLAGS_CACHE_SNOOP_ENABLE (1u << 4)
 #define RM_NVOS46_FLAGS_PAGE_SIZE_4KB (1u << 8)
+#define RM_NVOS33_FLAGS_ACCESS_WRITE_ONLY 0x2u
 #define RM_NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES 0u
 #define RM_NVA06F_CTRL_CMD_GPFIFO_SCHEDULE 0xa06f0103u
 #define RM_NVA06F_CTRL_CMD_BIND 0xa06f0104u
 #define RM_NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN 0xc36f0108u
+#define RM_NVC36F_CTRL_CMD_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX 0xc36f010au
 #define RM_NV906F_CTRL_GET_CLASS_ENGINEID 0x906f0101u
+#define RM_NV_CHANNELGPFIFO_NOTIFICATION_TYPE_SIZE_1 3u
+#define RM_NV_NOTIFICATION_BYTES 16u
+#define RM_NV_NOTIFICATION_INFO32_OFFSET 8u
+#define RM_NVC361_NV_USERMODE_SIZE 65536u
+#define RM_NVC361_NOTIFY_CHANNEL_PENDING 0x90u
 #define RM_NVA06F_SUBCHANNEL_COMPUTE 1u
 #define RM_NVC46F_DMA_SEC_OP_INC_METHOD 1u
 #define RM_COMPUTE_SET_OBJECT 0x0000u
 #define RM_COMPUTE_NO_OPERATION 0x0100u
 #define RM_COMPUTE_PIPE_NOP 0x1a2cu
+#define RM_COMPUTE_SET_PROGRAM_REGION_A 0x1608u
+#define RM_COMPUTE_SET_PROGRAM_REGION_B 0x160cu
+#define RM_COMPUTE_SET_QMD_VERSION 0x0288u
+#define RM_COMPUTE_CHECK_QMD_VERSION 0x0290u
+#define RM_COMPUTE_SET_CWD_SLOT_COUNT 0x02b0u
+#define RM_COMPUTE_SEND_PCAS_A 0x02b4u
+#define RM_COMPUTE_SEND_PCAS_B 0x02b8u
+#define RM_COMPUTE_SEND_SIGNALING_PCAS_B 0x02bcu
+#define RM_CHANNEL_SUBCHANNEL_HOST 0u
+#define RM_CHANNEL_SEM_ADDR_LO 0x005cu
+#define RM_CHANNEL_SEM_EXECUTE_RELEASE (1u << 0)
+#define RM_CHANNEL_SEM_EXECUTE_RELEASE_WFI_EN (1u << 20)
+#define RM_CHANNEL_SEM_EXECUTE_PAYLOAD_SIZE_32BIT 0u
+#define RM_CHANNEL_SEM_EXECUTE_PAYLOAD_SIZE_64BIT (1u << 24)
+#define RM_CHANNEL_SEM_EXECUTE_RELEASE_TIMESTAMP_DIS 0u
+#define LANXIN_HW_QMD_WORDS 64u
+#define LANXIN_HW_QMD_BYTES (LANXIN_HW_QMD_WORDS * sizeof(rm_u32))
+#define LANXIN_QMD_VERSION_01_06 0x0106u
+#define LANXIN_QMD_MAJOR_VERSION 1u
+#define LANXIN_QMD_MINOR_VERSION 6u
 #define LANXIN_QMD_STAGING_MAGIC 0x4c584e56514d4431ULL
 #define LANXIN_QMD_STAGING_VERSION 1u
 #define LANXIN_COMPLETION_MAGIC 0x4c584e56434d5031ULL
@@ -373,6 +404,15 @@ typedef struct {
 } rm_channel_token_params_t;
 
 typedef struct {
+    rm_u32 index;
+} rm_channel_token_notif_index_params_t;
+
+typedef struct {
+    rm_bool bBar1Mapping;
+    rm_bool bPriv;
+} rm_hopper_usermode_params_t;
+
+typedef struct {
     rm_handle hObject;
     rm_u32 classEngineID;
     rm_u32 classID;
@@ -414,16 +454,21 @@ struct lanxin_qmd_staging_desc {
 };
 
 struct lanxin_launch_completion {
+    volatile rm_u64 host_progress;
+    volatile rm_u32 qmd_done;
+    rm_u32 status;
     rm_u64 magic;
     rm_u64 launch_id;
-    rm_u32 status;
-    rm_u32 reserved0;
     rm_u64 gpfifo_put;
     rm_u64 timestamp_ns;
+    rm_u64 expected_host_progress;
+    rm_u32 expected_qmd_done;
+    rm_u32 qmd_submitted;
     rm_u64 reserved[4];
 };
 
 struct launch_staging {
+    struct rm_stage_buffer pushbuffer;
     struct rm_stage_buffer qmd;
     struct rm_stage_buffer params;
     struct rm_stage_buffer completion;
@@ -534,8 +579,10 @@ struct driver_state {
     int gpu_fd;
     int uvm_fd;
     int uvm_tools_fd;
+    int rm_notifier_fd;
     int rm_gpfifo_fd;
     int rm_userd_fd;
+    int rm_usermode_fd;
     int device_count;
     char name[128];
     char bus_id[32];
@@ -563,16 +610,26 @@ struct driver_state {
     rm_handle rm_error_ctxdma;
     rm_handle rm_gpfifo;
     rm_handle rm_userd;
+    rm_handle rm_usermode;
+    rm_handle rm_usermode_parent;
     rm_handle rm_channel;
     rm_handle rm_compute;
     rm_p64 rm_notifier_va;
+    rm_p64 rm_notifier_linear;
     rm_p64 rm_gpfifo_va;
     rm_p64 rm_gpfifo_linear;
     rm_p64 rm_userd_linear;
+    rm_p64 rm_usermode_linear;
+    size_t rm_gpfifo_size;
+    void *rm_notifier_cpu;
     void *rm_gpfifo_cpu;
     void *rm_userd_cpu;
+    void *rm_usermode_cpu;
     rm_u32 rm_work_submit_token;
+    rm_u32 rm_doorbell_token;
+    rm_u32 rm_token_notifier_index;
     rm_u32 rm_gpfifo_put;
+    rm_u32 rm_usermode_class;
     rm_u32 rm_compute_class;
     rm_u32 rm_compute_class_engine_id;
     struct allocation *allocs;
@@ -585,8 +642,10 @@ static struct driver_state g = {
     .gpu_fd = -1,
     .uvm_fd = -1,
     .uvm_tools_fd = -1,
+    .rm_notifier_fd = -1,
     .rm_gpfifo_fd = -1,
     .rm_userd_fd = -1,
+    .rm_usermode_fd = -1,
     .device_count = 0,
     .name = "NVIDIA GPU",
     .bus_id = "0001:01:00.0",
@@ -605,6 +664,7 @@ static __thread int tls_ctx_depth;
 
 static bool valid_module(CUmodule module);
 static bool valid_function(CUfunction function);
+static rm_u32 env_u32(const char *name, rm_u32 fallback);
 
 static int env_enabled(const char *name)
 {
@@ -755,15 +815,18 @@ static int rm_alloc_memory_locked(int ioctl_fd, int map_fd, rm_handle *hMemory,
     return -1;
 }
 
-static int rm_map_cpu_locked(int map_fd, rm_handle hMemory, size_t size,
-                             rm_p64 *linear, void **cpu, const char *label)
+static int rm_map_cpu_with_parent_flags_locked(int map_fd, rm_handle hDevice, rm_handle hMemory,
+                                               size_t size, rm_u32 flags,
+                                               rm_p64 *linear, void **cpu,
+                                               const char *label)
 {
     rm_nvos33_with_fd_t api;
     memset(&api, 0, sizeof(api));
     api.params.hClient = g.rm_client;
-    api.params.hDevice = g.rm_device;
+    api.params.hDevice = hDevice != 0 ? hDevice : g.rm_device;
     api.params.hMemory = hMemory;
     api.params.length = size;
+    api.params.flags = flags;
     api.fd = map_fd;
     int rc = rm_ioctl_xfer(g.ctl_fd, RM_ESC_RM_MAP_MEMORY, &api, sizeof(api));
     tracef("%s map ioctl=%d errno=%d status=0x%08x linear=0x%llx",
@@ -778,7 +841,7 @@ static int rm_map_cpu_locked(int map_fd, rm_handle hMemory, size_t size,
         rm_nvos34_t unmap_api;
         memset(&unmap_api, 0, sizeof(unmap_api));
         unmap_api.hClient = g.rm_client;
-        unmap_api.hDevice = g.rm_device;
+        unmap_api.hDevice = api.params.hDevice;
         unmap_api.hMemory = hMemory;
         unmap_api.pLinearAddress = api.params.pLinearAddress;
         (void)rm_ioctl_xfer(g.ctl_fd, RM_ESC_RM_UNMAP_MEMORY, &unmap_api, sizeof(unmap_api));
@@ -789,7 +852,22 @@ static int rm_map_cpu_locked(int map_fd, rm_handle hMemory, size_t size,
     return 0;
 }
 
-static void rm_unmap_cpu_locked(rm_handle hMemory, rm_p64 linear, void *cpu, size_t size)
+static int rm_map_cpu_with_parent_locked(int map_fd, rm_handle hDevice, rm_handle hMemory,
+                                         size_t size, rm_p64 *linear, void **cpu,
+                                         const char *label)
+{
+    return rm_map_cpu_with_parent_flags_locked(map_fd, hDevice, hMemory, size, 0,
+                                               linear, cpu, label);
+}
+
+static int rm_map_cpu_locked(int map_fd, rm_handle hMemory, size_t size,
+                             rm_p64 *linear, void **cpu, const char *label)
+{
+    return rm_map_cpu_with_parent_locked(map_fd, g.rm_device, hMemory, size, linear, cpu, label);
+}
+
+static void rm_unmap_cpu_with_parent_locked(rm_handle hDevice, rm_handle hMemory,
+                                            rm_p64 linear, void *cpu, size_t size)
 {
     if (cpu != NULL && size != 0) {
         munmap(cpu, size);
@@ -798,13 +876,18 @@ static void rm_unmap_cpu_locked(rm_handle hMemory, rm_p64 linear, void *cpu, siz
         rm_nvos34_t api;
         memset(&api, 0, sizeof(api));
         api.hClient = g.rm_client;
-        api.hDevice = g.rm_device;
+        api.hDevice = hDevice != 0 ? hDevice : g.rm_device;
         api.hMemory = hMemory;
         api.pLinearAddress = linear;
         int rc = rm_ioctl_xfer(g.ctl_fd, RM_ESC_RM_UNMAP_MEMORY, &api, sizeof(api));
         tracef("RM unmap cpu memory=0x%x ioctl=%d errno=%d status=0x%08x",
                hMemory, rc, rc == 0 ? 0 : errno, api.status);
     }
+}
+
+static void rm_unmap_cpu_locked(rm_handle hMemory, rm_p64 linear, void *cpu, size_t size)
+{
+    rm_unmap_cpu_with_parent_locked(g.rm_device, hMemory, linear, cpu, size);
 }
 
 static int rm_map_dma_locked(rm_handle hDma, rm_handle hMemory, size_t size,
@@ -995,24 +1078,34 @@ static size_t page_align_size(size_t size)
 static void rm_channel_destroy_locked(void)
 {
     size_t page = page_align_size(4096);
+    size_t gpfifo_size = g.rm_gpfifo_size != 0 ? g.rm_gpfifo_size : page;
     if (g.rm_compute != 0) {
         rm_free_object_locked(g.rm_client, g.rm_channel, g.rm_compute);
     }
     if (g.rm_channel != 0) {
         rm_free_object_locked(g.rm_client, g.rm_device, g.rm_channel);
     }
+    rm_unmap_cpu_with_parent_locked(g.rm_usermode_parent, g.rm_usermode,
+                                    g.rm_usermode_linear, g.rm_usermode_cpu,
+                                    RM_NVC361_NV_USERMODE_SIZE);
+    if (g.rm_usermode != 0) {
+        rm_free_object_locked(g.rm_client,
+                              g.rm_usermode_parent != 0 ? g.rm_usermode_parent : g.rm_device,
+                              g.rm_usermode);
+    }
     rm_unmap_cpu_locked(g.rm_userd, g.rm_userd_linear, g.rm_userd_cpu, page);
     if (g.rm_userd != 0) {
         rm_free_object_locked(g.rm_client, g.rm_device, g.rm_userd);
     }
-    rm_unmap_dma_locked(g.rm_vaspace, g.rm_gpfifo, g.rm_gpfifo_va, page);
-    rm_unmap_cpu_locked(g.rm_gpfifo, g.rm_gpfifo_linear, g.rm_gpfifo_cpu, page);
+    rm_unmap_dma_locked(g.rm_vaspace, g.rm_gpfifo, g.rm_gpfifo_va, gpfifo_size);
+    rm_unmap_cpu_locked(g.rm_gpfifo, g.rm_gpfifo_linear, g.rm_gpfifo_cpu, gpfifo_size);
     if (g.rm_gpfifo != 0) {
         rm_free_object_locked(g.rm_client, g.rm_device, g.rm_gpfifo);
     }
     if (g.rm_error_ctxdma != 0) {
         rm_free_object_locked(g.rm_client, g.rm_device, g.rm_error_ctxdma);
     }
+    rm_unmap_cpu_locked(g.rm_notifier, g.rm_notifier_linear, g.rm_notifier_cpu, page);
     rm_unmap_dma_locked(g.rm_vaspace, g.rm_notifier, g.rm_notifier_va, page);
     if (g.rm_notifier != 0) {
         rm_free_object_locked(g.rm_client, g.rm_device, g.rm_notifier);
@@ -1026,26 +1119,134 @@ static void rm_channel_destroy_locked(void)
     if (g.rm_userd_fd >= 0) {
         close(g.rm_userd_fd);
     }
+    if (g.rm_usermode_fd >= 0) {
+        close(g.rm_usermode_fd);
+    }
+    if (g.rm_notifier_fd >= 0) {
+        close(g.rm_notifier_fd);
+    }
+    g.rm_notifier_fd = -1;
     g.rm_gpfifo_fd = -1;
     g.rm_userd_fd = -1;
+    g.rm_usermode_fd = -1;
     g.rm_vaspace = 0;
     g.rm_notifier = 0;
     g.rm_error_ctxdma = 0;
     g.rm_gpfifo = 0;
     g.rm_userd = 0;
+    g.rm_usermode = 0;
+    g.rm_usermode_parent = 0;
     g.rm_channel = 0;
     g.rm_compute = 0;
     g.rm_notifier_va = 0;
+    g.rm_notifier_linear = 0;
     g.rm_gpfifo_va = 0;
     g.rm_gpfifo_linear = 0;
     g.rm_userd_linear = 0;
+    g.rm_usermode_linear = 0;
+    g.rm_gpfifo_size = 0;
+    g.rm_notifier_cpu = NULL;
     g.rm_gpfifo_cpu = NULL;
     g.rm_userd_cpu = NULL;
+    g.rm_usermode_cpu = NULL;
     g.rm_work_submit_token = 0;
+    g.rm_doorbell_token = 0;
+    g.rm_token_notifier_index = 0;
     g.rm_gpfifo_put = 0;
+    g.rm_usermode_class = 0;
     g.rm_compute_class = 0;
     g.rm_compute_class_engine_id = 0;
     g.rm_channel_ready = false;
+}
+
+static int rm_alloc_usermode_locked(void)
+{
+    if (env_disabled("LANXIN_NVIDIA_CUDA_DOORBELL")) {
+        tracef("RM usermode doorbell disabled by LANXIN_NVIDIA_CUDA_DOORBELL=0");
+        return 0;
+    }
+
+    static const rm_u32 usermode_classes[] = {
+        RM_BLACKWELL_USERMODE_A,
+        RM_HOPPER_USERMODE_A,
+        RM_VOLTA_USERMODE_A,
+    };
+    rm_handle parents[2] = {
+        g.rm_subdevice != 0 ? g.rm_subdevice : g.rm_device,
+        g.rm_device,
+    };
+
+    for (size_t p = 0; p < sizeof(parents) / sizeof(parents[0]); p++) {
+        rm_handle parent = parents[p];
+        if (parent == 0 || (p != 0 && parent == parents[0])) {
+            continue;
+        }
+        for (size_t i = 0; i < sizeof(usermode_classes) / sizeof(usermode_classes[0]); i++) {
+            rm_hopper_usermode_params_t hopper_params = {.bBar1Mapping = 1, .bPriv = 0};
+            void *params = usermode_classes[i] == RM_VOLTA_USERMODE_A ? NULL : &hopper_params;
+            rm_u32 params_size = params != NULL ? (rm_u32)sizeof(hopper_params) : 0;
+            rm_handle usermode = g.next_rm_handle++;
+            if (rm_alloc_object_locked(g.rm_client, parent, &usermode, usermode_classes[i],
+                                       params, params_size, "rm_alloc_usermode") != 0) {
+                continue;
+            }
+            if (rm_map_cpu_with_parent_flags_locked(g.rm_usermode_fd, parent, usermode,
+                                                    RM_NVC361_NV_USERMODE_SIZE,
+                                                    RM_NVOS33_FLAGS_ACCESS_WRITE_ONLY,
+                                                    &g.rm_usermode_linear, &g.rm_usermode_cpu,
+                                                    "rm_map_usermode_cpu") != 0) {
+                rm_free_object_locked(g.rm_client, parent, usermode);
+                continue;
+            }
+            g.rm_usermode = usermode;
+            g.rm_usermode_parent = parent;
+            g.rm_usermode_class = usermode_classes[i];
+            tracef("RM usermode doorbell ready object=0x%x parent=0x%x class=0x%x cpu=%p",
+                   g.rm_usermode, g.rm_usermode_parent, g.rm_usermode_class,
+                   g.rm_usermode_cpu);
+            return 0;
+        }
+    }
+
+    tracef("RM usermode doorbell allocation failed");
+    return -1;
+}
+
+static rm_u32 rm_read_notifier_info32_locked(rm_u32 index)
+{
+    if (g.rm_notifier_cpu == NULL) {
+        return 0;
+    }
+    size_t offset = (size_t)index * RM_NV_NOTIFICATION_BYTES + RM_NV_NOTIFICATION_INFO32_OFFSET;
+    if (offset + sizeof(rm_u32) > page_align_size(4096)) {
+        return 0;
+    }
+    volatile rm_u32 *info32 = (volatile rm_u32 *)((volatile uint8_t *)g.rm_notifier_cpu + offset);
+    __sync_synchronize();
+    return *info32;
+}
+
+static void rm_channel_kickoff_locked(rm_u32 old_put, rm_u32 new_put)
+{
+    volatile rm_u32 *control = (volatile rm_u32 *)g.rm_userd_cpu;
+    if (control != NULL) {
+        control[0x8c / 4] = new_put;
+    }
+    __sync_synchronize();
+
+    if (!env_disabled("LANXIN_NVIDIA_CUDA_DOORBELL") &&
+        g.rm_usermode_cpu != NULL && g.rm_doorbell_token != 0) {
+        volatile rm_u32 *doorbell =
+            (volatile rm_u32 *)((volatile uint8_t *)g.rm_usermode_cpu +
+                                RM_NVC361_NOTIFY_CHANNEL_PENDING);
+        *doorbell = g.rm_doorbell_token;
+        __sync_synchronize();
+        tracef("RM doorbell kickoff old_put=%u new_put=%u token=0x%08x usermode=0x%x class=0x%x",
+               old_put, new_put, g.rm_doorbell_token, g.rm_usermode, g.rm_usermode_class);
+    } else {
+        tracef("RM UserD-only kickoff old_put=%u new_put=%u token=0x%08x usermode=%p",
+               old_put, new_put, g.rm_doorbell_token, g.rm_usermode_cpu);
+    }
 }
 
 static int rm_channel_init_locked(void)
@@ -1063,6 +1264,10 @@ static int rm_channel_init_locked(void)
     }
 
     size_t page = page_align_size(4096);
+    size_t gpfifo_bytes = page_align_size((size_t)env_ull("LANXIN_NVIDIA_CUDA_GPFIFO_BYTES", 65536));
+    if (gpfifo_bytes < page) {
+        gpfifo_bytes = page;
+    }
     rm_u32 sys_flags = RM_NVOS02_FLAGS_PHYSICALITY_NONCONTIGUOUS |
                        RM_NVOS02_FLAGS_LOCATION_PCI |
                        RM_NVOS02_FLAGS_COHERENCY_WRITE_COMBINE |
@@ -1074,11 +1279,17 @@ static int rm_channel_init_locked(void)
                             RM_NVOS02_FLAGS_GPU_CACHEABLE_YES |
                             RM_NVOS02_FLAGS_MAPPING_NO_MAP;
 
+    g.rm_notifier_fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
     g.rm_gpfifo_fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
     g.rm_userd_fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
-    if (g.rm_gpfifo_fd < 0 || g.rm_userd_fd < 0) {
-        tracef("RM channel fd open failed gpfifo=%d userd=%d errno=%d",
-               g.rm_gpfifo_fd, g.rm_userd_fd, errno);
+    g.rm_usermode_fd = g.gpu_fd >= 0 ? dup(g.gpu_fd) : -1;
+    if (g.rm_usermode_fd < 0) {
+        g.rm_usermode_fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
+    }
+    if (g.rm_notifier_fd < 0 || g.rm_gpfifo_fd < 0 ||
+        g.rm_userd_fd < 0 || g.rm_usermode_fd < 0) {
+        tracef("RM channel fd open failed notifier=%d gpfifo=%d userd=%d usermode=%d errno=%d",
+               g.rm_notifier_fd, g.rm_gpfifo_fd, g.rm_userd_fd, g.rm_usermode_fd, errno);
         goto fail;
     }
 
@@ -1092,13 +1303,17 @@ static int rm_channel_init_locked(void)
     }
 
     g.rm_notifier = g.next_rm_handle++;
-    if (rm_alloc_memory_locked(g.gpu_fd, g.ctl_fd, &g.rm_notifier,
+    if (rm_alloc_memory_locked(g.gpu_fd, g.rm_notifier_fd, &g.rm_notifier,
                                RM_NV01_MEMORY_SYSTEM, coherent_flags, page,
                                "rm_alloc_notifier") != 0 ||
+        rm_map_cpu_locked(g.rm_notifier_fd, g.rm_notifier, page,
+                          &g.rm_notifier_linear, &g.rm_notifier_cpu,
+                          "rm_map_notifier_cpu") != 0 ||
         rm_map_dma_locked(g.rm_vaspace, g.rm_notifier, page, &g.rm_notifier_va,
                           "rm_map_notifier_dma") != 0) {
         goto fail;
     }
+    memset(g.rm_notifier_cpu, 0, page);
 
     g.rm_error_ctxdma = g.next_rm_handle++;
     if (rm_alloc_ctxdma_locked(g.rm_notifier, 0xff, &g.rm_error_ctxdma) != 0) {
@@ -1107,15 +1322,16 @@ static int rm_channel_init_locked(void)
 
     g.rm_gpfifo = g.next_rm_handle++;
     if (rm_alloc_memory_locked(g.gpu_fd, g.rm_gpfifo_fd, &g.rm_gpfifo,
-                               RM_NV01_MEMORY_SYSTEM, sys_flags, page,
+                               RM_NV01_MEMORY_SYSTEM, sys_flags, gpfifo_bytes,
                                "rm_alloc_gpfifo") != 0 ||
-        rm_map_cpu_locked(g.rm_gpfifo_fd, g.rm_gpfifo, page, &g.rm_gpfifo_linear,
+        rm_map_cpu_locked(g.rm_gpfifo_fd, g.rm_gpfifo, gpfifo_bytes, &g.rm_gpfifo_linear,
                           &g.rm_gpfifo_cpu, "rm_map_gpfifo_cpu") != 0 ||
-        rm_map_dma_locked(g.rm_vaspace, g.rm_gpfifo, page, &g.rm_gpfifo_va,
+        rm_map_dma_locked(g.rm_vaspace, g.rm_gpfifo, gpfifo_bytes, &g.rm_gpfifo_va,
                           "rm_map_gpfifo_dma") != 0) {
         goto fail;
     }
-    memset(g.rm_gpfifo_cpu, 0, page);
+    g.rm_gpfifo_size = gpfifo_bytes;
+    memset(g.rm_gpfifo_cpu, 0, gpfifo_bytes);
 
     g.rm_userd = g.next_rm_handle++;
     if (rm_alloc_memory_locked(g.gpu_fd, g.rm_userd_fd, &g.rm_userd,
@@ -1126,6 +1342,10 @@ static int rm_channel_init_locked(void)
         goto fail;
     }
     memset(g.rm_userd_cpu, 0, page);
+
+    if (rm_alloc_usermode_locked() != 0) {
+        goto fail;
+    }
 
     rm_channel_alloc_params_t ch_params;
     memset(&ch_params, 0, sizeof(ch_params));
@@ -1146,21 +1366,37 @@ static int rm_channel_init_locked(void)
 
     rm_channel_bind_params_t bind = {.engineType = RM_NV2080_ENGINE_TYPE_GRAPHICS};
     rm_channel_schedule_params_t schedule = {.bEnable = 1, .bSkipSubmit = 0, .bSkipEnable = 0};
+    rm_channel_token_notif_index_params_t notif = {
+        .index = RM_NV_CHANNELGPFIFO_NOTIFICATION_TYPE_SIZE_1,
+    };
     rm_channel_token_params_t token;
     memset(&token, 0, sizeof(token));
     if (rm_control_locked(g.rm_channel, RM_NVA06F_CTRL_CMD_BIND,
                           &bind, sizeof(bind), "rm_channel_bind") != 0 ||
         rm_control_locked(g.rm_channel, RM_NVA06F_CTRL_CMD_GPFIFO_SCHEDULE,
                           &schedule, sizeof(schedule), "rm_channel_schedule") != 0 ||
+        (!env_disabled("LANXIN_NVIDIA_CUDA_DOORBELL") &&
+         rm_control_locked(g.rm_channel, RM_NVC36F_CTRL_CMD_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX,
+                           &notif, sizeof(notif), "rm_channel_token_notif_index") != 0) ||
         rm_control_locked(g.rm_channel, RM_NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN,
                           &token, sizeof(token), "rm_channel_token") != 0) {
         goto fail;
     }
     g.rm_work_submit_token = token.workSubmitToken;
+    g.rm_token_notifier_index = notif.index;
+    g.rm_doorbell_token = rm_read_notifier_info32_locked(g.rm_token_notifier_index);
+    if (g.rm_doorbell_token == 0) {
+        g.rm_doorbell_token = g.rm_work_submit_token;
+    }
+    if (!env_disabled("LANXIN_NVIDIA_CUDA_DOORBELL") && g.rm_doorbell_token == 0) {
+        tracef("RM doorbell token is zero");
+        goto fail;
+    }
     g.rm_channel_ready = true;
-    tracef("RM channel ready channel=0x%x vaspace=0x%x gpfifo=0x%x/0x%llx userd=0x%x token=0x%08x",
+    tracef("RM channel ready channel=0x%x vaspace=0x%x gpfifo=0x%x/0x%llx userd=0x%x usermode=0x%x notifier_index=%u token=0x%08x doorbell=0x%08x",
            g.rm_channel, g.rm_vaspace, g.rm_gpfifo,
-           (unsigned long long)g.rm_gpfifo_va, g.rm_userd, g.rm_work_submit_token);
+           (unsigned long long)g.rm_gpfifo_va, g.rm_userd, g.rm_usermode,
+           g.rm_token_notifier_index, g.rm_work_submit_token, g.rm_doorbell_token);
     return 0;
 
 fail:
@@ -1183,6 +1419,44 @@ static void rm_write_gpfifo_entry(volatile rm_u32 *gp_words, rm_u32 entry,
     gp_words[entry * 2U] = (rm_u32)(pushbuffer_va & 0xfffffffcu);
     gp_words[entry * 2U + 1U] = (rm_u32)(((pushbuffer_va >> 32) & 0xffu) |
                                           (((rm_u64)(pushbuffer_bytes / 4U) & 0x1fffffu) << 10));
+}
+
+static void rm_qmd_set_bits(rm_u32 *words, unsigned int lo, unsigned int hi, rm_u64 value)
+{
+    if (words == NULL || hi < lo || hi >= LANXIN_HW_QMD_WORDS * 32U) {
+        return;
+    }
+    for (unsigned int bit = lo; bit <= hi; bit++) {
+        unsigned int src = bit - lo;
+        unsigned int word = bit / 32U;
+        unsigned int shift = bit % 32U;
+        rm_u32 mask = 1u << shift;
+        if ((value >> src) & 1ULL) {
+            words[word] |= mask;
+        } else {
+            words[word] &= ~mask;
+        }
+    }
+}
+
+static rm_u32 rm_qmd_u32_clamp(rm_u32 value, rm_u32 fallback)
+{
+    return value == 0 ? fallback : value;
+}
+
+static rm_u32 rm_qmd_shared_mem_units(rm_u32 bytes)
+{
+    return (bytes + 255u) / 256u;
+}
+
+static rm_u64 rm_completion_host_va(const struct launch_staging *launch)
+{
+    return launch->completion.gpu_va + offsetof(struct lanxin_launch_completion, host_progress);
+}
+
+static rm_u64 rm_completion_qmd_va(const struct launch_staging *launch)
+{
+    return launch->completion.gpu_va + offsetof(struct lanxin_launch_completion, qmd_done);
 }
 
 static int rm_compute_init_locked(void)
@@ -1332,16 +1606,107 @@ static int rm_stage_module_code_locked(CUmodule module)
     return 0;
 }
 
+static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_request *req,
+                                         struct launch_staging *launch,
+                                         struct lanxin_launch_completion *completion)
+{
+    rm_u32 *qmd = (rm_u32 *)launch->qmd.cpu;
+    struct lanxin_qmd_staging_desc *meta =
+        (struct lanxin_qmd_staging_desc *)((uint8_t *)launch->qmd.cpu + LANXIN_HW_QMD_BYTES);
+    memset(qmd, 0, LANXIN_HW_QMD_BYTES);
+    memset(meta, 0, sizeof(*meta));
+
+    rm_u32 grid_x = rm_qmd_u32_clamp(req->grid[0], 1);
+    rm_u32 grid_y = rm_qmd_u32_clamp(req->grid[1], 1);
+    rm_u32 grid_z = rm_qmd_u32_clamp(req->grid[2], 1);
+    rm_u32 block_x = rm_qmd_u32_clamp(req->block[0], 1);
+    rm_u32 block_y = rm_qmd_u32_clamp(req->block[1], 1);
+    rm_u32 block_z = rm_qmd_u32_clamp(req->block[2], 1);
+    rm_u32 qmd_payload = (rm_u32)(launch->launch_id & 0xffffffffu);
+    if (qmd_payload == 0) {
+        qmd_payload = 1;
+    }
+
+    rm_u64 params_va = launch->params.gpu_va;
+    rm_u64 qmd_release_va = rm_completion_qmd_va(launch);
+    rm_u32 qmd_version = env_u32("LANXIN_NVIDIA_CUDA_QMD_VERSION", LANXIN_QMD_MINOR_VERSION);
+    rm_u32 qmd_major = env_u32("LANXIN_NVIDIA_CUDA_QMD_MAJOR_VERSION", LANXIN_QMD_MAJOR_VERSION);
+    rm_u32 reg_count = env_u32("LANXIN_NVIDIA_CUDA_QMD_REGISTER_COUNT", 32);
+    rm_u32 sass_version = env_u32("LANXIN_NVIDIA_CUDA_QMD_SASS_VERSION", 0);
+
+    rm_qmd_set_bits(qmd, 200, 200, 1);                      /* schedule-on-put-update */
+    rm_qmd_set_bits(qmd, 202, 202, 1);                      /* release0 enabled */
+    rm_qmd_set_bits(qmd, 250, 255, 0x3f);                   /* invalidate shader/texture caches */
+    rm_qmd_set_bits(qmd, 256, 287, 0);                      /* program offset from SET_PROGRAM_REGION */
+    rm_qmd_set_bits(qmd, 366, 366, 1);                      /* FE sysmembar on release */
+    rm_qmd_set_bits(qmd, 368, 369, 1);                      /* CWD sysmembar */
+    rm_qmd_set_bits(qmd, 378, 378, 1);                      /* no API call-limit check */
+    rm_qmd_set_bits(qmd, 384, 415, grid_x);
+    rm_qmd_set_bits(qmd, 416, 431, grid_y);
+    rm_qmd_set_bits(qmd, 432, 447, grid_z);
+    rm_qmd_set_bits(qmd, 448, 479, 0);
+    rm_qmd_set_bits(qmd, 480, 495, 0);
+    rm_qmd_set_bits(qmd, 496, 511, 0);
+    rm_qmd_set_bits(qmd, 544, 561, rm_qmd_shared_mem_units(req->shared_mem_bytes));
+    rm_qmd_set_bits(qmd, 576, 579, qmd_version & 0xfu);
+    rm_qmd_set_bits(qmd, 580, 583, qmd_major & 0xfu);
+    rm_qmd_set_bits(qmd, 592, 607, block_x);
+    rm_qmd_set_bits(qmd, 608, 623, block_y);
+    rm_qmd_set_bits(qmd, 624, 639, block_z);
+    if (params_va != 0 && launch->params.size != 0) {
+        rm_qmd_set_bits(qmd, 640, 640, 1);                  /* constant buffer 0 valid */
+        rm_qmd_set_bits(qmd, 928, 959, (rm_u32)(params_va & 0xffffffffu));
+        rm_qmd_set_bits(qmd, 960, 967, (rm_u32)((params_va >> 32) & 0xffu));
+        rm_qmd_set_bits(qmd, 974, 974, 1);
+        rm_qmd_set_bits(qmd, 975, 991, (rm_u32)launch->params.size);
+    }
+    rm_qmd_set_bits(qmd, 736, 767, (rm_u32)(qmd_release_va & 0xffffffffu));
+    rm_qmd_set_bits(qmd, 768, 775, (rm_u32)((qmd_release_va >> 32) & 0xffu));
+    rm_qmd_set_bits(qmd, 794, 794, 0);                      /* no release reduction */
+    rm_qmd_set_bits(qmd, 799, 799, 1);                      /* one-word release */
+    rm_qmd_set_bits(qmd, 800, 831, qmd_payload);
+    rm_qmd_set_bits(qmd, 1496, 1503, reg_count);
+    rm_qmd_set_bits(qmd, 1528, 1535, sass_version);
+
+    completion->expected_qmd_done = qmd_payload;
+
+    meta->magic = LANXIN_QMD_STAGING_MAGIC;
+    meta->version = LANXIN_QMD_STAGING_VERSION;
+    meta->size = sizeof(*meta);
+    meta->launch_id = launch->launch_id;
+    meta->grid[0] = grid_x;
+    meta->grid[1] = grid_y;
+    meta->grid[2] = grid_z;
+    meta->block[0] = block_x;
+    meta->block[1] = block_y;
+    meta->block[2] = block_z;
+    meta->shared_mem_bytes = req->shared_mem_bytes;
+    meta->code_va = f->module->code.gpu_va;
+    meta->code_bytes = f->module->staged_code_bytes;
+    meta->qmd_va = launch->qmd.gpu_va;
+    meta->params_va = params_va;
+    meta->params_bytes = req->params_size;
+    meta->completion_va = launch->completion.gpu_va;
+    meta->module_image_bytes = f->module->image_size;
+    meta->module_image_hash = f->module->image_hash;
+    meta->function_name_hash = f->name_hash != 0 ? f->name_hash : fnv1a64_str(f->name);
+    meta->compute_class = g.rm_compute_class;
+    meta->class_engine_id = g.rm_compute_class_engine_id;
+    meta->param_flags = req->param_flags;
+}
+
 static int rm_prepare_launch_packet_locked(CUfunction f, const struct launch_request *req)
 {
     if (!valid_function(f) || req == NULL || rm_stage_module_code_locked(f->module) != 0) {
         return -1;
     }
     struct launch_staging *launch = &f->launch;
-    size_t qmd_bytes = page_align_size(sizeof(struct lanxin_qmd_staging_desc));
+    size_t pushbuffer_bytes = page_align_size(4096);
+    size_t qmd_bytes = page_align_size(LANXIN_HW_QMD_BYTES + sizeof(struct lanxin_qmd_staging_desc));
     size_t params_bytes = req->params_size != 0 ? req->params_size : 64;
     size_t completion_bytes = page_align_size(sizeof(struct lanxin_launch_completion));
-    if (rm_stage_alloc_locked(&launch->qmd, qmd_bytes, "rm_stage_qmd") != 0 ||
+    if (rm_stage_alloc_locked(&launch->pushbuffer, pushbuffer_bytes, "rm_stage_pushbuffer") != 0 ||
+        rm_stage_alloc_locked(&launch->qmd, qmd_bytes, "rm_stage_qmd") != 0 ||
         rm_stage_alloc_locked(&launch->params, params_bytes, "rm_stage_params") != 0 ||
         rm_stage_alloc_locked(&launch->completion, completion_bytes, "rm_stage_completion") != 0) {
         return -1;
@@ -1358,46 +1723,30 @@ static int rm_prepare_launch_packet_locked(CUfunction f, const struct launch_req
     completion->launch_id = launch->launch_id;
     completion->status = LANXIN_COMPLETION_PENDING;
     completion->timestamp_ns = now_ns();
+    completion->expected_host_progress = (rm_u32)(launch->launch_id & 0xffffffffu);
+    if (completion->expected_host_progress == 0) {
+        completion->expected_host_progress = 1;
+    }
 
-    struct lanxin_qmd_staging_desc *qmd = (struct lanxin_qmd_staging_desc *)launch->qmd.cpu;
-    memset(qmd, 0, sizeof(*qmd));
-    qmd->magic = LANXIN_QMD_STAGING_MAGIC;
-    qmd->version = LANXIN_QMD_STAGING_VERSION;
-    qmd->size = sizeof(*qmd);
-    qmd->launch_id = launch->launch_id;
-    qmd->grid[0] = req->grid[0];
-    qmd->grid[1] = req->grid[1];
-    qmd->grid[2] = req->grid[2];
-    qmd->block[0] = req->block[0];
-    qmd->block[1] = req->block[1];
-    qmd->block[2] = req->block[2];
-    qmd->shared_mem_bytes = req->shared_mem_bytes;
-    qmd->code_va = f->module->code.gpu_va;
-    qmd->code_bytes = f->module->staged_code_bytes;
-    qmd->qmd_va = launch->qmd.gpu_va;
-    qmd->params_va = launch->params.gpu_va;
-    qmd->params_bytes = req->params_size;
-    qmd->completion_va = launch->completion.gpu_va;
-    qmd->module_image_bytes = f->module->image_size;
-    qmd->module_image_hash = f->module->image_hash;
-    qmd->function_name_hash = f->name_hash != 0 ? f->name_hash : fnv1a64_str(f->name);
-    qmd->compute_class = g.rm_compute_class;
-    qmd->class_engine_id = g.rm_compute_class_engine_id;
-    qmd->param_flags = req->param_flags;
+    rm_build_hardware_qmd_locked(f, req, launch, completion);
     __sync_synchronize();
 
-    tracef("RM staged QMD launch_id=%llu fn=%s qmd=0x%llx code=0x%llx params=0x%llx/%zu completion=0x%llx grid=%ux%ux%u block=%ux%ux%u",
+    tracef("RM staged hardware QMD launch_id=%llu fn=%s pb=0x%llx qmd=0x%llx code=0x%llx params=0x%llx/%zu completion=0x%llx host_sem=0x%llx qmd_sem=0x%llx grid=%ux%ux%u block=%ux%ux%u qmd_payload=0x%x",
            launch->launch_id, f->name != NULL ? f->name : "<unnamed>",
+           (unsigned long long)launch->pushbuffer.gpu_va,
            (unsigned long long)launch->qmd.gpu_va,
            (unsigned long long)f->module->code.gpu_va,
            (unsigned long long)launch->params.gpu_va, req->params_size,
            (unsigned long long)launch->completion.gpu_va,
+           (unsigned long long)rm_completion_host_va(launch),
+           (unsigned long long)rm_completion_qmd_va(launch),
            req->grid[0], req->grid[1], req->grid[2],
-           req->block[0], req->block[1], req->block[2]);
+           req->block[0], req->block[1], req->block[2],
+           completion->expected_qmd_done);
     return 0;
 }
 
-static int rm_poll_launch_completion_locked(CUfunction f)
+static int rm_poll_launch_completion_locked(CUfunction f, bool require_qmd_release)
 {
     if (!valid_function(f) || f->launch.completion.cpu == NULL) {
         return -1;
@@ -1408,19 +1757,35 @@ static int rm_poll_launch_completion_locked(CUfunction f)
     while (completion->magic == LANXIN_COMPLETION_MAGIC &&
            completion->launch_id == f->launch.launch_id &&
            completion->status == LANXIN_COMPLETION_PENDING) {
+        __sync_synchronize();
+        bool host_done = completion->host_progress == completion->expected_host_progress;
+        bool qmd_done = !require_qmd_release ||
+                        completion->qmd_done == completion->expected_qmd_done;
+        if (host_done && qmd_done) {
+            completion->status = LANXIN_COMPLETION_DONE;
+            break;
+        }
         rm_u64 elapsed_ns = now_ns() - start;
         if (elapsed_ns >= timeout_ms * 1000000ULL) {
             completion->status = LANXIN_COMPLETION_TIMEOUT;
-            tracef("RM launch completion timeout launch_id=%llu status=%u put=%llu",
+            tracef("RM launch completion timeout launch_id=%llu status=%u put=%llu host=0x%llx/0x%llx qmd=0x%x/0x%x require_qmd=%d",
                    f->launch.launch_id, completion->status,
-                   (unsigned long long)completion->gpfifo_put);
+                   (unsigned long long)completion->gpfifo_put,
+                   (unsigned long long)completion->host_progress,
+                   (unsigned long long)completion->expected_host_progress,
+                   completion->qmd_done, completion->expected_qmd_done,
+                   require_qmd_release ? 1 : 0);
             return -1;
         }
         usleep(1000);
     }
-    tracef("RM launch completion observed launch_id=%llu status=%u put=%llu",
+    tracef("RM launch completion observed launch_id=%llu status=%u put=%llu host=0x%llx/0x%llx qmd=0x%x/0x%x require_qmd=%d",
            f->launch.launch_id, completion->status,
-           (unsigned long long)completion->gpfifo_put);
+           (unsigned long long)completion->gpfifo_put,
+           (unsigned long long)completion->host_progress,
+           (unsigned long long)completion->expected_host_progress,
+           completion->qmd_done, completion->expected_qmd_done,
+           require_qmd_release ? 1 : 0);
     return completion->status == LANXIN_COMPLETION_DONE ? 0 : -1;
 }
 
@@ -1429,6 +1794,7 @@ static void rm_release_function_launch_locked(CUfunction f)
     if (f == NULL) {
         return;
     }
+    rm_stage_release_locked(&f->launch.pushbuffer);
     rm_stage_release_locked(&f->launch.qmd);
     rm_stage_release_locked(&f->launch.params);
     rm_stage_release_locked(&f->launch.completion);
@@ -1441,14 +1807,15 @@ static int rm_submit_noop_locked(void)
         return -1;
     }
     volatile rm_u32 *gp_words = (volatile rm_u32 *)g.rm_gpfifo_cpu;
-    volatile rm_u32 *control = (volatile rm_u32 *)g.rm_userd_cpu;
     rm_u32 entry = g.rm_gpfifo_put % 32U;
     gp_words[entry * 2U] = 0;
     gp_words[entry * 2U + 1U] = 0;
+    gp_words[((entry + 1U) % 32U) * 2U] = 0;
+    gp_words[((entry + 1U) % 32U) * 2U + 1U] = 0;
     __sync_synchronize();
-    g.rm_gpfifo_put = (entry + 1U) % 32U;
-    control[0x8c / 4] = g.rm_gpfifo_put;
-    __sync_synchronize();
+    rm_u32 old_put = g.rm_gpfifo_put;
+    g.rm_gpfifo_put = (entry + 2U) % 32U;
+    rm_channel_kickoff_locked(old_put, g.rm_gpfifo_put);
     tracef("RM submitted GPFIFO NOP channel=0x%x put=%u token=0x%08x",
            g.rm_channel, g.rm_gpfifo_put, g.rm_work_submit_token);
     return 0;
@@ -1482,30 +1849,94 @@ static int rm_submit_compute_set_object_locked(CUfunction f, const struct launch
     }
 
     volatile rm_u32 *gp_words = (volatile rm_u32 *)g.rm_gpfifo_cpu;
-    volatile rm_u32 *control = (volatile rm_u32 *)g.rm_userd_cpu;
     rm_u32 entry = g.rm_gpfifo_put % 32U;
-    rm_u32 pb_offset = 0x200u + (entry * 0x40u);
-    volatile rm_u32 *pb_words = (volatile rm_u32 *)((volatile uint8_t *)g.rm_gpfifo_cpu + pb_offset);
+    if (entry & 1U) {
+        entry = (entry + 1U) % 32U;
+    }
+    rm_u32 progress_entry = (entry + 1U) % 32U;
+    rm_u32 pb_stride = 0x400u;
+    rm_u32 pb_offset = 0x1000u + (entry * pb_stride);
+    rm_u32 progress_offset = 0x1000u + (progress_entry * pb_stride);
+    volatile rm_u32 *pb_words = NULL;
+    volatile rm_u32 *progress_words = NULL;
+    rm_u64 pb_va = 0;
+    rm_u64 progress_va = 0;
+    if (g.rm_gpfifo_cpu != NULL && g.rm_gpfifo_size >= (size_t)pb_offset + pb_stride) {
+        pb_words = (volatile rm_u32 *)((volatile uint8_t *)g.rm_gpfifo_cpu + pb_offset);
+        memset((void *)pb_words, 0, pb_stride);
+        pb_va = g.rm_gpfifo_va + pb_offset;
+    } else if (qmd_ready && f->launch.pushbuffer.cpu != NULL && f->launch.pushbuffer.gpu_va != 0) {
+        pb_words = (volatile rm_u32 *)f->launch.pushbuffer.cpu;
+        memset((void *)pb_words, 0, f->launch.pushbuffer.size);
+        pb_va = f->launch.pushbuffer.gpu_va;
+    } else {
+        pb_offset = 0x200u + (entry * 0x40u);
+        pb_words = (volatile rm_u32 *)((volatile uint8_t *)g.rm_gpfifo_cpu + pb_offset);
+        pb_va = g.rm_gpfifo_va + pb_offset;
+    }
+    if (g.rm_gpfifo_cpu != NULL && g.rm_gpfifo_size >= (size_t)progress_offset + pb_stride) {
+        progress_words = (volatile rm_u32 *)((volatile uint8_t *)g.rm_gpfifo_cpu + progress_offset);
+        memset((void *)progress_words, 0, pb_stride);
+        progress_va = g.rm_gpfifo_va + progress_offset;
+    }
     rm_u32 pb_count = 0;
+    rm_u32 progress_count = 0;
+    struct lanxin_launch_completion *completion =
+        qmd_ready ? (struct lanxin_launch_completion *)f->launch.completion.cpu : NULL;
 
     pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE, RM_COMPUTE_SET_OBJECT,
                                                  1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
     pb_words[pb_count++] = g.rm_compute_class_engine_id;
 
-    rm_u32 qmd_method_lo = env_u32("LANXIN_NVIDIA_CUDA_QMD_METHOD_LO", 0);
-    rm_u32 qmd_method_hi = env_u32("LANXIN_NVIDIA_CUDA_QMD_METHOD_HI", 0);
-    if (qmd_requested && qmd_ready && qmd_method_lo != 0 && qmd_method_hi != 0) {
+    if (qmd_requested && qmd_ready) {
         rm_u64 qmd_va = f->launch.qmd.gpu_va;
-        pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE, qmd_method_lo,
+        rm_u64 code_va = f->module->code.gpu_va;
+        rm_u32 qmd_version_method =
+            env_u32("LANXIN_NVIDIA_CUDA_QMD_METHOD_VERSION",
+                    (LANXIN_QMD_VERSION_01_06 << 16) | LANXIN_QMD_VERSION_01_06);
+        rm_u32 cwd_slots = env_u32("LANXIN_NVIDIA_CUDA_QMD_CWD_SLOT_COUNT", 32);
+        rm_u32 pcas_b = env_u32("LANXIN_NVIDIA_CUDA_QMD_PCAS_B", 0);
+        rm_u32 pcas_signal =
+            env_u32("LANXIN_NVIDIA_CUDA_QMD_PCAS_SIGNAL",
+                    (1u << 0) | (1u << 1)); /* invalidate + schedule */
+
+        pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE,
+                                                     RM_COMPUTE_SET_PROGRAM_REGION_A,
+                                                     2, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+        pb_words[pb_count++] = (rm_u32)((code_va >> 32) & 0x1ffffu);
+        pb_words[pb_count++] = (rm_u32)(code_va & 0xffffffffu);
+
+        pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE,
+                                                     RM_COMPUTE_SET_QMD_VERSION,
                                                      1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
-        pb_words[pb_count++] = (rm_u32)(qmd_va & 0xffffffffu);
-        pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE, qmd_method_hi,
+        pb_words[pb_count++] = qmd_version_method;
+
+        if (env_enabled("LANXIN_NVIDIA_CUDA_CHECK_QMD_VERSION")) {
+            pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE,
+                                                         RM_COMPUTE_CHECK_QMD_VERSION,
+                                                         1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+            pb_words[pb_count++] = qmd_version_method;
+        }
+
+        pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE,
+                                                     RM_COMPUTE_SET_CWD_SLOT_COUNT,
                                                      1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
-        pb_words[pb_count++] = (rm_u32)(qmd_va >> 32);
-        tracef("RM experimental QMD PB uses method_lo=0x%x method_hi=0x%x qmd_va=0x%llx",
-               qmd_method_lo, qmd_method_hi, (unsigned long long)qmd_va);
+        pb_words[pb_count++] = cwd_slots & 0xffu;
+
+        pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE,
+                                                     RM_COMPUTE_SEND_PCAS_A,
+                                                     3, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+        pb_words[pb_count++] = (rm_u32)((qmd_va >> 8) & 0xffffffffu);
+        pb_words[pb_count++] = pcas_b;
+        pb_words[pb_count++] = pcas_signal;
+        if (completion != NULL) {
+            completion->qmd_submitted = 1;
+        }
+        tracef("RM QMD PCAS submit qmd_va=0x%llx qmd_shifted8=0x%x code_region=0x%llx version=0x%08x pcas_b=0x%08x signal=0x%08x",
+               (unsigned long long)qmd_va, (rm_u32)((qmd_va >> 8) & 0xffffffffu),
+               (unsigned long long)code_va, qmd_version_method, pcas_b, pcas_signal);
     } else if (qmd_requested) {
-        tracef("RM QMD submit requested but no verified method offsets are configured; staged QMD only");
+        tracef("RM QMD submit requested but hardware QMD staging is not ready");
     }
 
     pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE, RM_COMPUTE_NO_OPERATION,
@@ -1515,21 +1946,58 @@ static int rm_submit_compute_set_object_locked(CUfunction f, const struct launch
                                                  1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
     pb_words[pb_count++] = 0;
 
-    rm_write_gpfifo_entry(gp_words, entry, g.rm_gpfifo_va + pb_offset, pb_count * sizeof(rm_u32));
-    __sync_synchronize();
-    g.rm_gpfifo_put = (entry + 1U) % 32U;
-    control[0x8c / 4] = g.rm_gpfifo_put;
-    if (qmd_ready && f->launch.completion.cpu != NULL) {
-        struct lanxin_launch_completion *completion = (struct lanxin_launch_completion *)f->launch.completion.cpu;
-        completion->gpfifo_put = g.rm_gpfifo_put;
+    if (completion != NULL) {
+        if (progress_words == NULL || progress_va == 0) {
+            tracef("RM progress tracker PB unavailable for completion");
+            return -1;
+        }
+        bool progress_wfi = env_enabled("LANXIN_NVIDIA_CUDA_PROGRESS_WFI");
+        rm_u64 host_sem_va = rm_completion_host_va(&f->launch);
+        rm_u32 host_payload = (rm_u32)completion->expected_host_progress;
+        rm_u32 sem_execute = RM_CHANNEL_SEM_EXECUTE_RELEASE |
+                             RM_CHANNEL_SEM_EXECUTE_PAYLOAD_SIZE_32BIT |
+                             RM_CHANNEL_SEM_EXECUTE_RELEASE_TIMESTAMP_DIS |
+                             (progress_wfi ? RM_CHANNEL_SEM_EXECUTE_RELEASE_WFI_EN : 0);
+
+        progress_words[progress_count++] = rm_push_method_header(RM_CHANNEL_SUBCHANNEL_HOST,
+                                                                 RM_CHANNEL_SEM_ADDR_LO,
+                                                                 5, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+        progress_words[progress_count++] = (rm_u32)(host_sem_va & 0xffffffffu);
+        progress_words[progress_count++] = (rm_u32)((host_sem_va >> 32) & 0xffffffffu);
+        progress_words[progress_count++] = host_payload;
+        progress_words[progress_count++] = 0;
+        progress_words[progress_count++] = sem_execute;
+        tracef("RM progress semaphore PB addr=0x%llx payload=0x%x execute=0x%08x wfi=%d progress_pb=0x%llx",
+               (unsigned long long)host_sem_va, host_payload, sem_execute,
+               progress_wfi ? 1 : 0, (unsigned long long)progress_va);
+    }
+
+    rm_write_gpfifo_entry(gp_words, entry, pb_va, pb_count * sizeof(rm_u32));
+    if (progress_words != NULL && progress_va != 0 && progress_count != 0) {
+        rm_write_gpfifo_entry(gp_words, progress_entry, progress_va,
+                              progress_count * sizeof(rm_u32));
+    } else {
+        gp_words[progress_entry * 2U] = 0;
+        gp_words[progress_entry * 2U + 1U] = 0;
     }
     __sync_synchronize();
-    tracef("RM submitted compute PB channel=0x%x compute=0x%x class=0x%x put=%u words=%u pb=0x%llx token=0x%08x qmd_ready=%d qmd_requested=%d",
+    rm_u32 old_put = g.rm_gpfifo_put;
+    g.rm_gpfifo_put = (entry + 2U) % 32U;
+    if (completion != NULL) {
+        completion->gpfifo_put = g.rm_gpfifo_put;
+    }
+    rm_channel_kickoff_locked(old_put, g.rm_gpfifo_put);
+    tracef("RM submitted compute PB channel=0x%x compute=0x%x class=0x%x put=%u entry=%u/%u words=%u/%u pb=0x%llx progress=0x%llx token=0x%08x doorbell=0x%08x qmd_ready=%d qmd_requested=%d qmd_submitted=%d",
            g.rm_channel, g.rm_compute, g.rm_compute_class, g.rm_gpfifo_put,
-           pb_count, (unsigned long long)(g.rm_gpfifo_va + pb_offset),
-           g.rm_work_submit_token, qmd_ready ? 1 : 0, qmd_requested ? 1 : 0);
-    if (qmd_ready && env_enabled("LANXIN_NVIDIA_CUDA_WAIT_COMPLETION")) {
-        return rm_poll_launch_completion_locked(f);
+           entry, progress_entry, pb_count, progress_count,
+           (unsigned long long)pb_va, (unsigned long long)progress_va,
+           g.rm_work_submit_token, g.rm_doorbell_token,
+           qmd_ready ? 1 : 0, qmd_requested ? 1 : 0,
+           completion != NULL ? (int)completion->qmd_submitted : 0);
+    bool must_wait_completion = env_enabled("LANXIN_NVIDIA_CUDA_WAIT_COMPLETION") ||
+                                (qmd_requested && env_enabled("LANXIN_NVIDIA_CUDA_STRICT_LAUNCH"));
+    if (qmd_ready && must_wait_completion) {
+        return rm_poll_launch_completion_locked(f, qmd_requested);
     }
     return 0;
 }
@@ -3973,7 +4441,7 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f,
             submit_rc = rm_submit_noop_locked();
         } else if (rm_pb_submit || rm_qmd_submit || default_pb_submit) {
             submit_rc = rm_submit_compute_set_object_locked(f, &req, rm_qmd_submit);
-            if (submit_rc != 0) {
+            if (submit_rc != 0 && !rm_qmd_submit && !strict_launch) {
                 submit_rc = rm_submit_noop_locked();
             }
         }
@@ -3994,7 +4462,7 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f,
         }
         return CUDA_SUCCESS;
     }
-    if (rm_submit_only || strict_launch) {
+    if (rm_submit_only || (strict_launch && !rm_qmd_submit)) {
         return CUDA_ERROR_NOT_SUPPORTED;
     }
     return CUDA_SUCCESS;
