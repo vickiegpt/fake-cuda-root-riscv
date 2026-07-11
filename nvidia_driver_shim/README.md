@@ -30,6 +30,8 @@ LANXIN_NVIDIA_CUDA_TRACE=1 LANXIN_NVIDIA_CUDA_MODULE_IMAGE_LAUNCH=1 LANXIN_NVIDI
 LANXIN_NVIDIA_CUDA_TRACE=1 LANXIN_NVIDIA_CUDA_MODULE_IMAGE_LAUNCH=1 LANXIN_NVIDIA_CUDA_MODULE_IMAGE_LAUNCH_SECOND=1 LANXIN_NVIDIA_CUDA_CODE_STAGE_TEXT=1 LANXIN_NVIDIA_CUDA_WAIT_COMPLETION=1 ./nvidia_driver_shim/build/module_image_probe
 LANXIN_NVIDIA_CUDA_TRACE=1 ./nvidia_driver_shim/build/cubin_launch_probe /path/to/kernel.cubin kernel_name
 LANXIN_NVIDIA_CUDA_TRACE=1 LANXIN_NVIDIA_CUDA_CODE_STAGE_TEXT=1 LANXIN_NVIDIA_CUDA_CUBIN_LAUNCH=1 ./nvidia_driver_shim/build/cubin_launch_probe /path/to/kernel.cubin kernel_name
+./nvidia_driver_shim/llm_demo.sh
+LANXIN_LLM_TRACE=1 ./nvidia_driver_shim/llm_demo.sh
 ./nvidia_driver_shim/build/channel_probe
 ```
 
