@@ -168,6 +168,7 @@
 #define LANXIN_QMD_VERSION_01_06 0x0106u
 #define LANXIN_QMD_MAJOR_VERSION 1u
 #define LANXIN_QMD_MINOR_VERSION 6u
+#define LANXIN_FATBINC_MAGIC 0x466243b1u
 #define LANXIN_QMD_STAGING_MAGIC 0x4c584e56514d4431ULL
 #define LANXIN_QMD_STAGING_VERSION 1u
 #define LANXIN_COMPLETION_MAGIC 0x4c584e56434d5031ULL
@@ -418,6 +419,13 @@ typedef struct {
     rm_u32 classID;
     rm_u32 engineID;
 } rm_get_class_engine_id_params_t;
+
+typedef struct {
+    int magic;
+    int version;
+    const unsigned long long *data;
+    void *filename_or_fatbins;
+} lanxin_fatbin_wrapper_t;
 
 struct rm_stage_buffer {
     rm_handle memory;
@@ -720,6 +728,174 @@ static rm_u64 fnv1a64_bytes(const void *data, size_t size)
 static rm_u64 fnv1a64_str(const char *text)
 {
     return text != NULL ? fnv1a64_bytes(text, strlen(text)) : 0;
+}
+
+static uint16_t rd16le(const unsigned char *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static rm_u32 rd32le(const unsigned char *p)
+{
+    return (rm_u32)p[0] | ((rm_u32)p[1] << 8) |
+           ((rm_u32)p[2] << 16) | ((rm_u32)p[3] << 24);
+}
+
+static rm_u64 rd64le(const unsigned char *p)
+{
+    return (rm_u64)rd32le(p) | ((rm_u64)rd32le(p + 4) << 32);
+}
+
+static size_t image_scan_limit(void)
+{
+    unsigned long long limit = env_ull("LANXIN_NVIDIA_CUDA_IMAGE_SCAN_MAX_BYTES",
+                                       64ULL * 1024ULL * 1024ULL);
+    if (limit == 0) {
+        limit = 1;
+    }
+    return limit > (unsigned long long)SIZE_MAX ? SIZE_MAX : (size_t)limit;
+}
+
+static size_t probe_elf_image_size(const unsigned char *bytes)
+{
+    if (bytes == NULL ||
+        bytes[0] != 0x7f || bytes[1] != 'E' || bytes[2] != 'L' || bytes[3] != 'F') {
+        return 0;
+    }
+    if (bytes[4] != 1 && bytes[4] != 2) {
+        return 4;
+    }
+    if (bytes[5] != 1) {
+        return 4;
+    }
+
+    size_t limit = image_scan_limit();
+    size_t max_end = bytes[4] == 2 ? 64U : 52U;
+    if (bytes[4] == 2) {
+        rm_u64 phoff = rd64le(bytes + 32);
+        rm_u64 shoff = rd64le(bytes + 40);
+        uint16_t phentsize = rd16le(bytes + 54);
+        uint16_t phnum = rd16le(bytes + 56);
+        uint16_t shentsize = rd16le(bytes + 58);
+        uint16_t shnum = rd16le(bytes + 60);
+        if (phentsize >= 56 && phoff < limit && phnum < 8192) {
+            for (uint16_t i = 0; i < phnum; i++) {
+                rm_u64 off = phoff + (rm_u64)i * phentsize;
+                if (off + 56 > limit) {
+                    break;
+                }
+                rm_u64 p_offset = rd64le(bytes + off + 8);
+                rm_u64 p_filesz = rd64le(bytes + off + 32);
+                if (p_offset <= limit && p_filesz <= limit - p_offset &&
+                    p_offset + p_filesz > max_end) {
+                    max_end = (size_t)(p_offset + p_filesz);
+                }
+            }
+        }
+        if (shentsize >= 64 && shoff < limit && shnum < 8192) {
+            for (uint16_t i = 0; i < shnum; i++) {
+                rm_u64 off = shoff + (rm_u64)i * shentsize;
+                if (off + 64 > limit) {
+                    break;
+                }
+                rm_u32 sh_type = rd32le(bytes + off + 4);
+                rm_u64 sh_offset = rd64le(bytes + off + 24);
+                rm_u64 sh_size = rd64le(bytes + off + 32);
+                if (sh_type != 8 && sh_offset <= limit && sh_size <= limit - sh_offset &&
+                    sh_offset + sh_size > max_end) {
+                    max_end = (size_t)(sh_offset + sh_size);
+                }
+            }
+        }
+    } else {
+        rm_u32 phoff = rd32le(bytes + 28);
+        rm_u32 shoff = rd32le(bytes + 32);
+        uint16_t phentsize = rd16le(bytes + 42);
+        uint16_t phnum = rd16le(bytes + 44);
+        uint16_t shentsize = rd16le(bytes + 46);
+        uint16_t shnum = rd16le(bytes + 48);
+        if (phentsize >= 32 && phoff < limit && phnum < 8192) {
+            for (uint16_t i = 0; i < phnum; i++) {
+                rm_u64 off = (rm_u64)phoff + (rm_u64)i * phentsize;
+                if (off + 32 > limit) {
+                    break;
+                }
+                rm_u32 p_offset = rd32le(bytes + off + 4);
+                rm_u32 p_filesz = rd32le(bytes + off + 16);
+                if ((rm_u64)p_offset + p_filesz <= limit &&
+                    (size_t)p_offset + p_filesz > max_end) {
+                    max_end = (size_t)p_offset + p_filesz;
+                }
+            }
+        }
+        if (shentsize >= 40 && shoff < limit && shnum < 8192) {
+            for (uint16_t i = 0; i < shnum; i++) {
+                rm_u64 off = (rm_u64)shoff + (rm_u64)i * shentsize;
+                if (off + 40 > limit) {
+                    break;
+                }
+                rm_u32 sh_type = rd32le(bytes + off + 4);
+                rm_u32 sh_offset = rd32le(bytes + off + 16);
+                rm_u32 sh_size = rd32le(bytes + off + 20);
+                if (sh_type != 8 && (rm_u64)sh_offset + sh_size <= limit &&
+                    (size_t)sh_offset + sh_size > max_end) {
+                    max_end = (size_t)sh_offset + sh_size;
+                }
+            }
+        }
+    }
+    return max_end;
+}
+
+static const void *resolve_module_image(const void *image, size_t *size_out, const char **kind_out)
+{
+    const unsigned char *bytes = (const unsigned char *)image;
+    const char *kind = "unknown";
+    size_t image_size = 0;
+    if (image == NULL) {
+        if (size_out != NULL) {
+            *size_out = 0;
+        }
+        if (kind_out != NULL) {
+            *kind_out = kind;
+        }
+        return NULL;
+    }
+
+    const lanxin_fatbin_wrapper_t *wrapper = (const lanxin_fatbin_wrapper_t *)image;
+    if ((rm_u32)wrapper->magic == LANXIN_FATBINC_MAGIC && wrapper->data != NULL) {
+        bytes = (const unsigned char *)wrapper->data;
+        kind = "fatbin-wrapper";
+    }
+
+    image_size = probe_elf_image_size(bytes);
+    if (image_size != 0) {
+        if (strcmp(kind, "fatbin-wrapper") != 0) {
+            kind = "elf";
+        }
+    } else {
+        size_t limit = image_scan_limit();
+        image_size = strnlen((const char *)bytes, limit);
+        if (image_size != limit) {
+            image_size++;
+            if (strcmp(kind, "fatbin-wrapper") != 0) {
+                kind = "text";
+            }
+        } else {
+            image_size = 0;
+            if (strcmp(kind, "fatbin-wrapper") != 0) {
+                kind = "raw";
+            }
+        }
+    }
+
+    if (size_out != NULL) {
+        *size_out = image_size;
+    }
+    if (kind_out != NULL) {
+        *kind_out = kind;
+    }
+    return bytes;
 }
 
 static rm_u64 now_ns(void)
@@ -1636,6 +1812,8 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
 
     rm_qmd_set_bits(qmd, 200, 200, 1);                      /* schedule-on-put-update */
     rm_qmd_set_bits(qmd, 202, 202, 1);                      /* release0 enabled */
+    rm_qmd_set_bits(qmd, 204, 204,
+                    env_disabled("LANXIN_NVIDIA_CUDA_QMD_REQUIRE_PCAS") ? 0 : 1);
     rm_qmd_set_bits(qmd, 250, 255, 0x3f);                   /* invalidate shader/texture caches */
     rm_qmd_set_bits(qmd, 256, 287, 0);                      /* program offset from SET_PROGRAM_REGION */
     rm_qmd_set_bits(qmd, 366, 366, 1);                      /* FE sysmembar on release */
@@ -3739,21 +3917,15 @@ CUresult CUDAAPI cuModuleLoadData(CUmodule *module, const void *image)
         return CUDA_ERROR_INVALID_VALUE;
     }
     size_t image_size = 0;
-    const unsigned char *bytes = (const unsigned char *)image;
-    if (bytes[0] == 0x7f && bytes[1] == 'E' && bytes[2] == 'L' && bytes[3] == 'F') {
-        image_size = 4;
-    } else {
-        image_size = strnlen((const char *)image, 16U * 1024U * 1024U);
-        if (image_size != 16U * 1024U * 1024U) {
-            image_size++;
-        } else {
-            image_size = 0;
-        }
-    }
-    CUmodule m = make_module("<image>", image, image_size, image_size != 0);
+    const char *image_kind = NULL;
+    const void *resolved = resolve_module_image(image, &image_size, &image_kind);
+    CUmodule m = make_module("<image>", resolved, image_size, image_size != 0);
     if (m == NULL) {
         return CUDA_ERROR_OUT_OF_MEMORY;
     }
+    tracef("cuModuleLoadData image=%p resolved=%p kind=%s size=%zu hash=0x%016llx",
+           image, resolved, image_kind != NULL ? image_kind : "unknown", image_size,
+           (unsigned long long)m->image_hash);
     *module = m;
     return CUDA_SUCCESS;
 }
