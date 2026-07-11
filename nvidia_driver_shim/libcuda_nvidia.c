@@ -177,6 +177,8 @@
 #define LANXIN_COMPLETION_TIMEOUT 3u
 #define LANXIN_LAUNCH_PARAM_EXTRA_BUFFER 1u
 #define LANXIN_LAUNCH_PARAM_POINTER_ARRAY 2u
+#define LANXIN_CODE_STAGE_WHOLE_IMAGE 0u
+#define LANXIN_CODE_STAGE_TEXT_ONLY 1u
 #define LANXIN_ELF_EM_CUDA 190u
 #define LANXIN_ELF_SHT_PROGBITS 1u
 #define LANXIN_ELF_SHT_SYMTAB 2u
@@ -568,6 +570,10 @@ struct CUmod_st {
     size_t image_size;
     struct rm_stage_buffer code;
     size_t staged_code_bytes;
+    rm_u32 staged_code_layout;
+    rm_u64 staged_text_file_offset;
+    rm_u64 staged_text_size;
+    rm_u64 staged_function_name_hash;
     rm_u64 image_hash;
     struct CUfunc_st *functions;
     struct module_global *globals;
@@ -2071,17 +2077,36 @@ static size_t launch_code_stage_limit(void)
     return (size_t)limit;
 }
 
-static int rm_stage_module_code_locked(CUmodule module)
+static int rm_stage_module_code_locked(CUfunction f)
 {
-    if (!valid_module(module)) {
+    if (!valid_function(f) || !valid_module(f->module)) {
         return -1;
     }
+    CUmodule module = f->module;
     if (module->image_hash == 0 && module->image != NULL && module->image_size != 0) {
         module->image_hash = fnv1a64_bytes(module->image, module->image_size);
     } else if (module->image_hash == 0) {
         module->image_hash = fnv1a64_str(module->name);
     }
+
+    rm_u32 layout = LANXIN_CODE_STAGE_WHOLE_IMAGE;
+    const unsigned char *copy_src = module->image != NULL ?
+                                    (const unsigned char *)module->image : NULL;
     size_t copy_bytes = module->image != NULL ? module->image_size : 0;
+    rm_u64 text_file_offset = 0;
+    rm_u64 text_size = 0;
+    if (env_enabled("LANXIN_NVIDIA_CUDA_CODE_STAGE_TEXT") &&
+        f->metadata.valid && module->image != NULL &&
+        range_in_image(f->metadata.text_file_offset, f->metadata.text_size,
+                       module->image_size) &&
+        f->metadata.text_size != 0) {
+        layout = LANXIN_CODE_STAGE_TEXT_ONLY;
+        text_file_offset = f->metadata.text_file_offset;
+        text_size = f->metadata.text_size;
+        copy_src = (const unsigned char *)module->image + f->metadata.text_file_offset;
+        copy_bytes = f->metadata.text_size > (rm_u64)SIZE_MAX ?
+                     SIZE_MAX : (size_t)f->metadata.text_size;
+    }
     size_t limit = launch_code_stage_limit();
     if (copy_bytes > limit) {
         copy_bytes = limit;
@@ -2092,16 +2117,22 @@ static int rm_stage_module_code_locked(CUmodule module)
     if (rm_stage_alloc_locked(&module->code, copy_bytes, "rm_stage_code_object") != 0) {
         return -1;
     }
-    if (module->image != NULL && module->image_size != 0) {
-        memcpy(module->code.cpu, module->image, copy_bytes);
+    if (copy_src != NULL && copy_bytes != 0) {
+        memcpy(module->code.cpu, copy_src, copy_bytes);
     } else {
         snprintf((char *)module->code.cpu, module->code.size, "lanxin fake cuda code object: %s",
                  module->name != NULL ? module->name : "<module>");
     }
     module->staged_code_bytes = copy_bytes;
+    module->staged_code_layout = layout;
+    module->staged_text_file_offset = text_file_offset;
+    module->staged_text_size = text_size;
+    module->staged_function_name_hash = f->name_hash;
     __sync_synchronize();
-    tracef("RM staged code object module=%s image_bytes=%zu staged=%zu hash=0x%016llx gpu_va=0x%llx",
+    tracef("RM staged code object module=%s image_bytes=%zu staged=%zu layout=%s text_off=0x%llx text_size=%llu hash=0x%016llx gpu_va=0x%llx",
            module->name != NULL ? module->name : "<module>", module->image_size, module->staged_code_bytes,
+           layout == LANXIN_CODE_STAGE_TEXT_ONLY ? "text" : "whole",
+           (unsigned long long)text_file_offset, (unsigned long long)text_size,
            (unsigned long long)module->image_hash, (unsigned long long)module->code.gpu_va);
     return 0;
 }
@@ -2129,7 +2160,14 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
 
     rm_u64 params_va = launch->params.gpu_va;
     rm_u64 qmd_release_va = rm_completion_qmd_va(launch);
+    bool code_text_only = f->metadata.valid &&
+                          f->module->staged_code_layout == LANXIN_CODE_STAGE_TEXT_ONLY &&
+                          f->module->staged_function_name_hash == f->name_hash &&
+                          f->module->staged_text_file_offset == f->metadata.text_file_offset;
     rm_u32 parsed_program_offset = f->metadata.valid ? f->metadata.qmd_program_offset : 0;
+    if (code_text_only) {
+        parsed_program_offset = 0;
+    }
     rm_u32 parsed_reg_count = f->metadata.valid && f->metadata.reg_count != 0 ?
                               f->metadata.reg_count : 32;
     rm_u32 parsed_sass_version = f->metadata.valid ? f->metadata.sm_version : 0;
@@ -2209,7 +2247,8 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
     meta->compute_class = g.rm_compute_class;
     meta->class_engine_id = g.rm_compute_class_engine_id;
     meta->param_flags = req->param_flags;
-    meta->metadata_flags = f->metadata.valid ? 1u : 0u;
+    meta->metadata_flags = (f->metadata.valid ? 1u : 0u) |
+                           (code_text_only ? 2u : 0u);
     meta->text_file_offset = f->metadata.text_file_offset;
     meta->text_size = f->metadata.text_size;
     meta->const0_file_offset = f->metadata.const0_file_offset;
@@ -2225,7 +2264,7 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
 
 static int rm_prepare_launch_packet_locked(CUfunction f, const struct launch_request *req)
 {
-    if (!valid_function(f) || req == NULL || rm_stage_module_code_locked(f->module) != 0) {
+    if (!valid_function(f) || req == NULL || rm_stage_module_code_locked(f) != 0) {
         return -1;
     }
     struct launch_staging *launch = &f->launch;
@@ -2261,7 +2300,7 @@ static int rm_prepare_launch_packet_locked(CUfunction f, const struct launch_req
 
     struct lanxin_qmd_staging_desc *qmd_meta =
         (struct lanxin_qmd_staging_desc *)((uint8_t *)launch->qmd.cpu + LANXIN_HW_QMD_BYTES);
-    tracef("RM staged hardware QMD launch_id=%llu fn=%s pb=0x%llx qmd=0x%llx code=0x%llx params=0x%llx/%zu completion=0x%llx host_sem=0x%llx qmd_sem=0x%llx grid=%ux%ux%u block=%ux%ux%u qmd_payload=0x%x meta=%u program_offset=0x%x regs=%u smem=%u local=%u sm=%u",
+    tracef("RM staged hardware QMD launch_id=%llu fn=%s pb=0x%llx qmd=0x%llx code=0x%llx params=0x%llx/%zu completion=0x%llx host_sem=0x%llx qmd_sem=0x%llx grid=%ux%ux%u block=%ux%ux%u qmd_payload=0x%x meta=0x%x program_offset=0x%x regs=%u smem=%u local=%u sm=%u",
            launch->launch_id, f->name != NULL ? f->name : "<unnamed>",
            (unsigned long long)launch->pushbuffer.gpu_va,
            (unsigned long long)launch->qmd.gpu_va,

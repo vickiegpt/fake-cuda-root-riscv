@@ -27,6 +27,8 @@ LANXIN_NVIDIA_CUDA_TRACE=1 LANXIN_NVIDIA_CUDA_QMD_SUBMIT=1 LANXIN_NVIDIA_CUDA_ST
 LANXIN_NVIDIA_CUDA_TRACE=1 ./nvidia_driver_shim/build/api_probe
 LANXIN_NVIDIA_CUDA_TRACE=1 ./nvidia_driver_shim/build/module_image_probe
 LANXIN_NVIDIA_CUDA_TRACE=1 LANXIN_NVIDIA_CUDA_MODULE_IMAGE_LAUNCH=1 LANXIN_NVIDIA_CUDA_WAIT_COMPLETION=1 ./nvidia_driver_shim/build/module_image_probe
+LANXIN_NVIDIA_CUDA_TRACE=1 ./nvidia_driver_shim/build/cubin_launch_probe /path/to/kernel.cubin kernel_name
+LANXIN_NVIDIA_CUDA_TRACE=1 LANXIN_NVIDIA_CUDA_CODE_STAGE_TEXT=1 LANXIN_NVIDIA_CUDA_CUBIN_LAUNCH=1 ./nvidia_driver_shim/build/cubin_launch_probe /path/to/kernel.cubin kernel_name
 ./nvidia_driver_shim/build/channel_probe
 ```
 
@@ -44,6 +46,8 @@ Useful environment overrides:
 - `LANXIN_NVIDIA_CUDA_QMD_PROGRAM_OFFSET=0x...` overrides the parsed `.text.<kernel>` file offset written to QMD `PROGRAM_OFFSET`.
 - `LANXIN_NVIDIA_CUDA_QMD_LOCAL_MEM_BYTES=0` overrides parsed `.nv.info.<kernel>` local-memory bytes.
 - `LANXIN_NVIDIA_CUDA_QMD_REGISTER_COUNT=32` and `LANXIN_NVIDIA_CUDA_QMD_SASS_VERSION=120` override parsed cubin metadata.
+- `LANXIN_NVIDIA_CUDA_CODE_STAGE_TEXT=1` stages only `.text.<kernel>` bytes for the selected function and writes QMD `PROGRAM_OFFSET=0` by default. Without it, the shim stages the full ELF/cubin image and uses the parsed file offset.
+- `LANXIN_NVIDIA_CUDA_REQUIRE_CUBIN_METADATA=1` makes `cubin_launch_probe` fail when the named kernel did not parse any cubin metadata.
 - `LANXIN_NVIDIA_CUDA_IMAGE_SCAN_MAX_BYTES=67108864` caps loader-side in-memory image probing for `cuModuleLoadData`.
 - `LANXIN_NVIDIA_CUDA_CODE_STAGE_MAX_BYTES=16777216` caps how many module image bytes are copied into RM-mapped code-object staging memory.
 - `LANXIN_NVIDIA_CUDA_WAIT_COMPLETION=1` polls the staged completion record after doorbell. In the default safe pushbuffer path this verifies HOST progress; with `LANXIN_NVIDIA_CUDA_QMD_SUBMIT=1 LANXIN_NVIDIA_CUDA_STRICT_LAUNCH=1` it also requires the QMD release semaphore.
