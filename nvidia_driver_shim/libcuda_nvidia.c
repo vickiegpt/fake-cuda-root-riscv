@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -17,6 +18,10 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 /* cuda.h maps many public names to ABI-suffixed entry points. Export both. */
 #undef cuDeviceTotalMem
@@ -69,12 +74,17 @@
 #undef cuEventRecord
 #undef cuEventRecordWithFlags
 #undef cuEventDestroy
+#undef cuTensorMapEncodeTiled
+#undef cuTensorMapEncodeIm2col
+#undef cuTensorMapEncodeIm2colWide
+#undef cuTensorMapReplaceAddress
 
 #define LANXIN_CUDA_VERSION 12090
 #define DEFAULT_TOTAL_MEM_MB 32768ULL
 #define DEFAULT_SM_COUNT 170
 #define DEFAULT_COMPUTE_MAJOR 12
 #define DEFAULT_COMPUTE_MINOR 0
+#define DEFAULT_ACCOUNTING_DIR "/tmp/lanxin_nvidia_cuda_accounting"
 #define HANDLE_MAGIC_CTX 0x4c584354u
 #define HANDLE_MAGIC_STREAM 0x4c585354u
 #define HANDLE_MAGIC_EVENT 0x4c584556u
@@ -194,6 +204,20 @@
 #define LANXIN_EIATTR_MAX_THREADS 0x0504u
 #define LANXIN_EIATTR_SMEM_SIZE 0x0808u
 #define LANXIN_EIATTR_LMEM_SIZE 0x0a04u
+
+#define LANXIN_TORCH_DTYPE_BYTE 0
+#define LANXIN_TORCH_DTYPE_CHAR 1
+#define LANXIN_TORCH_DTYPE_SHORT 2
+#define LANXIN_TORCH_DTYPE_INT 3
+#define LANXIN_TORCH_DTYPE_LONG 4
+#define LANXIN_TORCH_DTYPE_HALF 5
+#define LANXIN_TORCH_DTYPE_FLOAT 6
+#define LANXIN_TORCH_DTYPE_DOUBLE 7
+#define LANXIN_TORCH_DTYPE_BOOL 11
+#define LANXIN_TORCH_DTYPE_BFLOAT16 15
+#define LANXIN_TORCH_DTYPE_UINT16 27
+#define LANXIN_TORCH_DTYPE_UINT32 28
+#define LANXIN_TORCH_DTYPE_UINT64 29
 
 typedef uint8_t rm_bool;
 typedef uint32_t rm_u32;
@@ -718,6 +742,43 @@ static struct driver_state g = {
     .next_id = 1,
     .next_rm_handle = 0x3000,
 };
+
+static const char *accounting_dir(void)
+{
+    const char *dir = getenv("LANXIN_NVIDIA_CUDA_ACCOUNTING_DIR");
+    return (dir != NULL && dir[0] != '\0') ? dir : DEFAULT_ACCOUNTING_DIR;
+}
+
+static void update_process_memory_accounting_locked(void)
+{
+    const char *dir = accounting_dir();
+    if (mkdir(dir, 0777) != 0 && errno != EEXIST) {
+        return;
+    }
+
+    char path[PATH_MAX];
+    int written = snprintf(path, sizeof(path), "%s/%ld.mem", dir, (long)getpid());
+    if (written <= 0 || (size_t)written >= sizeof(path)) {
+        return;
+    }
+
+    FILE *fp = fopen(path, "w");
+    if (fp == NULL) {
+        return;
+    }
+    fprintf(fp, "%llu\n", (unsigned long long)g.allocated_bytes);
+    fclose(fp);
+}
+
+__attribute__((destructor)) static void cleanup_process_memory_accounting(void)
+{
+    const char *dir = accounting_dir();
+    char path[PATH_MAX];
+    int written = snprintf(path, sizeof(path), "%s/%ld.mem", dir, (long)getpid());
+    if (written > 0 && (size_t)written < sizeof(path)) {
+        unlink(path);
+    }
+}
 
 static __thread CUcontext tls_current_ctx;
 static __thread CUcontext tls_ctx_stack[32];
@@ -3101,6 +3162,7 @@ static CUresult add_allocation_locked(CUdeviceptr *dptr, void *host, size_t size
     g.allocs = a;
     if (memory_type == CU_MEMORYTYPE_DEVICE || memory_type == CU_MEMORYTYPE_UNIFIED) {
         g.allocated_bytes += size;
+        update_process_memory_accounting_locked();
     }
     *dptr = a->dptr;
     return CUDA_SUCCESS;
@@ -3122,6 +3184,9 @@ static void *resolve_uva_ptr_locked(CUdeviceptr ptr, size_t bytes)
     if (a != NULL) {
         return (char *)a->host + (ptr - a->dptr);
     }
+    if (ptr < 4096U || (bytes != 0 && ptr > (CUdeviceptr)(UINTPTR_MAX - bytes))) {
+        return NULL;
+    }
     return (void *)(uintptr_t)ptr;
 }
 
@@ -3134,6 +3199,7 @@ static CUresult remove_allocation_locked(CUdeviceptr dptr, bool free_owned)
             *prev = a->next;
             if (a->memory_type == CU_MEMORYTYPE_DEVICE || a->memory_type == CU_MEMORYTYPE_UNIFIED) {
                 g.allocated_bytes -= a->size;
+                update_process_memory_accounting_locked();
             }
             if (a->rm_backed) {
                 rm_release_allocation_locked(a);
@@ -3716,21 +3782,27 @@ CUresult CUDAAPI cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize)
     if (result != CUDA_SUCCESS) {
         return result;
     }
-    struct allocation *rm_alloc = calloc(1, sizeof(*rm_alloc));
-    if (rm_alloc != NULL) {
-        pthread_mutex_lock(&g_lock);
-        if (rm_alloc_mapped_system_locked(bytesize, rm_alloc) == 0) {
-            rm_alloc->id = g.next_id++;
-            rm_alloc->next = g.allocs;
-            g.allocs = rm_alloc;
-            g.allocated_bytes += bytesize;
-            *dptr = rm_alloc->dptr;
+    if (!env_enabled("LANXIN_NVIDIA_CUDA_HOST_ALLOC_ONLY")) {
+        struct allocation *rm_alloc = calloc(1, sizeof(*rm_alloc));
+        if (rm_alloc != NULL) {
+            pthread_mutex_lock(&g_lock);
+            if (rm_alloc_mapped_system_locked(bytesize, rm_alloc) == 0) {
+                rm_alloc->id = g.next_id++;
+                rm_alloc->next = g.allocs;
+                g.allocs = rm_alloc;
+                g.allocated_bytes += bytesize;
+                update_process_memory_accounting_locked();
+                *dptr = rm_alloc->dptr;
+                pthread_mutex_unlock(&g_lock);
+                tracef("cuMemAlloc_v2 RM-backed %zu -> 0x%llx", bytesize,
+                       (unsigned long long)*dptr);
+                return CUDA_SUCCESS;
+            }
             pthread_mutex_unlock(&g_lock);
-            tracef("cuMemAlloc_v2 RM-backed %zu -> 0x%llx", bytesize, (unsigned long long)*dptr);
-            return CUDA_SUCCESS;
+            free(rm_alloc);
         }
-        pthread_mutex_unlock(&g_lock);
-        free(rm_alloc);
+    } else {
+        tracef("cuMemAlloc_v2 host-only path %zu", bytesize);
     }
     void *host = alloc_host_memory(bytesize);
     if (host == NULL) {
@@ -5158,6 +5230,1240 @@ static CUresult capture_launch_params(void **kernelParams, void **extra,
     return CUDA_SUCCESS;
 }
 
+struct lanxin_kernel_uint3 {
+    uint32_t x;
+    uint32_t y;
+    uint32_t z;
+};
+
+struct lanxin_block_q8_1 {
+    uint16_t d;
+    uint16_t s;
+    int8_t qs[32];
+};
+
+struct lanxin_block_q6_K {
+    uint8_t ql[128];
+    uint8_t qh[64];
+    int8_t scales[16];
+    uint16_t d;
+};
+
+struct lanxin_rope_corr_dims {
+    float v[2];
+};
+
+struct lanxin_mrope_sections {
+    int v[4];
+};
+
+static bool launch_arg_copy(void **kernelParams, size_t index, void *dst, size_t size)
+{
+    if (kernelParams == NULL || kernelParams[index] == NULL || dst == NULL || size == 0) {
+        return false;
+    }
+    memcpy(dst, kernelParams[index], size);
+    return true;
+}
+
+static uintptr_t launch_arg_ptr(void **kernelParams, size_t index)
+{
+    uintptr_t value = 0;
+    launch_arg_copy(kernelParams, index, &value, sizeof(value));
+    return value;
+}
+
+static int launch_arg_i32(void **kernelParams, size_t index)
+{
+    int value = 0;
+    launch_arg_copy(kernelParams, index, &value, sizeof(value));
+    return value;
+}
+
+static int64_t launch_arg_i64(void **kernelParams, size_t index)
+{
+    int64_t value = 0;
+    launch_arg_copy(kernelParams, index, &value, sizeof(value));
+    return value;
+}
+
+static uint32_t launch_arg_u32(void **kernelParams, size_t index)
+{
+    uint32_t value = 0;
+    launch_arg_copy(kernelParams, index, &value, sizeof(value));
+    return value;
+}
+
+static float launch_arg_f32(void **kernelParams, size_t index)
+{
+    float value = 0.0f;
+    launch_arg_copy(kernelParams, index, &value, sizeof(value));
+    return value;
+}
+
+static struct lanxin_kernel_uint3 launch_arg_uint3(void **kernelParams, size_t index)
+{
+    struct lanxin_kernel_uint3 value = {0, 0, 0};
+    launch_arg_copy(kernelParams, index, &value, sizeof(value));
+    return value;
+}
+
+static uint32_t packed_mod_u32(uint32_t value, struct lanxin_kernel_uint3 packed)
+{
+    return packed.z == 0 ? 0 : value % packed.z;
+}
+
+static uint32_t packed_div_u32(uint32_t value, struct lanxin_kernel_uint3 packed)
+{
+    return packed.z == 0 ? 0 : value / packed.z;
+}
+
+static float lanxin_half_to_float(uint16_t h)
+{
+    uint32_t sign = ((uint32_t)h & 0x8000U) << 16;
+    uint32_t exp = ((uint32_t)h >> 10) & 0x1fU;
+    uint32_t mant = (uint32_t)h & 0x03ffU;
+    uint32_t bits;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400U) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03ffU;
+            bits = sign | ((exp + (127U - 15U)) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1fU) {
+        bits = sign | 0x7f800000U | (mant << 13);
+    } else {
+        bits = sign | ((exp + (127U - 15U)) << 23) | (mant << 13);
+    }
+
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static uint16_t lanxin_float_to_half(float value)
+{
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    uint32_t sign = (bits >> 16) & 0x8000U;
+    int32_t exp = (int32_t)((bits >> 23) & 0xffU) - 127 + 15;
+    uint32_t mant = bits & 0x7fffffU;
+
+    if (exp <= 0) {
+        if (exp < -10) {
+            return (uint16_t)sign;
+        }
+        mant |= 0x800000U;
+        uint32_t shifted = mant >> (uint32_t)(1 - exp + 13);
+        uint32_t round = (mant >> (uint32_t)(1 - exp + 12)) & 1U;
+        return (uint16_t)(sign | (shifted + round));
+    }
+    if (exp >= 31) {
+        return (uint16_t)(sign | 0x7c00U);
+    }
+    mant += 0x00001000U;
+    if (mant & 0x00800000U) {
+        mant = 0;
+        exp++;
+        if (exp >= 31) {
+            return (uint16_t)(sign | 0x7c00U);
+        }
+    }
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+}
+
+static int8_t lanxin_round_to_i8(float value)
+{
+    int q = (int)(value >= 0.0f ? value + 0.5f : value - 0.5f);
+    if (q > 127) q = 127;
+    if (q < -128) q = -128;
+    return (int8_t)q;
+}
+
+static bool resolve_kernel_ptr_locked(uintptr_t ptr, size_t bytes, void **host_out)
+{
+    if (host_out == NULL) {
+        return false;
+    }
+    *host_out = resolve_uva_ptr_locked((CUdeviceptr)ptr, bytes);
+    return *host_out != NULL;
+}
+
+static CUresult host_fallback_bin_bcast_locked(CUfunction f,
+                                               unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                                               void **kernelParams)
+{
+    (void)gridDimX;
+    (void)gridDimY;
+    (void)gridDimZ;
+    const char *name = f->name != NULL ? f->name : "";
+    bool is_mul = strstr(name, "op_mulff") != NULL;
+    bool is_add = strstr(name, "op_addff") != NULL;
+    if (!is_mul && !is_add) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+
+    float *src0 = NULL;
+    float *src1 = NULL;
+    float *dst = NULL;
+    if (!resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 0), 0, (void **)&src0) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 1), 0, (void **)&src1) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 2), 0, (void **)&dst)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    int ne0 = launch_arg_i32(kernelParams, 3);
+    int ne1 = launch_arg_i32(kernelParams, 4);
+    int ne2 = launch_arg_i32(kernelParams, 5);
+    struct lanxin_kernel_uint3 ne3 = launch_arg_uint3(kernelParams, 6);
+    struct lanxin_kernel_uint3 ne10 = launch_arg_uint3(kernelParams, 7);
+    struct lanxin_kernel_uint3 ne11 = launch_arg_uint3(kernelParams, 8);
+    struct lanxin_kernel_uint3 ne12 = launch_arg_uint3(kernelParams, 9);
+    struct lanxin_kernel_uint3 ne13 = launch_arg_uint3(kernelParams, 10);
+    int64_t s1 = launch_arg_i32(kernelParams, 11);
+    int64_t s2 = launch_arg_i32(kernelParams, 12);
+    int64_t s3 = launch_arg_i32(kernelParams, 13);
+    int64_t s00 = launch_arg_i32(kernelParams, 14);
+    int64_t s01 = launch_arg_i32(kernelParams, 15);
+    int64_t s02 = launch_arg_i32(kernelParams, 16);
+    int64_t s03 = launch_arg_i32(kernelParams, 17);
+    int64_t s10 = launch_arg_i32(kernelParams, 18);
+    int64_t s11 = launch_arg_i32(kernelParams, 19);
+    int64_t s12 = launch_arg_i32(kernelParams, 20);
+    int64_t s13 = launch_arg_i32(kernelParams, 21);
+    uint32_t n3 = ne3.z == 0 ? 1 : ne3.z;
+
+    for (uint32_t i3 = 0; i3 < n3; i3++) {
+        uint32_t i13 = packed_mod_u32(i3, ne13);
+        for (int i2 = 0; i2 < ne2; i2++) {
+            uint32_t i12 = packed_mod_u32((uint32_t)i2, ne12);
+            for (int i1 = 0; i1 < ne1; i1++) {
+                uint32_t i11 = packed_mod_u32((uint32_t)i1, ne11);
+                int64_t src0_base = (int64_t)i3 * s03 + (int64_t)i2 * s02 + (int64_t)i1 * s01;
+                int64_t src1_base = (int64_t)i13 * s13 + (int64_t)i12 * s12 + (int64_t)i11 * s11;
+                int64_t dst_base = (int64_t)i3 * s3 + (int64_t)i2 * s2 + (int64_t)i1 * s1;
+                for (int i0 = 0; i0 < ne0; i0++) {
+                    uint32_t i10 = packed_mod_u32((uint32_t)i0, ne10);
+                    float a = src0[src0_base + (int64_t)i0 * s00];
+                    float b = src1[src1_base + (int64_t)i10 * s10];
+                    dst[dst_base + i0] = is_mul ? a * b : a + b;
+                }
+            }
+        }
+    }
+    tracef("host fallback kernel %s", name);
+    return CUDA_SUCCESS;
+}
+
+static CUresult host_fallback_rms_norm_locked(CUfunction f,
+                                              unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                                              void **kernelParams)
+{
+    const char *name = f->name != NULL ? f->name : "";
+    float *x = NULL;
+    float *dst = NULL;
+    if (!resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 0), 0, (void **)&x) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 1), 0, (void **)&dst)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    int ncols = launch_arg_i32(kernelParams, 2);
+    int64_t stride_row = launch_arg_i64(kernelParams, 3);
+    int64_t stride_channel = launch_arg_i64(kernelParams, 4);
+    int64_t stride_sample = launch_arg_i64(kernelParams, 5);
+    float eps = launch_arg_f32(kernelParams, 6);
+    float *mul = NULL;
+    float *add = NULL;
+    uintptr_t mul_ptr = launch_arg_ptr(kernelParams, 7);
+    uintptr_t add_ptr = launch_arg_ptr(kernelParams, 15);
+    if (mul_ptr != 0) {
+        resolve_kernel_ptr_locked(mul_ptr, 0, (void **)&mul);
+    }
+    if (add_ptr != 0) {
+        resolve_kernel_ptr_locked(add_ptr, 0, (void **)&add);
+    }
+    int64_t mul_stride_row = launch_arg_i64(kernelParams, 8);
+    int64_t mul_stride_channel = launch_arg_i64(kernelParams, 9);
+    int64_t mul_stride_sample = launch_arg_i64(kernelParams, 10);
+    struct lanxin_kernel_uint3 mul_ncols = launch_arg_uint3(kernelParams, 11);
+    struct lanxin_kernel_uint3 mul_nrows = launch_arg_uint3(kernelParams, 12);
+    struct lanxin_kernel_uint3 mul_nchannels = launch_arg_uint3(kernelParams, 13);
+    struct lanxin_kernel_uint3 mul_nsamples = launch_arg_uint3(kernelParams, 14);
+    int64_t add_stride_row = launch_arg_i64(kernelParams, 16);
+    int64_t add_stride_channel = launch_arg_i64(kernelParams, 17);
+    int64_t add_stride_sample = launch_arg_i64(kernelParams, 18);
+    struct lanxin_kernel_uint3 add_ncols = launch_arg_uint3(kernelParams, 19);
+    struct lanxin_kernel_uint3 add_nrows = launch_arg_uint3(kernelParams, 20);
+    struct lanxin_kernel_uint3 add_nchannels = launch_arg_uint3(kernelParams, 21);
+    struct lanxin_kernel_uint3 add_nsamples = launch_arg_uint3(kernelParams, 22);
+
+    for (unsigned int sample = 0; sample < gridDimZ; sample++) {
+        for (unsigned int channel = 0; channel < gridDimY; channel++) {
+            for (unsigned int row = 0; row < gridDimX; row++) {
+                float *xb = x + (int64_t)sample * stride_sample + (int64_t)channel * stride_channel + (int64_t)row * stride_row;
+                float *db = dst + (((int64_t)sample * gridDimY + channel) * gridDimX + row) * ncols;
+                double sum = 0.0;
+                for (int col = 0; col < ncols; col++) {
+                    sum += (double)xb[col] * (double)xb[col];
+                }
+                float scale = 1.0f / sqrtf((float)(sum / (double)ncols) + eps);
+                float *mb = NULL;
+                float *ab = NULL;
+                if (mul != NULL) {
+                    mb = mul + (int64_t)packed_mod_u32(sample, mul_nsamples) * mul_stride_sample +
+                         (int64_t)packed_mod_u32(channel, mul_nchannels) * mul_stride_channel +
+                         (int64_t)packed_mod_u32(row, mul_nrows) * mul_stride_row;
+                }
+                if (add != NULL) {
+                    ab = add + (int64_t)packed_mod_u32(sample, add_nsamples) * add_stride_sample +
+                         (int64_t)packed_mod_u32(channel, add_nchannels) * add_stride_channel +
+                         (int64_t)packed_mod_u32(row, add_nrows) * add_stride_row;
+                }
+                for (int col = 0; col < ncols; col++) {
+                    float value = xb[col] * scale;
+                    if (mb != NULL) {
+                        value *= mb[packed_mod_u32((uint32_t)col, mul_ncols)];
+                    }
+                    if (ab != NULL) {
+                        value += ab[packed_mod_u32((uint32_t)col, add_ncols)];
+                    }
+                    db[col] = value;
+                }
+            }
+        }
+    }
+    tracef("host fallback kernel %s", name);
+    return CUDA_SUCCESS;
+}
+
+static CUresult host_fallback_get_rows_float_locked(CUfunction f,
+                                                    unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                                                    unsigned int blockDimX, void **kernelParams)
+{
+    (void)gridDimY;
+    (void)gridDimZ;
+    (void)blockDimX;
+    const char *name = f->name != NULL ? f->name : "";
+    float *src0 = NULL;
+    int32_t *src1 = NULL;
+    float *dst = NULL;
+    if (!resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 0), 0, (void **)&src0) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 1), 0, (void **)&src1) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 2), 0, (void **)&dst)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    int64_t ne00 = launch_arg_i64(kernelParams, 3);
+    int64_t ne11 = launch_arg_i64(kernelParams, 4);
+    struct lanxin_kernel_uint3 ne12 = launch_arg_uint3(kernelParams, 5);
+    size_t s1 = (size_t)launch_arg_i64(kernelParams, 6);
+    size_t s2 = (size_t)launch_arg_i64(kernelParams, 7);
+    size_t s3 = (size_t)launch_arg_i64(kernelParams, 8);
+    size_t nb01 = (size_t)launch_arg_i64(kernelParams, 9);
+    size_t nb02 = (size_t)launch_arg_i64(kernelParams, 10);
+    size_t nb03 = (size_t)launch_arg_i64(kernelParams, 11);
+    size_t s10 = (size_t)launch_arg_i64(kernelParams, 12);
+    size_t s11 = (size_t)launch_arg_i64(kernelParams, 13);
+    size_t s12 = (size_t)launch_arg_i64(kernelParams, 14);
+    uint32_t n12 = ne12.z == 0 ? 1 : ne12.z;
+
+    for (unsigned int i10 = 0; i10 < gridDimX; i10++) {
+        for (int64_t z = 0; z < ne11 * (int64_t)n12; z++) {
+            int64_t i11 = z / (int64_t)n12;
+            int64_t i12 = z - i11 * (int64_t)n12;
+            int i01 = src1[(size_t)i10 * s10 + (size_t)i11 * s11 + (size_t)i12 * s12];
+            float *dst_row = dst + (size_t)i10 * s1 + (size_t)i11 * s2 + (size_t)i12 * s3;
+            float *src_row = (float *)((char *)src0 + (size_t)i01 * nb01 + (size_t)i11 * nb02 + (size_t)i12 * nb03);
+            for (int64_t i00 = 0; i00 < ne00; i00++) {
+                dst_row[i00] = src_row[i00];
+            }
+        }
+    }
+    tracef("host fallback kernel %s", name);
+    return CUDA_SUCCESS;
+}
+
+static CUresult host_fallback_quantize_q8_1_locked(CUfunction f,
+                                                   unsigned int gridDimY, unsigned int gridDimZ,
+                                                   void **kernelParams)
+{
+    const char *name = f->name != NULL ? f->name : "";
+    float *x = NULL;
+    struct lanxin_block_q8_1 *y = NULL;
+    if (!resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 0), 0, (void **)&x) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 1), 0, (void **)&y)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    int64_t ne00 = launch_arg_i64(kernelParams, 2);
+    int64_t s01 = launch_arg_i64(kernelParams, 3);
+    int64_t s02 = launch_arg_i64(kernelParams, 4);
+    int64_t s03 = launch_arg_i64(kernelParams, 5);
+    int64_t ne0 = launch_arg_i64(kernelParams, 6);
+    uint32_t ne1 = launch_arg_u32(kernelParams, 7);
+    struct lanxin_kernel_uint3 ne2 = launch_arg_uint3(kernelParams, 8);
+    uint32_t n2 = ne2.z == 0 ? 1 : ne2.z;
+
+    for (uint32_t bz = 0; bz < gridDimZ; bz++) {
+        int64_t i3 = (int64_t)(bz / n2);
+        int64_t i2 = (int64_t)(bz - (uint32_t)i3 * n2);
+        for (uint32_t i1 = 0; i1 < gridDimY && i1 < ne1; i1++) {
+            for (int64_t block0 = 0; block0 < ne0; block0 += 32) {
+                float amax = 0.0f;
+                float sum = 0.0f;
+                float vals[32];
+                for (int j = 0; j < 32; j++) {
+                    int64_t i0 = block0 + j;
+                    float v = i0 < ne00 ? x[i3 * s03 + i2 * s02 + (int64_t)i1 * s01 + i0] : 0.0f;
+                    vals[j] = v;
+                    float av = v < 0.0f ? -v : v;
+                    if (av > amax) {
+                        amax = av;
+                    }
+                    sum += v;
+                }
+                float d = amax / 127.0f;
+                float id = d != 0.0f ? 1.0f / d : 0.0f;
+                int64_t i_cont = ((i3 * (int64_t)n2 + i2) * (int64_t)ne1 + (int64_t)i1) * ne0 + block0;
+                struct lanxin_block_q8_1 *yb = &y[i_cont / 32];
+                yb->d = lanxin_float_to_half(d);
+                yb->s = lanxin_float_to_half(sum * d);
+                for (int j = 0; j < 32; j++) {
+                    yb->qs[j] = lanxin_round_to_i8(vals[j] * id);
+                }
+            }
+        }
+    }
+    tracef("host fallback kernel %s", name);
+    return CUDA_SUCCESS;
+}
+
+static CUresult host_fallback_torch_fill_locked(CUfunction f, void **kernelParams)
+{
+    const char *name = f->name != NULL ? f->name : "";
+    if (strstr(name, "FillFunctor") == NULL ||
+        strstr(name, "St5arrayIPcLm1") == NULL) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+
+    int n = launch_arg_i32(kernelParams, 0);
+    if (n < 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    uintptr_t dst_ptr = launch_arg_ptr(kernelParams, 2);
+    if (dst_ptr == 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    if (strstr(name, "FillFunctorIi") != NULL) {
+        int32_t *dst = NULL;
+        int32_t value = 0;
+        launch_arg_copy(kernelParams, 1, &value, sizeof(value));
+        if (!resolve_kernel_ptr_locked(dst_ptr, (size_t)n * sizeof(*dst), (void **)&dst)) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        for (int i = 0; i < n; i++) {
+            dst[i] = value;
+        }
+        tracef("host fallback kernel %s n=%d value=%d", name, n, (int)value);
+        return CUDA_SUCCESS;
+    }
+    if (strstr(name, "FillFunctorIl") != NULL) {
+        int64_t *dst = NULL;
+        int64_t value = 0;
+        launch_arg_copy(kernelParams, 1, &value, sizeof(value));
+        if (!resolve_kernel_ptr_locked(dst_ptr, (size_t)n * sizeof(*dst), (void **)&dst)) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        for (int i = 0; i < n; i++) {
+            dst[i] = value;
+        }
+        tracef("host fallback kernel %s n=%d", name, n);
+        return CUDA_SUCCESS;
+    }
+    if (strstr(name, "FillFunctorIN3c104HalfE") != NULL ||
+        strstr(name, "FillFunctorIN3c108BFloat16E") != NULL ||
+        strstr(name, "FillFunctorIs") != NULL ||
+        strstr(name, "FillFunctorIt") != NULL) {
+        uint16_t *dst = NULL;
+        uint16_t value = 0;
+        launch_arg_copy(kernelParams, 1, &value, sizeof(value));
+        if (!resolve_kernel_ptr_locked(dst_ptr, (size_t)n * sizeof(*dst), (void **)&dst)) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        for (int i = 0; i < n; i++) {
+            dst[i] = value;
+        }
+        tracef("host fallback kernel %s n=%d value_bits=0x%04x", name, n, (unsigned)value);
+        return CUDA_SUCCESS;
+    }
+    if (strstr(name, "FillFunctorIa") != NULL ||
+        strstr(name, "FillFunctorIh") != NULL) {
+        uint8_t *dst = NULL;
+        uint8_t value = 0;
+        launch_arg_copy(kernelParams, 1, &value, sizeof(value));
+        if (!resolve_kernel_ptr_locked(dst_ptr, (size_t)n * sizeof(*dst), (void **)&dst)) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        memset(dst, value, (size_t)n);
+        tracef("host fallback kernel %s n=%d value=0x%02x", name, n, (unsigned)value);
+        return CUDA_SUCCESS;
+    }
+    if (strstr(name, "FillFunctorIj") != NULL) {
+        uint32_t *dst = NULL;
+        uint32_t value = 0;
+        launch_arg_copy(kernelParams, 1, &value, sizeof(value));
+        if (!resolve_kernel_ptr_locked(dst_ptr, (size_t)n * sizeof(*dst), (void **)&dst)) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        for (int i = 0; i < n; i++) {
+            dst[i] = value;
+        }
+        tracef("host fallback kernel %s n=%d value=%u", name, n, (unsigned)value);
+        return CUDA_SUCCESS;
+    }
+    if (strstr(name, "FillFunctorIm") != NULL) {
+        uint64_t *dst = NULL;
+        uint64_t value = 0;
+        launch_arg_copy(kernelParams, 1, &value, sizeof(value));
+        if (!resolve_kernel_ptr_locked(dst_ptr, (size_t)n * sizeof(*dst), (void **)&dst)) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        for (int i = 0; i < n; i++) {
+            dst[i] = value;
+        }
+        tracef("host fallback kernel %s n=%d", name, n);
+        return CUDA_SUCCESS;
+    }
+    if (strstr(name, "FillFunctorIf") != NULL) {
+        float *dst = NULL;
+        float value = 0.0f;
+        launch_arg_copy(kernelParams, 1, &value, sizeof(value));
+        if (!resolve_kernel_ptr_locked(dst_ptr, (size_t)n * sizeof(*dst), (void **)&dst)) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        for (int i = 0; i < n; i++) {
+            dst[i] = value;
+        }
+        tracef("host fallback kernel %s n=%d value=%f", name, n, value);
+        return CUDA_SUCCESS;
+    }
+    if (strstr(name, "FillFunctorId") != NULL) {
+        double *dst = NULL;
+        double value = 0.0;
+        launch_arg_copy(kernelParams, 1, &value, sizeof(value));
+        if (!resolve_kernel_ptr_locked(dst_ptr, (size_t)n * sizeof(*dst), (void **)&dst)) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        for (int i = 0; i < n; i++) {
+            dst[i] = value;
+        }
+        tracef("host fallback kernel %s n=%d", name, n);
+        return CUDA_SUCCESS;
+    }
+    if (strstr(name, "FillFunctorIb") != NULL) {
+        uint8_t *dst = NULL;
+        uint8_t value = 0;
+        launch_arg_copy(kernelParams, 1, &value, sizeof(value));
+        if (!resolve_kernel_ptr_locked(dst_ptr, (size_t)n * sizeof(*dst), (void **)&dst)) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        memset(dst, value ? 1 : 0, (size_t)n);
+        tracef("host fallback kernel %s n=%d value=%u", name, n, (unsigned)value);
+        return CUDA_SUCCESS;
+    }
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+struct lanxin_torch_cast_policy {
+    int8_t dtype;
+    uint8_t reserved[3];
+    uint32_t element_size;
+};
+
+static float lanxin_bfloat16_to_float(uint16_t value)
+{
+    uint32_t bits = (uint32_t)value << 16;
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static uint16_t lanxin_float_to_bfloat16(float value)
+{
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    uint32_t lsb = (bits >> 16) & 1U;
+    uint32_t rounding_bias = 0x7fffU + lsb;
+    return (uint16_t)((bits + rounding_bias) >> 16);
+}
+
+static bool torch_dtype_supported_for_direct_copy(int dtype, uint32_t element_size)
+{
+    switch (dtype) {
+    case LANXIN_TORCH_DTYPE_BYTE:
+    case LANXIN_TORCH_DTYPE_CHAR:
+    case LANXIN_TORCH_DTYPE_BOOL:
+        return element_size == 1;
+    case LANXIN_TORCH_DTYPE_SHORT:
+    case LANXIN_TORCH_DTYPE_HALF:
+    case LANXIN_TORCH_DTYPE_BFLOAT16:
+    case LANXIN_TORCH_DTYPE_UINT16:
+        return element_size == 2;
+    case LANXIN_TORCH_DTYPE_INT:
+    case LANXIN_TORCH_DTYPE_FLOAT:
+    case LANXIN_TORCH_DTYPE_UINT32:
+        return element_size == 4;
+    case LANXIN_TORCH_DTYPE_LONG:
+    case LANXIN_TORCH_DTYPE_DOUBLE:
+    case LANXIN_TORCH_DTYPE_UINT64:
+        return element_size == 8;
+    default:
+        return false;
+    }
+}
+
+static double torch_direct_read_scalar_as_double(const void *base, size_t index,
+                                                 int dtype, uint32_t element_size)
+{
+    const char *ptr = (const char *)base + index * (size_t)element_size;
+    switch (dtype) {
+    case LANXIN_TORCH_DTYPE_BYTE:
+        return (double)*(const uint8_t *)ptr;
+    case LANXIN_TORCH_DTYPE_CHAR:
+        return (double)*(const int8_t *)ptr;
+    case LANXIN_TORCH_DTYPE_SHORT:
+        return (double)*(const int16_t *)ptr;
+    case LANXIN_TORCH_DTYPE_INT:
+        return (double)*(const int32_t *)ptr;
+    case LANXIN_TORCH_DTYPE_LONG:
+        return (double)*(const int64_t *)ptr;
+    case LANXIN_TORCH_DTYPE_HALF:
+        return (double)lanxin_half_to_float(*(const uint16_t *)ptr);
+    case LANXIN_TORCH_DTYPE_FLOAT:
+        return (double)*(const float *)ptr;
+    case LANXIN_TORCH_DTYPE_DOUBLE:
+        return *(const double *)ptr;
+    case LANXIN_TORCH_DTYPE_BOOL:
+        return *(const uint8_t *)ptr != 0 ? 1.0 : 0.0;
+    case LANXIN_TORCH_DTYPE_BFLOAT16:
+        return (double)lanxin_bfloat16_to_float(*(const uint16_t *)ptr);
+    case LANXIN_TORCH_DTYPE_UINT16:
+        return (double)*(const uint16_t *)ptr;
+    case LANXIN_TORCH_DTYPE_UINT32:
+        return (double)*(const uint32_t *)ptr;
+    case LANXIN_TORCH_DTYPE_UINT64:
+        return (double)*(const uint64_t *)ptr;
+    default:
+        return 0.0;
+    }
+}
+
+static int64_t torch_direct_read_scalar_as_i64(const void *base, size_t index,
+                                               int dtype, uint32_t element_size)
+{
+    const char *ptr = (const char *)base + index * (size_t)element_size;
+    switch (dtype) {
+    case LANXIN_TORCH_DTYPE_BYTE:
+        return (int64_t)*(const uint8_t *)ptr;
+    case LANXIN_TORCH_DTYPE_CHAR:
+        return (int64_t)*(const int8_t *)ptr;
+    case LANXIN_TORCH_DTYPE_SHORT:
+        return (int64_t)*(const int16_t *)ptr;
+    case LANXIN_TORCH_DTYPE_INT:
+        return (int64_t)*(const int32_t *)ptr;
+    case LANXIN_TORCH_DTYPE_LONG:
+        return *(const int64_t *)ptr;
+    case LANXIN_TORCH_DTYPE_BOOL:
+        return *(const uint8_t *)ptr != 0 ? 1 : 0;
+    case LANXIN_TORCH_DTYPE_UINT16:
+        return (int64_t)*(const uint16_t *)ptr;
+    case LANXIN_TORCH_DTYPE_UINT32:
+        return (int64_t)*(const uint32_t *)ptr;
+    default:
+        return (int64_t)torch_direct_read_scalar_as_double(base, index, dtype,
+                                                           element_size);
+    }
+}
+
+static void torch_direct_write_scalar_from_double(void *base, size_t index,
+                                                  int dtype, uint32_t element_size,
+                                                  double value)
+{
+    char *ptr = (char *)base + index * (size_t)element_size;
+    switch (dtype) {
+    case LANXIN_TORCH_DTYPE_BYTE:
+        *(uint8_t *)ptr = (uint8_t)value;
+        break;
+    case LANXIN_TORCH_DTYPE_CHAR:
+        *(int8_t *)ptr = (int8_t)value;
+        break;
+    case LANXIN_TORCH_DTYPE_SHORT:
+        *(int16_t *)ptr = (int16_t)value;
+        break;
+    case LANXIN_TORCH_DTYPE_INT:
+        *(int32_t *)ptr = (int32_t)value;
+        break;
+    case LANXIN_TORCH_DTYPE_LONG:
+        *(int64_t *)ptr = (int64_t)value;
+        break;
+    case LANXIN_TORCH_DTYPE_HALF:
+        *(uint16_t *)ptr = lanxin_float_to_half((float)value);
+        break;
+    case LANXIN_TORCH_DTYPE_FLOAT:
+        *(float *)ptr = (float)value;
+        break;
+    case LANXIN_TORCH_DTYPE_DOUBLE:
+        *(double *)ptr = value;
+        break;
+    case LANXIN_TORCH_DTYPE_BOOL:
+        *(uint8_t *)ptr = value != 0.0 ? 1 : 0;
+        break;
+    case LANXIN_TORCH_DTYPE_BFLOAT16:
+        *(uint16_t *)ptr = lanxin_float_to_bfloat16((float)value);
+        break;
+    case LANXIN_TORCH_DTYPE_UINT16:
+        *(uint16_t *)ptr = (uint16_t)value;
+        break;
+    case LANXIN_TORCH_DTYPE_UINT32:
+        *(uint32_t *)ptr = (uint32_t)value;
+        break;
+    case LANXIN_TORCH_DTYPE_UINT64:
+        *(uint64_t *)ptr = (uint64_t)value;
+        break;
+    default:
+        break;
+    }
+}
+
+static void torch_direct_write_scalar_from_i64(void *base, size_t index,
+                                               int dtype, uint32_t element_size,
+                                               int64_t value)
+{
+    char *ptr = (char *)base + index * (size_t)element_size;
+    switch (dtype) {
+    case LANXIN_TORCH_DTYPE_BYTE:
+        *(uint8_t *)ptr = (uint8_t)value;
+        break;
+    case LANXIN_TORCH_DTYPE_CHAR:
+        *(int8_t *)ptr = (int8_t)value;
+        break;
+    case LANXIN_TORCH_DTYPE_SHORT:
+        *(int16_t *)ptr = (int16_t)value;
+        break;
+    case LANXIN_TORCH_DTYPE_INT:
+        *(int32_t *)ptr = (int32_t)value;
+        break;
+    case LANXIN_TORCH_DTYPE_LONG:
+        *(int64_t *)ptr = value;
+        break;
+    case LANXIN_TORCH_DTYPE_BOOL:
+        *(uint8_t *)ptr = value != 0 ? 1 : 0;
+        break;
+    case LANXIN_TORCH_DTYPE_UINT16:
+        *(uint16_t *)ptr = (uint16_t)value;
+        break;
+    case LANXIN_TORCH_DTYPE_UINT32:
+        *(uint32_t *)ptr = (uint32_t)value;
+        break;
+    case LANXIN_TORCH_DTYPE_UINT64:
+        *(uint64_t *)ptr = (uint64_t)value;
+        break;
+    default:
+        torch_direct_write_scalar_from_double(base, index, dtype, element_size,
+                                              (double)value);
+        break;
+    }
+}
+
+static bool torch_dtype_is_integral_like(int dtype)
+{
+    return dtype == LANXIN_TORCH_DTYPE_BYTE ||
+           dtype == LANXIN_TORCH_DTYPE_CHAR ||
+           dtype == LANXIN_TORCH_DTYPE_SHORT ||
+           dtype == LANXIN_TORCH_DTYPE_INT ||
+           dtype == LANXIN_TORCH_DTYPE_LONG ||
+           dtype == LANXIN_TORCH_DTYPE_BOOL ||
+           dtype == LANXIN_TORCH_DTYPE_UINT16 ||
+           dtype == LANXIN_TORCH_DTYPE_UINT32 ||
+           dtype == LANXIN_TORCH_DTYPE_UINT64;
+}
+
+static CUresult host_fallback_torch_direct_copy_locked(CUfunction f,
+                                                       void **kernelParams)
+{
+    const char *name = f->name != NULL ? f->name : "";
+    if (strstr(name, "direct_copy_kernel_cuda") == NULL ||
+        strstr(name, "St5arrayIPcLm2E") == NULL ||
+        strstr(name, "LoadWithCastILi1EE") == NULL ||
+        strstr(name, "StoreWithCastILi1EE") == NULL) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+
+    int n = launch_arg_i32(kernelParams, 0);
+    if (n < 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    uintptr_t data_ptrs[2] = {0, 0};
+    launch_arg_copy(kernelParams, 2, data_ptrs, sizeof(data_ptrs));
+    if (data_ptrs[0] == 0 || data_ptrs[1] == 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    struct lanxin_torch_cast_policy loader = {0, {0, 0, 0}, 0};
+    struct lanxin_torch_cast_policy storer = {0, {0, 0, 0}, 0};
+    launch_arg_copy(kernelParams, 5, &loader, sizeof(loader));
+    launch_arg_copy(kernelParams, 6, &storer, sizeof(storer));
+    if (!torch_dtype_supported_for_direct_copy((int)loader.dtype,
+                                               loader.element_size) ||
+        !torch_dtype_supported_for_direct_copy((int)storer.dtype,
+                                               storer.element_size)) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+
+    void *dst = NULL;
+    void *src = NULL;
+    size_t dst_bytes = (size_t)n * (size_t)storer.element_size;
+    size_t src_bytes = (size_t)n * (size_t)loader.element_size;
+    if (!resolve_kernel_ptr_locked(data_ptrs[0], dst_bytes, &dst) ||
+        !resolve_kernel_ptr_locked(data_ptrs[1], src_bytes, &src)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    if (loader.dtype == storer.dtype &&
+        loader.element_size == storer.element_size) {
+        memmove(dst, src, dst_bytes);
+        tracef("host fallback kernel %s n=%d dtype=%d bytes=%zu",
+               name, n, (int)storer.dtype, dst_bytes);
+        return CUDA_SUCCESS;
+    }
+
+    bool integral_path = torch_dtype_is_integral_like((int)loader.dtype) &&
+                         torch_dtype_is_integral_like((int)storer.dtype);
+    for (int i = 0; i < n; i++) {
+        if (integral_path) {
+            int64_t value = torch_direct_read_scalar_as_i64(src, (size_t)i,
+                                                            (int)loader.dtype,
+                                                            loader.element_size);
+            torch_direct_write_scalar_from_i64(dst, (size_t)i,
+                                               (int)storer.dtype,
+                                               storer.element_size, value);
+        } else {
+            double value = torch_direct_read_scalar_as_double(src, (size_t)i,
+                                                              (int)loader.dtype,
+                                                              loader.element_size);
+            torch_direct_write_scalar_from_double(dst, (size_t)i,
+                                                  (int)storer.dtype,
+                                                  storer.element_size, value);
+        }
+    }
+    tracef("host fallback kernel %s n=%d src_dtype=%d dst_dtype=%d",
+           name, n, (int)loader.dtype, (int)storer.dtype);
+    return CUDA_SUCCESS;
+}
+
+static CUresult host_fallback_torch_nocast_direct_copy_locked(CUfunction f,
+                                                              void **kernelParams)
+{
+    const char *name = f->name != NULL ? f->name : "";
+    if (!env_enabled("LANXIN_NVIDIA_CUDA_GUESS_NOCAST_DIRECT_COPY")) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    if (strstr(name, "direct_copy_kernel_cuda") == NULL ||
+        strstr(name, "gpu_kernel_impl_nocast") == NULL ||
+        strstr(name, "N3c104HalfE") == NULL) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+
+    int n = launch_arg_i32(kernelParams, 0);
+    if (n < 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    const int candidate_arg_indices[] = {2, 1, 3};
+    for (size_t i = 0; i < sizeof(candidate_arg_indices) / sizeof(candidate_arg_indices[0]); i++) {
+        uintptr_t data_ptrs[2] = {0, 0};
+        launch_arg_copy(kernelParams, candidate_arg_indices[i], data_ptrs, sizeof(data_ptrs));
+        if (data_ptrs[0] == 0 || data_ptrs[1] == 0) {
+            continue;
+        }
+
+        void *dst = NULL;
+        void *src = NULL;
+        size_t bytes = (size_t)n * sizeof(uint16_t);
+        if (!resolve_kernel_ptr_locked(data_ptrs[0], bytes, &dst) ||
+            !resolve_kernel_ptr_locked(data_ptrs[1], bytes, &src)) {
+            continue;
+        }
+
+        memmove(dst, src, bytes);
+        tracef("host fallback kernel %s n=%d dtype=Half bytes=%zu ptr_arg=%d",
+               name, n, bytes, candidate_arg_indices[i]);
+        return CUDA_SUCCESS;
+    }
+
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+static CUresult host_fallback_torch_float_to_lowp_copy_locked(CUfunction f,
+                                                              void **kernelParams)
+{
+    const char *name = f->name != NULL ? f->name : "";
+    bool to_bfloat16 = strstr(name, "bfloat16_copy_kernel_cuda") != NULL;
+    bool to_half = !to_bfloat16 &&
+                   strstr(name, "float16_copy_kernel_cuda") != NULL;
+    if ((!to_half && !to_bfloat16) ||
+        strstr(name, "vectorized_elementwise_kernel") == NULL ||
+        strstr(name, "St5arrayIPcLm2E") == NULL) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+
+    int n = launch_arg_i32(kernelParams, 0);
+    if (n < 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    uintptr_t data_ptrs[2] = {0, 0};
+    launch_arg_copy(kernelParams, 2, data_ptrs, sizeof(data_ptrs));
+    if (data_ptrs[0] == 0 || data_ptrs[1] == 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    uint16_t *dst = NULL;
+    float *src = NULL;
+    if (!resolve_kernel_ptr_locked(data_ptrs[0], (size_t)n * sizeof(*dst),
+                                   (void **)&dst) ||
+        !resolve_kernel_ptr_locked(data_ptrs[1], (size_t)n * sizeof(*src),
+                                   (void **)&src)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    for (int i = 0; i < n; i++) {
+        dst[i] = to_half ? lanxin_float_to_half(src[i])
+                         : lanxin_float_to_bfloat16(src[i]);
+    }
+    tracef("host fallback kernel %s n=%d src_dtype=6 dst_dtype=%d",
+           name, n, to_half ? LANXIN_TORCH_DTYPE_HALF
+                            : LANXIN_TORCH_DTYPE_BFLOAT16);
+    return CUDA_SUCCESS;
+}
+
+static float rope_yarn_ramp_host(float low, float high, int i0)
+{
+    float denom = high - low;
+    if (denom < 0.001f) {
+        denom = 0.001f;
+    }
+    float y = ((float)i0 / 2.0f - low) / denom;
+    if (y < 0.0f) y = 0.0f;
+    if (y > 1.0f) y = 1.0f;
+    return 1.0f - y;
+}
+
+static void rope_yarn_host(bool forward, float theta_extrap, float freq_scale,
+                           struct lanxin_rope_corr_dims corr_dims, int i0,
+                           float ext_factor, float mscale,
+                           float *cos_theta, float *sin_theta)
+{
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        float ramp_mix = rope_yarn_ramp_host(corr_dims.v[0], corr_dims.v[1], i0) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    *cos_theta = cosf(theta) * mscale;
+    *sin_theta = sinf(theta) * mscale;
+    if (!forward) {
+        *sin_theta *= -1.0f;
+    }
+}
+
+static CUresult host_fallback_rope_multi_float_locked(CUfunction f,
+                                                      unsigned int gridDimX, unsigned int blockDimX,
+                                                      void **kernelParams)
+{
+    const char *name = f->name != NULL ? f->name : "";
+    bool forward = strstr(name, "_ZL10rope_multiILb1E") != NULL;
+    bool has_ff = strstr(name, "_ZL10rope_multiILb1ELb1E") != NULL ||
+                  strstr(name, "_ZL10rope_multiILb0ELb1E") != NULL;
+    if (strstr(name, "EfEvPKT1_PS0_") == NULL) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    float *x = NULL;
+    float *dst = NULL;
+    int32_t *pos = NULL;
+    float *freq_factors = NULL;
+    if (!resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 0), 0, (void **)&x) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 1), 0, (void **)&dst) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 12), 0, (void **)&pos)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    uintptr_t ff_ptr = launch_arg_ptr(kernelParams, 18);
+    if (ff_ptr != 0) {
+        resolve_kernel_ptr_locked(ff_ptr, 0, (void **)&freq_factors);
+    }
+    if (has_ff && freq_factors == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    int ne00 = launch_arg_i32(kernelParams, 2);
+    int ne01 = launch_arg_i32(kernelParams, 3);
+    int ne02 = launch_arg_i32(kernelParams, 4);
+    int s01 = launch_arg_i32(kernelParams, 5);
+    int s02 = launch_arg_i32(kernelParams, 6);
+    int s03 = launch_arg_i32(kernelParams, 7);
+    int s1 = launch_arg_i32(kernelParams, 8);
+    int s2 = launch_arg_i32(kernelParams, 9);
+    int s3 = launch_arg_i32(kernelParams, 10);
+    int n_dims = launch_arg_i32(kernelParams, 11);
+    float freq_scale = launch_arg_f32(kernelParams, 13);
+    float ext_factor = launch_arg_f32(kernelParams, 14);
+    float attn_factor = launch_arg_f32(kernelParams, 15);
+    struct lanxin_rope_corr_dims corr_dims = {{0.0f, 0.0f}};
+    launch_arg_copy(kernelParams, 16, &corr_dims, sizeof(corr_dims));
+    float theta_scale = launch_arg_f32(kernelParams, 17);
+    struct lanxin_mrope_sections sections = {{0, 0, 0, 0}};
+    launch_arg_copy(kernelParams, 19, &sections, sizeof(sections));
+    bool is_imrope = false;
+    launch_arg_copy(kernelParams, 20, &is_imrope, sizeof(is_imrope));
+
+    if (ne00 <= 0 || ne01 <= 0 || ne02 <= 0 || n_dims <= 0 || n_dims > ne00) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
+    int sec_w = sections.v[1] + sections.v[0];
+    if (sect_dims <= 0) {
+        sections.v[0] = n_dims / 2;
+        sections.v[1] = 0;
+        sections.v[2] = 0;
+        sections.v[3] = 0;
+        sect_dims = sections.v[0];
+        sec_w = sections.v[0];
+    }
+
+    uint32_t rows = gridDimX * (blockDimX == 0 ? 1U : blockDimX);
+    for (uint32_t row_dst = 0; row_dst < rows; row_dst++) {
+        uint32_t i3 = row_dst / (uint32_t)(ne01 * ne02);
+        uint32_t i2 = (row_dst - i3 * (uint32_t)(ne01 * ne02)) / (uint32_t)ne01;
+        uint32_t i1 = row_dst - i3 * (uint32_t)(ne01 * ne02) - i2 * (uint32_t)ne01;
+        if (i1 >= (uint32_t)ne01 || i2 >= (uint32_t)ne02) {
+            continue;
+        }
+        for (int i0 = 0; i0 < ne00; i0 += 2) {
+            int idst = i0 / 2 + (int)i1 * s1 + (int)i2 * s2 + (int)i3 * s3;
+            int ix = i0 / 2 + (int)i1 * s01 + (int)i2 * s02 + (int)i3 * s03;
+            if (i0 >= n_dims) {
+                dst[idst + i0 / 2 + 0] = x[ix + i0 / 2 + 0];
+                dst[idst + i0 / 2 + 1] = x[ix + i0 / 2 + 1];
+                continue;
+            }
+
+            int sector = (i0 / 2) % sect_dims;
+            float theta_base = 0.0f;
+            float theta_pow = powf(theta_scale, (float)i0 / 2.0f);
+            if (is_imrope) {
+                if (sector % 3 == 1 && sector < 3 * sections.v[1]) {
+                    theta_base = (float)pos[i2 + (uint32_t)ne02 * 1U] * theta_pow;
+                } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {
+                    theta_base = (float)pos[i2 + (uint32_t)ne02 * 2U] * theta_pow;
+                } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {
+                    theta_base = (float)pos[i2] * theta_pow;
+                } else {
+                    theta_base = (float)pos[i2 + (uint32_t)ne02 * 3U] * theta_pow;
+                }
+            } else {
+                if (sector < sections.v[0]) {
+                    theta_base = (float)pos[i2] * theta_pow;
+                } else if (sector >= sections.v[0] && sector < sec_w) {
+                    theta_base = (float)pos[i2 + (uint32_t)ne02 * 1U] * theta_pow;
+                } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
+                    theta_base = (float)pos[i2 + (uint32_t)ne02 * 2U] * theta_pow;
+                } else {
+                    theta_base = (float)pos[i2 + (uint32_t)ne02 * 3U] * theta_pow;
+                }
+            }
+
+            float freq_factor = has_ff ? freq_factors[i0 / 2] : 1.0f;
+            float cos_theta = 1.0f;
+            float sin_theta = 0.0f;
+            rope_yarn_host(forward, theta_base / freq_factor, freq_scale, corr_dims, i0,
+                           ext_factor, attn_factor, &cos_theta, &sin_theta);
+            float x0 = x[ix + 0];
+            float x1 = x[ix + n_dims / 2];
+            dst[idst + 0] = x0 * cos_theta - x1 * sin_theta;
+            dst[idst + n_dims / 2] = x0 * sin_theta + x1 * cos_theta;
+        }
+    }
+    tracef("host fallback kernel %s rows=%u ne00=%d n_dims=%d", name, rows, ne00, n_dims);
+    return CUDA_SUCCESS;
+}
+
+static float q6_k_value(const struct lanxin_block_q6_K *block, int idx)
+{
+    float d = lanxin_half_to_float(block->d);
+    int n = idx < 128 ? 0 : 128;
+    int l = idx - n;
+    int ql_index;
+    int qh_index;
+    int shift;
+    int scale_index;
+    int q;
+    if (l < 32) {
+        ql_index = n / 2 + l;
+        qh_index = n / 4 + l;
+        shift = 0;
+        scale_index = l / 16 + 0;
+        q = (int)((block->ql[ql_index] & 0x0fU) | (((block->qh[qh_index] >> shift) & 3U) << 4)) - 32;
+    } else if (l < 64) {
+        ql_index = n / 2 + l;
+        qh_index = n / 4 + (l - 32);
+        shift = 2;
+        scale_index = (l - 32) / 16 + 2;
+        q = (int)((block->ql[ql_index] & 0x0fU) | (((block->qh[qh_index] >> shift) & 3U) << 4)) - 32;
+    } else if (l < 96) {
+        ql_index = n / 2 + (l - 64);
+        qh_index = n / 4 + (l - 64);
+        shift = 4;
+        scale_index = (l - 64) / 16 + 4;
+        q = (int)(((block->ql[ql_index] >> 4) & 0x0fU) | (((block->qh[qh_index] >> shift) & 3U) << 4)) - 32;
+    } else {
+        ql_index = n / 2 + (l - 64);
+        qh_index = n / 4 + (l - 96);
+        shift = 6;
+        scale_index = (l - 96) / 16 + 6;
+        q = (int)(((block->ql[ql_index] >> 4) & 0x0fU) | (((block->qh[qh_index] >> shift) & 3U) << 4)) - 32;
+    }
+    return d * (float)block->scales[n == 0 ? scale_index : scale_index + 8] * (float)q;
+}
+
+static CUresult host_fallback_mmvq_q6k_ncols1_locked(CUfunction f,
+                                                     unsigned int gridDimY, unsigned int gridDimZ,
+                                                     void **kernelParams)
+{
+    const char *name = f->name != NULL ? f->name : "";
+    struct lanxin_block_q6_K *vx = NULL;
+    struct lanxin_block_q8_1 *vy = NULL;
+    int32_t *ids = NULL;
+    float *dst = NULL;
+    if (!resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 0), 0, (void **)&vx) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 1), 0, (void **)&vy) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 4), 0, (void **)&dst)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    uintptr_t ids_ptr = launch_arg_ptr(kernelParams, 2);
+    if (ids_ptr != 0) {
+        resolve_kernel_ptr_locked(ids_ptr, 0, (void **)&ids);
+    }
+    uint32_t ncols_x = launch_arg_u32(kernelParams, 5);
+    struct lanxin_kernel_uint3 nchannels_y = launch_arg_uint3(kernelParams, 6);
+    uint32_t stride_row_x = launch_arg_u32(kernelParams, 7);
+    uint32_t stride_col_y = launch_arg_u32(kernelParams, 8);
+    uint32_t stride_col_dst = launch_arg_u32(kernelParams, 9);
+    struct lanxin_kernel_uint3 channel_ratio = launch_arg_uint3(kernelParams, 10);
+    uint32_t stride_channel_x = launch_arg_u32(kernelParams, 11);
+    uint32_t stride_channel_y = launch_arg_u32(kernelParams, 12);
+    uint32_t stride_channel_dst = launch_arg_u32(kernelParams, 13);
+    struct lanxin_kernel_uint3 sample_ratio = launch_arg_uint3(kernelParams, 14);
+    uint32_t stride_sample_x = launch_arg_u32(kernelParams, 15);
+    uint32_t stride_sample_y = launch_arg_u32(kernelParams, 16);
+    uint32_t stride_sample_dst = launch_arg_u32(kernelParams, 17);
+    uint32_t ids_stride = launch_arg_u32(kernelParams, 18);
+    if (ncols_x % 256 != 0 || stride_col_dst == 0) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    uint32_t blocks_per_row_x = ncols_x / 256U;
+    uint32_t y_blocks_per_col = ncols_x / 32U;
+
+    for (uint32_t sample_dst = 0; sample_dst < gridDimZ; sample_dst++) {
+        uint32_t sample_x = packed_div_u32(sample_dst, sample_ratio);
+        uint32_t sample_y = sample_dst;
+        for (uint32_t channel_dst = 0; channel_dst < gridDimY; channel_dst++) {
+            uint32_t channel_x;
+            uint32_t channel_y;
+            if (ids != NULL) {
+                uint32_t idx_stride = ids_stride == 0 ? 1U : ids_stride;
+                channel_x = (uint32_t)ids[(size_t)channel_dst * idx_stride];
+                channel_y = packed_mod_u32(channel_dst, nchannels_y);
+            } else {
+                channel_x = packed_div_u32(channel_dst, channel_ratio);
+                channel_y = channel_dst;
+            }
+            struct lanxin_block_q8_1 *yb = vy + (size_t)sample_y * stride_sample_y +
+                                           (size_t)channel_y * stride_channel_y;
+            for (uint32_t row = 0; row < stride_col_dst; row++) {
+                size_t x_offset = (size_t)sample_x * stride_sample_x +
+                                  (size_t)channel_x * stride_channel_x +
+                                  (size_t)row * stride_row_x;
+                double acc = 0.0;
+                for (uint32_t kbx = 0; kbx < blocks_per_row_x; kbx++) {
+                    const struct lanxin_block_q6_K *xb = vx + x_offset + kbx;
+                    for (int elem = 0; elem < 256; elem++) {
+                        const struct lanxin_block_q8_1 *q8 = yb + (size_t)kbx * 8U + (uint32_t)elem / 32U;
+                        float yv = lanxin_half_to_float(q8->d) * (float)q8->qs[elem % 32];
+                        acc += (double)q6_k_value(xb, elem) * (double)yv;
+                    }
+                }
+                dst[(size_t)sample_dst * stride_sample_dst +
+                    (size_t)channel_dst * stride_channel_dst + row] = (float)acc;
+            }
+        }
+    }
+    (void)stride_col_y;
+    (void)y_blocks_per_col;
+    tracef("host fallback kernel %s rows=%u ncols_x=%u", name, stride_col_dst, ncols_x);
+    return CUDA_SUCCESS;
+}
+
+static CUresult try_host_kernel_fallback_locked(CUfunction f,
+                                                unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                                                unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+                                                void **kernelParams)
+{
+    (void)blockDimY;
+    (void)blockDimZ;
+    if (f == NULL || f->name == NULL || kernelParams == NULL ||
+        env_disabled("LANXIN_NVIDIA_CUDA_HOST_FALLBACK")) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    const char *name = f->name;
+    if (strstr(name, "_ZL11k_bin_bcast") != NULL) {
+        return host_fallback_bin_bcast_locked(f, gridDimX, gridDimY, gridDimZ, kernelParams);
+    }
+    if (strstr(name, "_ZL12rms_norm_f32") != NULL) {
+        return host_fallback_rms_norm_locked(f, gridDimX, gridDimY, gridDimZ, kernelParams);
+    }
+    if (strstr(name, "_ZL16k_get_rows_floatIffE") != NULL) {
+        return host_fallback_get_rows_float_locked(f, gridDimX, gridDimY, gridDimZ, blockDimX, kernelParams);
+    }
+    if (strstr(name, "_ZL13quantize_q8_1") != NULL) {
+        return host_fallback_quantize_q8_1_locked(f, gridDimY, gridDimZ, kernelParams);
+    }
+    if (strstr(name, "direct_copy_kernel_cuda") != NULL) {
+        CUresult direct_rc = host_fallback_torch_direct_copy_locked(f, kernelParams);
+        if (direct_rc == CUDA_SUCCESS) {
+            return direct_rc;
+        }
+        return host_fallback_torch_nocast_direct_copy_locked(f, kernelParams);
+    }
+    if (strstr(name, "float16_copy_kernel_cuda") != NULL ||
+        strstr(name, "bfloat16_copy_kernel_cuda") != NULL) {
+        return host_fallback_torch_float_to_lowp_copy_locked(f, kernelParams);
+    }
+    if (strstr(name, "FillFunctor") != NULL) {
+        return host_fallback_torch_fill_locked(f, kernelParams);
+    }
+    if (strstr(name, "_ZL10rope_multi") != NULL) {
+        return host_fallback_rope_multi_float_locked(f, gridDimX, blockDimX, kernelParams);
+    }
+    if (strstr(name, "_ZL13mul_mat_vec_qIL9ggml_type14ELi1ELb0ELb0E") != NULL) {
+        return host_fallback_mmvq_q6k_ncols1_locked(f, gridDimY, gridDimZ, kernelParams);
+    }
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
+
 CUresult CUDAAPI cuLaunchKernel(CUfunction f,
                                 unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                                 unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
@@ -5187,11 +6493,22 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f,
     bool rm_pb_submit = env_enabled("LANXIN_NVIDIA_CUDA_PB_SUBMIT");
     bool rm_qmd_submit = env_enabled("LANXIN_NVIDIA_CUDA_QMD_SUBMIT");
     bool strict_launch = env_enabled("LANXIN_NVIDIA_CUDA_STRICT_LAUNCH");
+    bool fail_unsupported_kernel = env_enabled("LANXIN_NVIDIA_CUDA_FAIL_UNSUPPORTED_KERNEL");
     bool default_pb_submit = !noop_success && !rm_submit_only && !env_disabled("LANXIN_NVIDIA_CUDA_PB_SUBMIT");
     pthread_mutex_lock(&g_lock);
     CUresult init = ensure_initialized_locked();
-    int submit_rc = -1;
+    CUresult host_rc = CUDA_ERROR_NOT_SUPPORTED;
     if (init == CUDA_SUCCESS) {
+        host_rc = try_host_kernel_fallback_locked(f, gridDimX, gridDimY, gridDimZ,
+                                                  blockDimX, blockDimY, blockDimZ,
+                                                  kernelParams);
+    }
+    int submit_rc = -1;
+    if (host_rc == CUDA_SUCCESS) {
+        submit_rc = 0;
+    } else if (init == CUDA_SUCCESS && fail_unsupported_kernel) {
+        submit_rc = -2;
+    } else if (init == CUDA_SUCCESS) {
         if (noop_success || rm_submit_only) {
             submit_rc = rm_submit_noop_locked();
         } else if (rm_pb_submit || rm_qmd_submit || default_pb_submit) {
@@ -5202,12 +6519,18 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f,
         }
     }
     pthread_mutex_unlock(&g_lock);
-    tracef("RM cuLaunchKernel scaffold(%s) submit_rc=%d noop_success=%d submit_only=%d pb_submit=%d qmd_submit=%d default_pb=%d strict=%d params=%zu flags=0x%x",
+    tracef("RM cuLaunchKernel scaffold(%s) submit_rc=%d host_rc=%d noop_success=%d submit_only=%d pb_submit=%d qmd_submit=%d default_pb=%d strict=%d fail_unsupported=%d params=%zu flags=0x%x",
            f->name != NULL ? f->name : "<unnamed>", submit_rc,
-           noop_success ? 1 : 0, rm_submit_only ? 1 : 0, rm_pb_submit ? 1 : 0,
+           (int)host_rc, noop_success ? 1 : 0, rm_submit_only ? 1 : 0, rm_pb_submit ? 1 : 0,
            rm_qmd_submit ? 1 : 0, default_pb_submit ? 1 : 0, strict_launch ? 1 : 0,
-           param_size, param_flags);
+           fail_unsupported_kernel ? 1 : 0, param_size, param_flags);
     free(param_copy);
+    if (host_rc == CUDA_SUCCESS) {
+        return CUDA_SUCCESS;
+    }
+    if (fail_unsupported_kernel && submit_rc == -2) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
     if (submit_rc != 0) {
         if (noop_success) {
             return CUDA_ERROR_UNKNOWN;
@@ -5297,6 +6620,100 @@ CUresult CUDAAPI cuOccupancyAvailableDynamicSMemPerBlock(size_t *dynamicSmemSize
         return CUDA_ERROR_INVALID_VALUE;
     }
     *dynamicSmemSize = 48U * 1024U;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuTensorMapEncodeTiled(CUtensorMap *tensorMap,
+                                        CUtensorMapDataType tensorDataType,
+                                        cuuint32_t tensorRank,
+                                        void *globalAddress,
+                                        const cuuint64_t *globalDim,
+                                        const cuuint64_t *globalStrides,
+                                        const cuuint32_t *boxDim,
+                                        const cuuint32_t *elementStrides,
+                                        CUtensorMapInterleave interleave,
+                                        CUtensorMapSwizzle swizzle,
+                                        CUtensorMapL2promotion l2Promotion,
+                                        CUtensorMapFloatOOBfill oobFill)
+{
+    (void)tensorDataType;
+    (void)tensorRank;
+    (void)globalAddress;
+    (void)globalDim;
+    (void)globalStrides;
+    (void)boxDim;
+    (void)elementStrides;
+    (void)interleave;
+    (void)swizzle;
+    (void)l2Promotion;
+    (void)oobFill;
+    if (tensorMap == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    memset(tensorMap, 0, sizeof(*tensorMap));
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuTensorMapEncodeIm2col(CUtensorMap *tensorMap,
+                                         CUtensorMapDataType tensorDataType,
+                                         cuuint32_t tensorRank,
+                                         void *globalAddress,
+                                         const cuuint64_t *globalDim,
+                                         const cuuint64_t *globalStrides,
+                                         const int *pixelBoxLowerCorner,
+                                         const int *pixelBoxUpperCorner,
+                                         cuuint32_t channelsPerPixel,
+                                         cuuint32_t pixelsPerColumn,
+                                         const cuuint32_t *elementStrides,
+                                         CUtensorMapInterleave interleave,
+                                         CUtensorMapSwizzle swizzle,
+                                         CUtensorMapL2promotion l2Promotion,
+                                         CUtensorMapFloatOOBfill oobFill)
+{
+    (void)pixelBoxLowerCorner;
+    (void)pixelBoxUpperCorner;
+    (void)channelsPerPixel;
+    (void)pixelsPerColumn;
+    return cuTensorMapEncodeTiled(tensorMap, tensorDataType, tensorRank,
+                                  globalAddress, globalDim, globalStrides,
+                                  NULL, elementStrides, interleave, swizzle,
+                                  l2Promotion, oobFill);
+}
+
+CUresult CUDAAPI cuTensorMapEncodeIm2colWide(CUtensorMap *tensorMap,
+                                             CUtensorMapDataType tensorDataType,
+                                             cuuint32_t tensorRank,
+                                             void *globalAddress,
+                                             const cuuint64_t *globalDim,
+                                             const cuuint64_t *globalStrides,
+                                             int pixelBoxLowerCornerWidth,
+                                             int pixelBoxUpperCornerWidth,
+                                             cuuint32_t channelsPerPixel,
+                                             cuuint32_t pixelsPerColumn,
+                                             const cuuint32_t *elementStrides,
+                                             CUtensorMapInterleave interleave,
+                                             CUtensorMapIm2ColWideMode mode,
+                                             CUtensorMapSwizzle swizzle,
+                                             CUtensorMapL2promotion l2Promotion,
+                                             CUtensorMapFloatOOBfill oobFill)
+{
+    (void)pixelBoxLowerCornerWidth;
+    (void)pixelBoxUpperCornerWidth;
+    (void)channelsPerPixel;
+    (void)pixelsPerColumn;
+    (void)mode;
+    return cuTensorMapEncodeTiled(tensorMap, tensorDataType, tensorRank,
+                                  globalAddress, globalDim, globalStrides,
+                                  NULL, elementStrides, interleave, swizzle,
+                                  l2Promotion, oobFill);
+}
+
+CUresult CUDAAPI cuTensorMapReplaceAddress(CUtensorMap *tensorMap, void *globalAddress)
+{
+    (void)globalAddress;
+    if (tensorMap == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
     return CUDA_SUCCESS;
 }
 
@@ -5513,6 +6930,10 @@ static const struct proc_entry proc_table[] = {
     PROC_ENTRY(cuOccupancyMaxPotentialBlockSize),
     PROC_ENTRY(cuOccupancyMaxPotentialBlockSizeWithFlags),
     PROC_ENTRY(cuOccupancyAvailableDynamicSMemPerBlock),
+    PROC_ENTRY(cuTensorMapEncodeTiled),
+    PROC_ENTRY(cuTensorMapEncodeIm2col),
+    PROC_ENTRY(cuTensorMapEncodeIm2colWide),
+    PROC_ENTRY(cuTensorMapReplaceAddress),
     PROC_ENTRY(cuGetErrorName),
     PROC_ENTRY(cuGetErrorString),
 };

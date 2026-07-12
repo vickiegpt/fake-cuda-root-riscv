@@ -378,7 +378,9 @@ static void print_default_table(const struct gpu_row *rows, unsigned int count)
         const struct gpu_row *r = &rows[i];
         for (unsigned int j = 0; j < r->proc_count; j++) {
             const struct proc_row *p = &r->procs[j];
-            const char *mem = p->used_gpu_memory == NVML_VALUE_NOT_AVAILABLE ? "N/A" : "?";
+            char mem_buf[32];
+            const char *mem = p->used_gpu_memory == NVML_VALUE_NOT_AVAILABLE ?
+                "N/A" : mib_string(p->used_gpu_memory, mem_buf, sizeof(mem_buf), 1);
             printf("|  %3u   %-8u C      %-52.52s %10s |\n", r->index, p->pid, p->name, mem);
             any = 1;
         }

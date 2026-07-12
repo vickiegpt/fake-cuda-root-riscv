@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -20,6 +21,8 @@
 
 #define MAX_NVML_DEVICES 16U
 #define MAX_NVML_PROCS 256U
+#define MAX_UTIL_TRACKED_PROCS 512U
+#define DEFAULT_ACCOUNTING_DIR "/tmp/lanxin_nvidia_cuda_accounting"
 
 struct nvmlDevice_st {
     unsigned int index;
@@ -28,6 +31,27 @@ struct nvmlDevice_st {
 static int g_initialized;
 static unsigned int g_device_count;
 static struct nvmlDevice_st g_devices[MAX_NVML_DEVICES];
+
+typedef struct {
+    unsigned int pid;
+    unsigned long long timeStamp;
+    unsigned int smUtil;
+    unsigned int memUtil;
+    unsigned int encUtil;
+    unsigned int decUtil;
+} nvmlProcessUtilizationSample_t;
+
+struct util_sample {
+    pid_t pid;
+    unsigned long long cpu_ticks;
+    double uptime_seconds;
+    unsigned int last_util;
+};
+
+static struct util_sample g_util_samples[MAX_UTIL_TRACKED_PROCS];
+
+static int process_has_nvidia_fd(pid_t pid);
+static int process_is_monitor(pid_t pid);
 
 static void trim(char *s)
 {
@@ -87,6 +111,249 @@ static int read_hex_file(const char *path, unsigned int *value)
     }
     *value = (unsigned int)parsed;
     return 0;
+}
+
+static double read_uptime_seconds(void)
+{
+    FILE *f = fopen("/proc/uptime", "r");
+    if (f == NULL) {
+        return 0.0;
+    }
+    double uptime = 0.0;
+    if (fscanf(f, "%lf", &uptime) != 1) {
+        uptime = 0.0;
+    }
+    fclose(f);
+    return uptime;
+}
+
+static int read_process_cpu_ticks(pid_t pid, unsigned long long *cpu_ticks, double *age_seconds)
+{
+    if (cpu_ticks == NULL || age_seconds == NULL) {
+        return -1;
+    }
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        return -1;
+    }
+    char line[4096];
+    if (fgets(line, sizeof(line), f) == NULL) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    char *rp = strrchr(line, ')');
+    if (rp == NULL || rp[1] == '\0') {
+        return -1;
+    }
+
+    unsigned long long utime = 0;
+    unsigned long long stime = 0;
+    unsigned long long starttime = 0;
+    unsigned int field = 3;
+    char *save = NULL;
+    for (char *tok = strtok_r(rp + 2, " ", &save); tok != NULL; tok = strtok_r(NULL, " ", &save), field++) {
+        if (field == 14) {
+            utime = strtoull(tok, NULL, 10);
+        } else if (field == 15) {
+            stime = strtoull(tok, NULL, 10);
+        } else if (field == 22) {
+            starttime = strtoull(tok, NULL, 10);
+            break;
+        }
+    }
+    if (utime == 0 && stime == 0 && starttime == 0) {
+        return -1;
+    }
+
+    long hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0) {
+        hz = 100;
+    }
+    double uptime = read_uptime_seconds();
+    double process_start = (double)starttime / (double)hz;
+    *cpu_ticks = utime + stime;
+    *age_seconds = uptime > process_start ? uptime - process_start : 0.0;
+    return 0;
+}
+
+static unsigned int clamp_percent(double value)
+{
+    if (value <= 0.0) {
+        return 0;
+    }
+    if (value >= 100.0) {
+        return 100;
+    }
+    return (unsigned int)(value + 0.5);
+}
+
+static unsigned int estimate_process_gpu_util(pid_t pid)
+{
+    unsigned long long cpu_ticks = 0;
+    double age_seconds = 0.0;
+    if (read_process_cpu_ticks(pid, &cpu_ticks, &age_seconds) != 0) {
+        return 0;
+    }
+
+    long hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0) {
+        hz = 100;
+    }
+    double uptime = read_uptime_seconds();
+    struct util_sample *slot = NULL;
+    struct util_sample *empty = NULL;
+    for (unsigned int i = 0; i < MAX_UTIL_TRACKED_PROCS; i++) {
+        if (g_util_samples[i].pid == pid) {
+            slot = &g_util_samples[i];
+            break;
+        }
+        if (empty == NULL && g_util_samples[i].pid == 0) {
+            empty = &g_util_samples[i];
+        }
+    }
+    if (slot == NULL) {
+        slot = empty != NULL ? empty : &g_util_samples[(unsigned int)pid % MAX_UTIL_TRACKED_PROCS];
+        memset(slot, 0, sizeof(*slot));
+        slot->pid = pid;
+    }
+
+    double util = 0.0;
+    double elapsed = uptime - slot->uptime_seconds;
+    if (slot->uptime_seconds > 0.0 && elapsed >= 0.05 && cpu_ticks >= slot->cpu_ticks) {
+        util = ((double)(cpu_ticks - slot->cpu_ticks) / (double)hz) * 100.0 / elapsed;
+    } else if (slot->uptime_seconds > 0.0 && elapsed < 0.05) {
+        util = (double)slot->last_util;
+    } else if (age_seconds > 0.0) {
+        util = ((double)cpu_ticks / (double)hz) * 100.0 / age_seconds;
+    }
+
+    slot->cpu_ticks = cpu_ticks;
+    slot->uptime_seconds = uptime;
+    slot->last_util = clamp_percent(util);
+    return slot->last_util;
+}
+
+static unsigned int scan_total_process_gpu_util(void)
+{
+    DIR *dir = opendir("/proc");
+    if (dir == NULL) {
+        return 0;
+    }
+
+    unsigned int total = 0;
+    pid_t self = getpid();
+    struct dirent *de = NULL;
+    while ((de = readdir(dir)) != NULL) {
+        if (!isdigit((unsigned char)de->d_name[0])) {
+            continue;
+        }
+        char *end = NULL;
+        long parsed = strtol(de->d_name, &end, 10);
+        if (end == de->d_name || *end != '\0' || parsed <= 0 || parsed == (long)self) {
+            continue;
+        }
+        pid_t pid = (pid_t)parsed;
+        if (process_is_monitor(pid) || !process_has_nvidia_fd(pid)) {
+            continue;
+        }
+        total += estimate_process_gpu_util(pid);
+        if (total >= 100) {
+            total = 100;
+            break;
+        }
+    }
+    closedir(dir);
+    return total;
+}
+
+static unsigned long long now_timestamp_us(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return (unsigned long long)time(NULL) * 1000000ULL;
+    }
+    return (unsigned long long)ts.tv_sec * 1000000ULL + (unsigned long long)ts.tv_nsec / 1000ULL;
+}
+
+static const char *accounting_dir(void)
+{
+    const char *dir = getenv("LANXIN_NVIDIA_CUDA_ACCOUNTING_DIR");
+    return (dir != NULL && dir[0] != '\0') ? dir : DEFAULT_ACCOUNTING_DIR;
+}
+
+static int pid_is_alive(pid_t pid)
+{
+    char proc_path[PATH_MAX];
+    snprintf(proc_path, sizeof(proc_path), "/proc/%ld", (long)pid);
+    return access(proc_path, F_OK) == 0;
+}
+
+static int read_process_accounting_file(pid_t pid, unsigned long long *bytes)
+{
+    if (bytes == NULL || !pid_is_alive(pid)) {
+        return -1;
+    }
+
+    char path[PATH_MAX];
+    int written = snprintf(path, sizeof(path), "%s/%ld.mem", accounting_dir(), (long)pid);
+    if (written <= 0 || (size_t)written >= sizeof(path)) {
+        return -1;
+    }
+
+    char line[64];
+    if (read_first_line(path, line, sizeof(line)) != 0) {
+        return -1;
+    }
+
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(line, &end, 10);
+    if (errno != 0 || end == line) {
+        return -1;
+    }
+    *bytes = parsed;
+    return 0;
+}
+
+static unsigned long long read_process_nvidia_mmaps(pid_t pid)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "/proc/%ld/maps", (long)pid);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        return 0;
+    }
+
+    unsigned long long bytes = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (strstr(line, "/dev/nvidia") == NULL) {
+            continue;
+        }
+        unsigned long long start = 0;
+        unsigned long long end = 0;
+        if (sscanf(line, "%llx-%llx", &start, &end) == 2 && end > start) {
+            bytes += end - start;
+        }
+    }
+    fclose(f);
+    return bytes;
+}
+
+static unsigned long long read_process_gpu_memory(pid_t pid)
+{
+    unsigned long long bytes = 0;
+    if (read_process_accounting_file(pid, &bytes) == 0) {
+        return bytes;
+    }
+
+    bytes = read_process_nvidia_mmaps(pid);
+    return bytes != 0 ? bytes : NVML_VALUE_NOT_AVAILABLE;
 }
 
 static int parse_pci_bus_id(const char *bus_id, unsigned int *domain,
@@ -328,7 +595,7 @@ static unsigned int scan_nvidia_processes(nvmlProcessInfo_t *infos, unsigned int
         if (infos != NULL && found < capacity) {
             memset(&infos[found], 0, sizeof(infos[found]));
             infos[found].pid = (unsigned int)pid;
-            infos[found].usedGpuMemory = NVML_VALUE_NOT_AVAILABLE;
+            infos[found].usedGpuMemory = read_process_gpu_memory(pid);
         }
         found++;
         if (found >= MAX_NVML_PROCS && infos == NULL) {
@@ -337,6 +604,38 @@ static unsigned int scan_nvidia_processes(nvmlProcessInfo_t *infos, unsigned int
     }
     closedir(dir);
     return found;
+}
+
+static unsigned long long scan_total_process_gpu_memory(void)
+{
+    DIR *dir = opendir("/proc");
+    if (dir == NULL) {
+        return 0;
+    }
+
+    unsigned long long total = 0;
+    pid_t self = getpid();
+    struct dirent *de = NULL;
+    while ((de = readdir(dir)) != NULL) {
+        if (!isdigit((unsigned char)de->d_name[0])) {
+            continue;
+        }
+        char *end = NULL;
+        long parsed = strtol(de->d_name, &end, 10);
+        if (end == de->d_name || *end != '\0' || parsed <= 0 || parsed == (long)self) {
+            continue;
+        }
+        pid_t pid = (pid_t)parsed;
+        if (process_is_monitor(pid) || !process_has_nvidia_fd(pid)) {
+            continue;
+        }
+        unsigned long long bytes = read_process_gpu_memory(pid);
+        if (bytes != NVML_VALUE_NOT_AVAILABLE) {
+            total += bytes;
+        }
+    }
+    closedir(dir);
+    return total;
 }
 
 static nvmlReturn_t cuda_to_nvml(CUresult rc)
@@ -530,9 +829,14 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory_t *memory)
     if (cu_rc != CUDA_SUCCESS) {
         return cuda_to_nvml(cu_rc);
     }
-    cu_rc = cuMemGetInfo(&free_bytes, &total);
-    if (cu_rc != CUDA_SUCCESS) {
-        free_bytes = total;
+    unsigned long long process_used = scan_total_process_gpu_memory();
+    if (process_used != 0) {
+        free_bytes = process_used < total ? total - process_used : 0;
+    } else {
+        cu_rc = cuMemGetInfo(&free_bytes, &total);
+        if (cu_rc != CUDA_SUCCESS) {
+            free_bytes = total;
+        }
     }
     memory->total = (unsigned long long)total;
     memory->free = (unsigned long long)free_bytes;
@@ -632,7 +936,83 @@ nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t device, nvmlUtilization_
     if (utilization == NULL) {
         return NVML_ERROR_INVALID_ARGUMENT;
     }
-    return NVML_ERROR_NOT_SUPPORTED;
+    CUdevice dev = 0;
+    rc = cuda_device_for_handle(device, &dev);
+    if (rc != NVML_SUCCESS) {
+        return rc;
+    }
+
+    size_t total = 0;
+    if (cuDeviceTotalMem(&total, dev) != CUDA_SUCCESS || total == 0) {
+        total = 0;
+    }
+    unsigned long long used = scan_total_process_gpu_memory();
+    memset(utilization, 0, sizeof(*utilization));
+    utilization->gpu = scan_total_process_gpu_util();
+    utilization->memory = total != 0 ? clamp_percent((double)used * 100.0 / (double)total) : 0;
+    return NVML_SUCCESS;
+}
+
+nvmlReturn_t nvmlDeviceGetProcessUtilization(nvmlDevice_t device, nvmlProcessUtilizationSample_t *utilization,
+                                             unsigned int *processSamplesCount,
+                                             unsigned long long lastSeenTimeStamp)
+{
+    nvmlReturn_t rc = cuda_device_for_handle(device, NULL);
+    if (rc != NVML_SUCCESS) {
+        return rc;
+    }
+    if (processSamplesCount == NULL) {
+        return NVML_ERROR_INVALID_ARGUMENT;
+    }
+
+    unsigned int capacity = utilization != NULL ? *processSamplesCount : 0U;
+    unsigned int found = 0;
+    unsigned long long timestamp = now_timestamp_us();
+    if (timestamp <= lastSeenTimeStamp) {
+        timestamp = lastSeenTimeStamp + 1U;
+    }
+
+    DIR *dir = opendir("/proc");
+    if (dir == NULL) {
+        *processSamplesCount = 0;
+        return NVML_SUCCESS;
+    }
+
+    pid_t self = getpid();
+    struct dirent *de = NULL;
+    while ((de = readdir(dir)) != NULL) {
+        if (!isdigit((unsigned char)de->d_name[0])) {
+            continue;
+        }
+        char *end = NULL;
+        long parsed = strtol(de->d_name, &end, 10);
+        if (end == de->d_name || *end != '\0' || parsed <= 0 || parsed == (long)self) {
+            continue;
+        }
+        pid_t pid = (pid_t)parsed;
+        if (process_is_monitor(pid) || !process_has_nvidia_fd(pid)) {
+            continue;
+        }
+        if (utilization != NULL && found < capacity) {
+            unsigned long long bytes = read_process_gpu_memory(pid);
+            memset(&utilization[found], 0, sizeof(utilization[found]));
+            utilization[found].pid = (unsigned int)pid;
+            utilization[found].timeStamp = timestamp;
+            utilization[found].smUtil = estimate_process_gpu_util(pid);
+            utilization[found].memUtil = bytes != NVML_VALUE_NOT_AVAILABLE && bytes != 0 ? 1U : 0U;
+        }
+        found++;
+        if (found >= MAX_NVML_PROCS && utilization == NULL) {
+            break;
+        }
+    }
+    closedir(dir);
+
+    *processSamplesCount = found;
+    if (utilization == NULL || capacity < found) {
+        return found == 0 ? NVML_SUCCESS : NVML_ERROR_INSUFFICIENT_SIZE;
+    }
+    return NVML_SUCCESS;
 }
 
 nvmlReturn_t nvmlDeviceGetPowerUsage(nvmlDevice_t device, unsigned int *power)
