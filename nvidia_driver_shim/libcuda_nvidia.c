@@ -5294,6 +5294,13 @@ static uint32_t launch_arg_u32(void **kernelParams, size_t index)
     return value;
 }
 
+static size_t launch_arg_size(void **kernelParams, size_t index)
+{
+    size_t value = 0;
+    launch_arg_copy(kernelParams, index, &value, sizeof(value));
+    return value;
+}
+
 static float launch_arg_f32(void **kernelParams, size_t index)
 {
     float value = 0.0f;
@@ -5394,6 +5401,91 @@ static bool resolve_kernel_ptr_locked(uintptr_t ptr, size_t bytes, void **host_o
     }
     *host_out = resolve_uva_ptr_locked((CUdeviceptr)ptr, bytes);
     return *host_out != NULL;
+}
+
+static bool i64_mul_overflows_size(int64_t a, int64_t b, size_t elem_size, size_t *out)
+{
+    if (out == NULL || a < 0 || b < 0 || elem_size == 0) {
+        return true;
+    }
+    uint64_t ua = (uint64_t)a;
+    uint64_t ub = (uint64_t)b;
+    if (ua != 0 && ub > UINT64_MAX / ua) {
+        return true;
+    }
+    uint64_t prod = ua * ub;
+    if (prod > UINT64_MAX / elem_size) {
+        return true;
+    }
+    prod *= elem_size;
+    if (prod > (uint64_t)SIZE_MAX) {
+        return true;
+    }
+    *out = (size_t)prod;
+    return false;
+}
+
+static CUresult host_fallback_compute_batched_ptrs_locked(CUfunction f,
+                                                          unsigned int gridDimX, unsigned int gridDimY,
+                                                          unsigned int blockDimX, unsigned int blockDimY,
+                                                          void **kernelParams)
+{
+    (void)gridDimX;
+    (void)gridDimY;
+    (void)blockDimX;
+    (void)blockDimY;
+
+    char *src0 = NULL;
+    char *src1 = NULL;
+    char *dst = NULL;
+    const void **ptrs_src = NULL;
+    void **ptrs_dst = NULL;
+
+    int64_t ne12 = launch_arg_i64(kernelParams, 5);
+    int64_t ne13 = launch_arg_i64(kernelParams, 6);
+    int64_t ne23 = launch_arg_i64(kernelParams, 7);
+    size_t nb02 = launch_arg_size(kernelParams, 8);
+    size_t nb03 = launch_arg_size(kernelParams, 9);
+    size_t nb12 = launch_arg_size(kernelParams, 10);
+    size_t nb13 = launch_arg_size(kernelParams, 11);
+    size_t nbd2 = launch_arg_size(kernelParams, 12);
+    size_t nbd3 = launch_arg_size(kernelParams, 13);
+    int64_t r2 = launch_arg_i64(kernelParams, 14);
+    int64_t r3 = launch_arg_i64(kernelParams, 15);
+
+    size_t ptrs_src_bytes = 0;
+    size_t ptrs_dst_bytes = 0;
+    if (ne12 < 0 || ne13 < 0 || ne23 < 0 || r2 <= 0 || r3 <= 0 ||
+        (ne12 != 0 && ne13 > INT64_MAX / ne12) ||
+        ne12 * ne13 != ne23 ||
+        i64_mul_overflows_size(ne23, 2, sizeof(void *), &ptrs_src_bytes) ||
+        i64_mul_overflows_size(ne23, 1, sizeof(void *), &ptrs_dst_bytes)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    if (!resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 0), 0, (void **)&src0) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 1), 0, (void **)&src1) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 2), 0, (void **)&dst) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 3), ptrs_src_bytes, (void **)&ptrs_src) ||
+        !resolve_kernel_ptr_locked(launch_arg_ptr(kernelParams, 4), ptrs_dst_bytes, (void **)&ptrs_dst)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    for (int64_t i13 = 0; i13 < ne13; i13++) {
+        int64_t i03 = i13 / r3;
+        for (int64_t i12 = 0; i12 < ne12; i12++) {
+            int64_t i02 = i12 / r2;
+            int64_t idx = i12 + i13 * ne12;
+            ptrs_src[(size_t)idx] = src0 + (size_t)i02 * nb02 + (size_t)i03 * nb03;
+            ptrs_src[(size_t)ne23 + (size_t)idx] = src1 + (size_t)i12 * nb12 + (size_t)i13 * nb13;
+            ptrs_dst[(size_t)idx] = dst + (size_t)i12 * nbd2 + (size_t)i13 * nbd3;
+        }
+    }
+
+    tracef("host fallback kernel %s ne12=%lld ne13=%lld ne23=%lld",
+           f->name != NULL ? f->name : "<unnamed>",
+           (long long)ne12, (long long)ne13, (long long)ne23);
+    return CUDA_SUCCESS;
 }
 
 static CUresult host_fallback_bin_bcast_locked(CUfunction f,
@@ -6429,6 +6521,10 @@ static CUresult try_host_kernel_fallback_locked(CUfunction f,
         return CUDA_ERROR_NOT_SUPPORTED;
     }
     const char *name = f->name;
+    if (strstr(name, "k_compute_batched_ptrs") != NULL) {
+        return host_fallback_compute_batched_ptrs_locked(f, gridDimX, gridDimY,
+                                                         blockDimX, blockDimY, kernelParams);
+    }
     if (strstr(name, "_ZL11k_bin_bcast") != NULL) {
         return host_fallback_bin_bcast_locked(f, gridDimX, gridDimY, gridDimZ, kernelParams);
     }
