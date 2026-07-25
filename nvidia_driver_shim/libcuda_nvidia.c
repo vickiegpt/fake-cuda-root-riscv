@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -118,6 +119,7 @@
 #define RM_NV20_SUBDEVICE_0 0x2080u
 #define RM_NV01_CONTEXT_DMA 0x2u
 #define RM_NV01_MEMORY_SYSTEM 0x3eu
+#define RM_NV01_MEMORY_LOCAL_USER 0x40u
 #define RM_NV01_MEMORY_VIRTUAL 0x70u
 #define RM_BLACKWELL_CHANNEL_GPFIFO_B 0xca6fu
 #define RM_BLACKWELL_USERMODE_A 0xc761u
@@ -132,15 +134,22 @@
 #define RM_NV2080_ENGINE_TYPE_GRAPHICS 0x1u
 #define RM_NVOS02_FLAGS_PHYSICALITY_NONCONTIGUOUS (1u << 4)
 #define RM_NVOS02_FLAGS_LOCATION_PCI (0u << 8)
+#define RM_NVOS02_FLAGS_COHERENCY_UNCACHED (0u << 12)
 #define RM_NVOS02_FLAGS_COHERENCY_WRITE_COMBINE (2u << 12)
-#define RM_NVOS02_FLAGS_COHERENCY_WRITE_BACK (5u << 12)
-#define RM_NVOS02_FLAGS_GPU_CACHEABLE_YES (1u << 18)
 #define RM_NVOS02_FLAGS_MAPPING_NO_MAP (1u << 30)
+#define RM_NVOS32_TYPE_DMA 6u
+#define RM_NVOS32_ATTR_PAGE_SIZE_4KB (1u << 23)
+#define RM_NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE 0x100u
+#define RM_NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM 0x10000u
+#define RM_BLACKWELL_USERD_BYTES 512u
 #define RM_NVOS03_FLAGS_MAPPING_KERNEL (1u << 20)
 #define RM_NVOS03_FLAGS_HASH_TABLE_DISABLE (1u << 29)
 #define RM_NVOS04_FLAGS_MAP_CHANNEL_TRUE (1u << 30)
 #define RM_NVOS46_FLAGS_CACHE_SNOOP_ENABLE (1u << 4)
 #define RM_NVOS46_FLAGS_PAGE_SIZE_4KB (1u << 8)
+#define RM_NVOS46_FLAGS_DMA_OFFSET_FIXED (1u << 15)
+#define RM_DEVICE_VA_DEFAULT_BASE 0x1000000000ULL
+#define RM_DEVICE_VA_ALIGNMENT 0x10000ULL
 #define RM_NVOS33_FLAGS_ACCESS_WRITE_ONLY 0x2u
 #define RM_NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES 0u
 #define RM_NVA06F_CTRL_CMD_GPFIFO_SCHEDULE 0xa06f0103u
@@ -148,24 +157,46 @@
 #define RM_NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN 0xc36f0108u
 #define RM_NVC36F_CTRL_CMD_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX 0xc36f010au
 #define RM_NV906F_CTRL_GET_CLASS_ENGINEID 0x906f0101u
+#define RM_NV906F_CTRL_CMD_GET_MMU_FAULT_INFO 0x906f0106u
+#define RM_NV906F_CTRL_MMU_FAULT_SHADER_TYPES 7u
+#define RM_NV906F_CTRL_MMU_FAULT_SHADER_TYPE_COMPUTE 6u
+#define RM_ROBUST_CHANNEL_FIFO_ERROR_MMU_ERR_FLT 31u
 #define RM_NV_CHANNELGPFIFO_NOTIFICATION_TYPE_SIZE_1 3u
 #define RM_NV_NOTIFICATION_BYTES 16u
 #define RM_NV_NOTIFICATION_INFO32_OFFSET 8u
+#define RM_TRANSIENT_BAR1_CHUNK (64ULL * 1024ULL * 1024ULL)
+#define RM_COPY_BOUNCE_CHUNK (16ULL * 1024ULL * 1024ULL)
 #define RM_NVC361_NV_USERMODE_SIZE 65536u
 #define RM_NVC361_NOTIFY_CHANNEL_PENDING 0x90u
 #define RM_NVA06F_SUBCHANNEL_COMPUTE 1u
 #define RM_NVC46F_DMA_SEC_OP_INC_METHOD 1u
 #define RM_COMPUTE_SET_OBJECT 0x0000u
 #define RM_COMPUTE_NO_OPERATION 0x0100u
+#define RM_COMPUTE_INVALIDATE_SHADER_CACHES 0x021cu
+#define RM_COMPUTE_INVALIDATE_SHADER_CACHES_INSTRUCTION (1u << 0)
+#define RM_COMPUTE_INVALIDATE_SHADER_CACHES_FLUSH_DATA (1u << 2)
+#define RM_COMPUTE_INVALIDATE_SHADER_CACHES_DATA (1u << 4)
+#define RM_COMPUTE_INVALIDATE_SHADER_CACHES_CONSTANT (1u << 12)
 #define RM_COMPUTE_PIPE_NOP 0x1a2cu
 #define RM_COMPUTE_SET_PROGRAM_REGION_A 0x1608u
 #define RM_COMPUTE_SET_PROGRAM_REGION_B 0x160cu
 #define RM_COMPUTE_SET_QMD_VERSION 0x0288u
 #define RM_COMPUTE_CHECK_QMD_VERSION 0x0290u
+#define RM_COMPUTE_SET_SHADER_SHARED_MEMORY_WINDOW_A 0x02a0u
+#define RM_COMPUTE_SET_SHADER_SHARED_MEMORY_WINDOW_B 0x02a4u
 #define RM_COMPUTE_SET_CWD_SLOT_COUNT 0x02b0u
 #define RM_COMPUTE_SEND_PCAS_A 0x02b4u
 #define RM_COMPUTE_SEND_PCAS_B 0x02b8u
 #define RM_COMPUTE_SEND_SIGNALING_PCAS_B 0x02bcu
+#define RM_COMPUTE_SEND_SIGNALING_PCAS2_B 0x02c0u
+#define RM_COMPUTE_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A 0x02e4u
+#define RM_COMPUTE_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_B 0x02e8u
+#define RM_COMPUTE_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_C 0x02ecu
+#define RM_COMPUTE_SET_SHADER_LOCAL_MEMORY_A 0x0790u
+#define RM_COMPUTE_SET_SHADER_LOCAL_MEMORY_B 0x0794u
+#define RM_COMPUTE_SET_SHADER_LOCAL_MEMORY_WINDOW_A 0x07b0u
+#define RM_COMPUTE_SET_SHADER_LOCAL_MEMORY_WINDOW_B 0x07b4u
+#define RM_COMPUTE_PCAS_ACTION_INVALIDATE_COPY_SCHEDULE 0x3u
 #define RM_CHANNEL_SUBCHANNEL_HOST 0u
 #define RM_CHANNEL_SEM_ADDR_LO 0x005cu
 #define RM_CHANNEL_SEM_EXECUTE_RELEASE (1u << 0)
@@ -173,12 +204,25 @@
 #define RM_CHANNEL_SEM_EXECUTE_PAYLOAD_SIZE_32BIT 0u
 #define RM_CHANNEL_SEM_EXECUTE_PAYLOAD_SIZE_64BIT (1u << 24)
 #define RM_CHANNEL_SEM_EXECUTE_RELEASE_TIMESTAMP_DIS 0u
-#define LANXIN_HW_QMD_WORDS 64u
+#define LANXIN_HW_QMD_WORDS 96u
 #define LANXIN_HW_QMD_BYTES (LANXIN_HW_QMD_WORDS * sizeof(rm_u32))
+#define LANXIN_QMD_SLOT_BYTES 512u
+#define LANXIN_QMD_RING_SLOTS 64u
+#define LANXIN_QMD_RING_BYTES (LANXIN_QMD_SLOT_BYTES * LANXIN_QMD_RING_SLOTS)
+#define LANXIN_LAUNCH_SLOTS 16u
 #define LANXIN_QMD_VERSION_01_06 0x0106u
-#define LANXIN_QMD_MAJOR_VERSION 1u
-#define LANXIN_QMD_MINOR_VERSION 6u
+#define LANXIN_QMD_VERSION_05_00 0x0500u
+#define LANXIN_QMD_V1_WORDS 64u
+#define LANXIN_SM120_CBANK_NTID_X 0x360u
+#define LANXIN_SM120_CBANK_LOCAL_BASE 0x2f8u
+#define LANXIN_SM120_CBANK_NTID_Y 0x364u
+#define LANXIN_SM120_CBANK_NTID_Z 0x368u
+#define LANXIN_SM120_CBANK_NCTAID_X 0x370u
+#define LANXIN_SM120_CBANK_NCTAID_Y 0x374u
+#define LANXIN_SM120_CBANK_NCTAID_Z 0x378u
+#define LANXIN_SM120_CBANK_STACK_SIZE 0x37cu
 #define LANXIN_FATBINC_MAGIC 0x466243b1u
+#define LANXIN_FATBIN_MAGIC 0xba55ed50u
 #define LANXIN_QMD_STAGING_MAGIC 0x4c584e56514d4431ULL
 #define LANXIN_QMD_STAGING_VERSION 1u
 #define LANXIN_COMPLETION_MAGIC 0x4c584e56434d5031ULL
@@ -201,9 +245,14 @@
 #define LANXIN_ELF_STT_CUDA_FUNC 10u
 #define LANXIN_EIATTR_REGCOUNT 0x2f04u
 #define LANXIN_EIATTR_REGCOUNT_ALT 0x0401u
+#define LANXIN_EIATTR_FRAME_SIZE 0x1104u
+#define LANXIN_EIATTR_MIN_STACK_SIZE 0x1204u
+#define LANXIN_EIATTR_PARAM_CBANK 0x0a04u
+#define LANXIN_EIATTR_KPARAM_INFO 0x1704u
 #define LANXIN_EIATTR_MAX_THREADS 0x0504u
 #define LANXIN_EIATTR_SMEM_SIZE 0x0808u
 #define LANXIN_EIATTR_LMEM_SIZE 0x0a04u
+#define LANXIN_MAX_KERNEL_PARAMS 128u
 
 #define LANXIN_TORCH_DTYPE_BYTE 0
 #define LANXIN_TORCH_DTYPE_CHAR 1
@@ -374,6 +423,15 @@ typedef struct {
 } rm_nvos54_t;
 
 typedef struct {
+    rm_u32 addrHi;
+    rm_u32 addrLo;
+    rm_u32 faultType;
+    char faultString[32];
+    rm_u64 shaderProgramVA[RM_NV906F_CTRL_MMU_FAULT_SHADER_TYPES]
+        __attribute__((aligned(8)));
+} rm_nv906f_mmu_fault_info_t;
+
+typedef struct {
     rm_u32 deviceId;
     rm_handle hClientShare;
     rm_handle hTargetClient;
@@ -401,6 +459,32 @@ typedef struct {
     rm_u32 addressSpace;
     rm_u32 cacheAttrib;
 } rm_memory_desc_params_t;
+
+typedef struct {
+    rm_u32 owner;
+    rm_u32 type;
+    rm_u32 flags;
+    rm_u32 width;
+    rm_u32 height;
+    int32_t pitch;
+    rm_u32 attr;
+    rm_u32 attr2;
+    rm_u32 format;
+    rm_u32 comprCovg;
+    rm_u32 zcullCovg;
+    rm_u64 rangeLo __attribute__((aligned(8)));
+    rm_u64 rangeHi __attribute__((aligned(8)));
+    rm_u64 size __attribute__((aligned(8)));
+    rm_u64 alignment __attribute__((aligned(8)));
+    rm_u64 offset __attribute__((aligned(8)));
+    rm_u64 limit __attribute__((aligned(8)));
+    rm_p64 address __attribute__((aligned(8)));
+    rm_u32 ctagOffset;
+    rm_handle hVASpace;
+    rm_u32 internalflags;
+    rm_u32 tag;
+    int32_t numaNode;
+} rm_memory_allocation_params_t;
 
 typedef struct {
     rm_handle hObjectError;
@@ -486,6 +570,8 @@ struct lanxin_kernel_metadata {
     rm_u64 symbol_size;
     rm_u64 const0_file_offset;
     rm_u64 const0_size;
+    rm_u32 param_cbank_offset;
+    rm_u32 param_cbank_size;
     rm_u32 qmd_program_offset;
     rm_u32 reg_count;
     rm_u32 static_shared_mem_bytes;
@@ -493,6 +579,13 @@ struct lanxin_kernel_metadata {
     rm_u32 const_mem_bytes;
     rm_u32 max_threads_per_block;
     rm_u32 sm_version;
+    rm_u32 param_count;
+    struct {
+        rm_u32 index;
+        uint16_t ordinal;
+        uint16_t offset;
+        rm_u32 size;
+    } params[LANXIN_MAX_KERNEL_PARAMS];
 };
 
 struct lanxin_qmd_staging_desc {
@@ -552,6 +645,7 @@ struct launch_staging {
     struct rm_stage_buffer params;
     struct rm_stage_buffer completion;
     unsigned long long launch_id;
+    size_t qmd_offset;
 };
 
 struct launch_request {
@@ -609,9 +703,16 @@ struct CUfunc_st {
     uint32_t magic;
     char *name;
     CUmodule module;
+    const void *image;
+    size_t image_size;
+    rm_u64 image_hash;
     rm_u64 name_hash;
     struct lanxin_kernel_metadata metadata;
-    struct launch_staging launch;
+    struct rm_stage_buffer code;
+    size_t staged_code_bytes;
+    rm_u32 staged_code_layout;
+    rm_u64 staged_text_file_offset;
+    rm_u64 staged_text_size;
     struct CUfunc_st *next;
 };
 
@@ -653,6 +754,9 @@ struct allocation {
     bool rm_backed;
     rm_handle rm_memory;
     rm_p64 rm_linear;
+    rm_u64 rm_gpu_va;
+    rm_handle rm_cpu_parent;
+    int rm_map_fd;
     unsigned long long id;
     struct allocation *next;
 };
@@ -695,6 +799,7 @@ struct driver_state {
     rm_handle rm_error_ctxdma;
     rm_handle rm_gpfifo;
     rm_handle rm_userd;
+    rm_handle rm_userd_parent;
     rm_handle rm_usermode;
     rm_handle rm_usermode_parent;
     rm_handle rm_channel;
@@ -717,6 +822,12 @@ struct driver_state {
     rm_u32 rm_usermode_class;
     rm_u32 rm_compute_class;
     rm_u32 rm_compute_class_engine_id;
+    rm_u64 rm_device_va_cursor;
+    struct launch_staging rm_launch[LANXIN_LAUNCH_SLOTS];
+    bool rm_launch_pending[LANXIN_LAUNCH_SLOTS];
+    struct allocation rm_slm;
+    rm_u64 rm_slm_bytes_per_tpc;
+    rm_u32 rm_slm_bytes_per_lane;
     struct allocation *allocs;
     CUmodule modules;
 };
@@ -742,6 +853,14 @@ static struct driver_state g = {
     .next_id = 1,
     .next_rm_handle = 0x3000,
 };
+
+static int rm_ensure_slm_locked(rm_u32 bytes_per_lane);
+static void rm_release_launch_slots_locked(void);
+static void rm_trace_launch_pointer_data_locked(CUfunction f,
+                                                const struct launch_request *req);
+static rm_u32 rm_effective_local_mem_bytes(CUfunction f);
+static rm_u32 rm_effective_local_stack_bytes(CUfunction f);
+static rm_u32 rm_effective_slm_bytes_per_lane(CUfunction f);
 
 static const char *accounting_dir(void)
 {
@@ -826,6 +945,15 @@ static int env_disabled(const char *name)
 {
     const char *value = getenv(name);
     return value != NULL && strcmp(value, "0") == 0;
+}
+
+static int rm_qmd_release_enabled(void)
+{
+    const char *value = getenv("LANXIN_NVIDIA_CUDA_QMD_RELEASE");
+    if (value != NULL && value[0] != '\0') {
+        return env_enabled("LANXIN_NVIDIA_CUDA_QMD_RELEASE");
+    }
+    return g.rm_compute_class < RM_BLACKWELL_COMPUTE_A;
 }
 
 static rm_u64 fnv1a64_bytes(const void *data, size_t size)
@@ -973,6 +1101,21 @@ static size_t probe_elf_image_size(const unsigned char *bytes)
     return max_end;
 }
 
+static size_t probe_fatbin_image_size(const unsigned char *bytes)
+{
+    if (bytes == NULL || rd32le(bytes) != LANXIN_FATBIN_MAGIC) {
+        return 0;
+    }
+    size_t limit = image_scan_limit();
+    size_t header_size = rd16le(bytes + 6);
+    rm_u64 payload_size = rd64le(bytes + 8);
+    if (header_size < 16 || header_size > limit ||
+        payload_size > limit - header_size) {
+        return 0;
+    }
+    return header_size + (size_t)payload_size;
+}
+
 static const void *resolve_module_image(const void *image, size_t *size_out, const char **kind_out)
 {
     const unsigned char *bytes = (const unsigned char *)image;
@@ -994,9 +1137,15 @@ static const void *resolve_module_image(const void *image, size_t *size_out, con
         kind = "fatbin-wrapper";
     }
 
-    image_size = probe_elf_image_size(bytes);
+    size_t fatbin_size = probe_fatbin_image_size(bytes);
+    if (fatbin_size != 0) {
+        image_size = fatbin_size;
+        kind = "fatbin";
+    } else {
+        image_size = probe_elf_image_size(bytes);
+    }
     if (image_size != 0) {
-        if (strcmp(kind, "fatbin-wrapper") != 0) {
+        if (strcmp(kind, "fatbin-wrapper") != 0 && strcmp(kind, "fatbin-elf") != 0) {
             kind = "elf";
         }
     } else {
@@ -1129,8 +1278,9 @@ static void parse_kernel_nv_info(const unsigned char *data, rm_u64 size,
     }
     rm_u64 off = 0;
     while (off + 4 <= size) {
+        rm_u32 attr_format = data[off];
         rm_u32 attr_type = rd16le(data + off);
-        rm_u32 attr_size = rd16le(data + off + 2);
+        rm_u32 attr_size = attr_format == 4 ? rd16le(data + off + 2) : 0;
         off += 4;
         if (attr_size > size - off) {
             break;
@@ -1143,6 +1293,15 @@ static void parse_kernel_nv_info(const unsigned char *data, rm_u64 size,
             case LANXIN_EIATTR_REGCOUNT_ALT:
                 meta->reg_count = value;
                 break;
+            case LANXIN_EIATTR_KPARAM_INFO:
+                if (attr_size >= 12 && meta->param_count < LANXIN_MAX_KERNEL_PARAMS) {
+                    rm_u32 slot = meta->param_count++;
+                    meta->params[slot].index = rd32le(payload);
+                    meta->params[slot].ordinal = rd16le(payload + 4);
+                    meta->params[slot].offset = rd16le(payload + 6);
+                    meta->params[slot].size = (rd32le(payload + 8) >> 18) & 0x3fffu;
+                }
+                break;
             case LANXIN_EIATTR_MAX_THREADS:
                 meta->max_threads_per_block = value;
                 break;
@@ -1150,10 +1309,49 @@ static void parse_kernel_nv_info(const unsigned char *data, rm_u64 size,
                 meta->static_shared_mem_bytes = value;
                 break;
             case LANXIN_EIATTR_LMEM_SIZE:
-                meta->local_mem_bytes = value;
+                if (attr_size >= 8) {
+                    meta->param_cbank_offset = rd16le(payload + 4);
+                    meta->param_cbank_size = rd16le(payload + 6);
+                } else {
+                    meta->local_mem_bytes = value;
+                }
                 break;
             default:
                 break;
+            }
+        }
+        off += attr_size;
+        off = (off + 3ULL) & ~3ULL;
+    }
+}
+
+static void parse_global_kernel_nv_info(const unsigned char *data, rm_u64 size,
+                                        rm_u32 symbol_index,
+                                        struct lanxin_kernel_metadata *meta)
+{
+    if (data == NULL || meta == NULL || symbol_index == UINT32_MAX) {
+        return;
+    }
+    rm_u64 off = 0;
+    while (off + 4 <= size) {
+        rm_u32 attr_format = data[off];
+        rm_u32 attr_type = rd16le(data + off);
+        rm_u32 attr_size = attr_format == 4 ? rd16le(data + off + 2) : 0;
+        off += 4;
+        if (attr_size > size - off) {
+            break;
+        }
+        const unsigned char *payload = data + off;
+        if (attr_size >= 8 && rd32le(payload) == symbol_index) {
+            rm_u32 value = rd32le(payload + 4);
+            if (attr_type == LANXIN_EIATTR_REGCOUNT ||
+                attr_type == LANXIN_EIATTR_REGCOUNT_ALT) {
+                meta->reg_count = value;
+            } else if (attr_type == LANXIN_EIATTR_FRAME_SIZE ||
+                       attr_type == LANXIN_EIATTR_MIN_STACK_SIZE) {
+                if (value > meta->local_mem_bytes) {
+                    meta->local_mem_bytes = value;
+                }
             }
         }
         off += attr_size;
@@ -1200,10 +1398,15 @@ static bool module_find_kernel_metadata(CUmodule module, const char *kernel_name
 
     struct elf64_section_view text = {0};
     struct elf64_section_view info = {0};
+    struct elf64_section_view global_info = {0};
     struct elf64_section_view const0 = {0};
+    struct elf64_section_view shared = {0};
     bool have_text = false;
     bool have_info = false;
+    bool have_global_info = false;
     bool have_const0 = false;
+    bool have_shared = false;
+    rm_u32 kernel_symbol_index = UINT32_MAX;
 
     for (uint16_t i = 0; i < shnum; i++) {
         struct elf64_section_view sec;
@@ -1221,10 +1424,17 @@ static bool module_find_kernel_metadata(CUmodule module, const char *kernel_name
                    kernel_named_section_matches(sec.name, ".nv.info.", kernel_name)) {
             info = sec;
             have_info = true;
+        } else if (!have_global_info && strcmp(sec.name, ".nv.info") == 0) {
+            global_info = sec;
+            have_global_info = true;
         } else if (!have_const0 &&
                    kernel_named_section_matches(sec.name, ".nv.constant0.", kernel_name)) {
             const0 = sec;
             have_const0 = true;
+        } else if (!have_shared &&
+                   kernel_named_section_matches(sec.name, ".nv.shared.", kernel_name)) {
+            shared = sec;
+            have_shared = true;
         }
     }
 
@@ -1263,6 +1473,7 @@ static bool module_find_kernel_metadata(CUmodule module, const char *kernel_name
                 (sym_sec.flags & LANXIN_ELF_SHF_EXECINSTR) != 0) {
                 text = sym_sec;
                 have_text = true;
+                kernel_symbol_index = j > UINT32_MAX ? UINT32_MAX : (rm_u32)j;
                 meta->symbol_value = rd64le(sym + 8);
                 meta->symbol_size = rd64le(sym + 16);
             }
@@ -1276,7 +1487,10 @@ static bool module_find_kernel_metadata(CUmodule module, const char *kernel_name
     meta->text_file_offset = text.offset;
     meta->text_size = meta->symbol_size != 0 ? meta->symbol_size : text.size;
     meta->text_addr = text.addr;
-    meta->sm_version = eflags & 0xffu;
+    meta->sm_version = (eflags >> 8) & 0xffu;
+    if (meta->sm_version == 0) {
+        meta->sm_version = eflags & 0xffu;
+    }
     if (meta->sm_version == 0 && eflags != 0) {
         meta->sm_version = eflags;
     }
@@ -1292,12 +1506,71 @@ static bool module_find_kernel_metadata(CUmodule module, const char *kernel_name
         range_in_image(info.offset, info.size, image_size)) {
         parse_kernel_nv_info(image + info.offset, info.size, meta);
     }
+    if (have_global_info && global_info.type == LANXIN_ELF_SHT_CUDA_INFO &&
+        range_in_image(global_info.offset, global_info.size, image_size)) {
+        parse_global_kernel_nv_info(image + global_info.offset, global_info.size,
+                                    kernel_symbol_index, meta);
+    }
     if (have_const0 && range_in_image(const0.offset, const0.size, image_size)) {
         meta->const0_file_offset = const0.offset;
         meta->const0_size = const0.size;
         meta->const_mem_bytes = const0.size > 0xffffffffULL ? 0xffffffffu : (rm_u32)const0.size;
     }
+    if (have_shared) {
+        rm_u32 shared_size = shared.size > UINT32_MAX ? UINT32_MAX : (rm_u32)shared.size;
+        if (shared_size > meta->static_shared_mem_bytes) {
+            meta->static_shared_mem_bytes = shared_size;
+        }
+    }
     return true;
+}
+
+static bool fatbin_find_kernel_image(CUmodule module, const char *kernel_name,
+                                     const void **image_out, size_t *image_size_out,
+                                     struct lanxin_kernel_metadata *meta)
+{
+    if (!valid_module(module) || kernel_name == NULL || image_out == NULL ||
+        image_size_out == NULL || meta == NULL || module->image == NULL) {
+        return false;
+    }
+    const unsigned char *fatbin = (const unsigned char *)module->image;
+    size_t total_size = probe_fatbin_image_size(fatbin);
+    if (total_size == 0 || total_size > module->image_size) {
+        return false;
+    }
+
+    size_t offset = rd16le(fatbin + 6);
+    while (offset + 16 <= total_size) {
+        const unsigned char *entry = fatbin + offset;
+        size_t entry_header_size = rd32le(entry + 4);
+        rm_u64 entry_payload_size = rd64le(entry + 8);
+        if (entry_header_size < 16 || entry_header_size > total_size - offset ||
+            entry_payload_size > total_size - offset - entry_header_size) {
+            break;
+        }
+
+        const unsigned char *payload = entry + entry_header_size;
+        size_t elf_size = probe_elf_image_size(payload);
+        if (elf_size != 0 && elf_size <= entry_payload_size) {
+            struct CUmod_st candidate;
+            memset(&candidate, 0, sizeof(candidate));
+            candidate.magic = HANDLE_MAGIC_MODULE;
+            candidate.image = payload;
+            candidate.image_size = elf_size;
+            if (module_find_kernel_metadata(&candidate, kernel_name, meta)) {
+                *image_out = payload;
+                *image_size_out = elf_size;
+                return true;
+            }
+        }
+
+        size_t advance = entry_header_size + (size_t)entry_payload_size;
+        if (advance == 0) {
+            break;
+        }
+        offset += advance;
+    }
+    return false;
 }
 
 static CUfunction module_find_function(CUmodule module, const char *name)
@@ -1335,7 +1608,19 @@ static CUresult module_get_or_create_function(CUfunction *hfunc, CUmodule hmod, 
     }
     fn->name_hash = fnv1a64_str(name);
     fn->module = hmod;
-    if (module_find_kernel_metadata(hmod, name, &fn->metadata)) {
+    fn->image = hmod->image;
+    fn->image_size = hmod->image_size;
+    bool found_metadata = false;
+    if (hmod->image != NULL &&
+        probe_fatbin_image_size((const unsigned char *)hmod->image) != 0) {
+        found_metadata = fatbin_find_kernel_image(
+            hmod, name, &fn->image, &fn->image_size, &fn->metadata);
+    } else {
+        found_metadata = module_find_kernel_metadata(hmod, name, &fn->metadata);
+    }
+    fn->image_hash = fn->image != NULL && fn->image_size != 0 ?
+                     fnv1a64_bytes(fn->image, fn->image_size) : hmod->image_hash;
+    if (found_metadata) {
         tracef("cuModuleGetFunction cubin name=%s text_off=0x%llx text_size=%llu program_offset=0x%x regs=%u static_smem=%u local=%u const0=0x%llx/%llu max_threads=%u sm=%u",
                name,
                (unsigned long long)fn->metadata.text_file_offset,
@@ -1370,6 +1655,44 @@ static CUresult module_discover_cubin_kernels(CUmodule module)
 
     const unsigned char *image = (const unsigned char *)module->image;
     size_t image_size = module->image_size;
+    size_t fatbin_size = probe_fatbin_image_size(image);
+    if (fatbin_size != 0 && fatbin_size <= image_size) {
+        const void *container_image = module->image;
+        size_t container_size = module->image_size;
+        size_t offset = rd16le(image + 6);
+        while (offset + 16 <= fatbin_size) {
+            const unsigned char *entry = image + offset;
+            size_t entry_header_size = rd32le(entry + 4);
+            rm_u64 entry_payload_size = rd64le(entry + 8);
+            if (entry_header_size < 16 || entry_header_size > fatbin_size - offset ||
+                entry_payload_size > fatbin_size - offset - entry_header_size) {
+                break;
+            }
+            const unsigned char *payload = entry + entry_header_size;
+            size_t elf_size = probe_elf_image_size(payload);
+            if (elf_size != 0 && elf_size <= entry_payload_size) {
+                module->image = payload;
+                module->image_size = elf_size;
+                module->kernels_discovered = false;
+                CUresult result = module_discover_cubin_kernels(module);
+                module->image = container_image;
+                module->image_size = container_size;
+                module->kernels_discovered = false;
+                if (result != CUDA_SUCCESS) {
+                    return result;
+                }
+            }
+            size_t advance = entry_header_size + (size_t)entry_payload_size;
+            if (advance == 0) {
+                break;
+            }
+            offset += advance;
+        }
+        module->image = container_image;
+        module->image_size = container_size;
+        module->kernels_discovered = true;
+        return CUDA_SUCCESS;
+    }
     if (image[0] != 0x7f || image[1] != 'E' || image[2] != 'L' || image[3] != 'F' ||
         image[4] != 2 || image[5] != 1 || rd16le(image + 18) != LANXIN_ELF_EM_CUDA) {
         module->kernels_discovered = true;
@@ -1518,16 +1841,18 @@ static int rm_alloc_memory_locked(int ioctl_fd, int map_fd, rm_handle *hMemory,
     return -1;
 }
 
-static int rm_map_cpu_with_parent_flags_locked(int map_fd, rm_handle hDevice, rm_handle hMemory,
-                                               size_t size, rm_u32 flags,
-                                               rm_p64 *linear, void **cpu,
-                                               const char *label)
+static int rm_map_cpu_range_with_parent_flags_locked(int map_fd, rm_handle hDevice,
+                                                     rm_handle hMemory, size_t offset,
+                                                     size_t size, rm_u32 flags,
+                                                     rm_p64 *linear, void **cpu,
+                                                     const char *label)
 {
     rm_nvos33_with_fd_t api;
     memset(&api, 0, sizeof(api));
     api.params.hClient = g.rm_client;
     api.params.hDevice = hDevice != 0 ? hDevice : g.rm_device;
     api.params.hMemory = hMemory;
+    api.params.offset = offset;
     api.params.length = size;
     api.params.flags = flags;
     api.fd = map_fd;
@@ -1553,6 +1878,16 @@ static int rm_map_cpu_with_parent_flags_locked(int map_fd, rm_handle hDevice, rm
     *linear = api.params.pLinearAddress;
     *cpu = addr;
     return 0;
+}
+
+static int rm_map_cpu_with_parent_flags_locked(int map_fd, rm_handle hDevice,
+                                               rm_handle hMemory, size_t size,
+                                               rm_u32 flags, rm_p64 *linear,
+                                               void **cpu, const char *label)
+{
+    return rm_map_cpu_range_with_parent_flags_locked(map_fd, hDevice, hMemory,
+                                                     0, size, flags, linear,
+                                                     cpu, label);
 }
 
 static int rm_map_cpu_with_parent_locked(int map_fd, rm_handle hDevice, rm_handle hMemory,
@@ -1603,7 +1938,13 @@ static int rm_map_dma_locked(rm_handle hDma, rm_handle hMemory, size_t size,
     api.hDma = hDma;
     api.hMemory = hMemory;
     api.length = size;
-    api.flags = (rm_v32)(RM_NVOS46_FLAGS_PAGE_SIZE_4KB | RM_NVOS46_FLAGS_CACHE_SNOOP_ENABLE);
+    api.flags = (rm_v32)RM_NVOS46_FLAGS_PAGE_SIZE_4KB;
+    if (*gpu_va != 0) {
+        api.flags |= (rm_v32)RM_NVOS46_FLAGS_DMA_OFFSET_FIXED;
+    }
+    if (env_enabled("LANXIN_NVIDIA_CUDA_CACHE_SNOOP")) {
+        api.flags |= RM_NVOS46_FLAGS_CACHE_SNOOP_ENABLE;
+    }
     api.dmaOffset = *gpu_va;
     int rc = rm_ioctl_xfer(g.ctl_fd, RM_ESC_RM_MAP_MEMORY_DMA, &api, sizeof(api));
     tracef("%s dma map ioctl=%d errno=%d status=0x%08x va=0x%llx",
@@ -1614,6 +1955,24 @@ static int rm_map_dma_locked(rm_handle hDma, rm_handle hMemory, size_t size,
         return 0;
     }
     return -1;
+}
+
+static rm_u64 rm_reserve_device_va_locked(size_t size)
+{
+    rm_u64 base = env_ull("LANXIN_NVIDIA_CUDA_DEVICE_VA_BASE",
+                          RM_DEVICE_VA_DEFAULT_BASE);
+    if (g.rm_device_va_cursor < base) {
+        g.rm_device_va_cursor = base;
+    }
+    rm_u64 address = (g.rm_device_va_cursor + RM_DEVICE_VA_ALIGNMENT - 1ULL) &
+                     ~(RM_DEVICE_VA_ALIGNMENT - 1ULL);
+    rm_u64 mapped_size = ((rm_u64)size + RM_DEVICE_VA_ALIGNMENT - 1ULL) &
+                         ~(RM_DEVICE_VA_ALIGNMENT - 1ULL);
+    if (address > UINT64_MAX - mapped_size) {
+        return 0;
+    }
+    g.rm_device_va_cursor = address + mapped_size;
+    return address;
 }
 
 static void rm_unmap_dma_locked(rm_handle hDma, rm_handle hMemory, rm_u64 gpu_va, size_t size)
@@ -1782,6 +2141,7 @@ static void rm_channel_destroy_locked(void)
 {
     size_t page = page_align_size(4096);
     size_t gpfifo_size = g.rm_gpfifo_size != 0 ? g.rm_gpfifo_size : page;
+    rm_release_launch_slots_locked();
     if (g.rm_compute != 0) {
         rm_free_object_locked(g.rm_client, g.rm_channel, g.rm_compute);
     }
@@ -1796,7 +2156,8 @@ static void rm_channel_destroy_locked(void)
                               g.rm_usermode_parent != 0 ? g.rm_usermode_parent : g.rm_device,
                               g.rm_usermode);
     }
-    rm_unmap_cpu_locked(g.rm_userd, g.rm_userd_linear, g.rm_userd_cpu, page);
+    rm_unmap_cpu_with_parent_locked(g.rm_userd_parent, g.rm_userd,
+                                    g.rm_userd_linear, g.rm_userd_cpu, page);
     if (g.rm_userd != 0) {
         rm_free_object_locked(g.rm_client, g.rm_device, g.rm_userd);
     }
@@ -1837,6 +2198,7 @@ static void rm_channel_destroy_locked(void)
     g.rm_error_ctxdma = 0;
     g.rm_gpfifo = 0;
     g.rm_userd = 0;
+    g.rm_userd_parent = 0;
     g.rm_usermode = 0;
     g.rm_usermode_parent = 0;
     g.rm_channel = 0;
@@ -1929,21 +2291,78 @@ static rm_u32 rm_read_notifier_info32_locked(rm_u32 index)
     return *info32;
 }
 
+static inline void rm_io_fence(void)
+{
+#if defined(__riscv)
+    __asm__ __volatile__("fence iorw, iorw" ::: "memory");
+#else
+    __sync_synchronize();
+#endif
+}
+
+static void rm_trace_channel_state_locked(const char *reason)
+{
+    rm_u32 gp_get = 0;
+    rm_u32 gp_put = 0;
+    rm_u32 error_info32 = 0;
+    rm_u32 error_info16 = 0;
+    rm_u32 error_status = 0;
+
+    if (g.rm_userd_cpu != NULL) {
+        volatile rm_u32 *control = (volatile rm_u32 *)g.rm_userd_cpu;
+        gp_get = control[0x88 / 4];
+        gp_put = control[0x8c / 4];
+    }
+    if (g.rm_notifier_cpu != NULL) {
+        volatile uint8_t *notifier = (volatile uint8_t *)g.rm_notifier_cpu;
+        error_info32 = *(volatile rm_u32 *)(notifier + 8);
+        error_info16 = *(volatile uint16_t *)(notifier + 12);
+        error_status = *(volatile uint16_t *)(notifier + 14);
+    }
+    __sync_synchronize();
+    tracef("RM channel state reason=%s GPGet=%u GPPut=%u error_status=0x%04x error_info32=0x%08x error_info16=0x%04x",
+           reason != NULL ? reason : "unknown", gp_get, gp_put,
+           error_status, error_info32, error_info16);
+
+    if (error_status == 0xffffu &&
+        error_info32 == RM_ROBUST_CHANNEL_FIFO_ERROR_MMU_ERR_FLT &&
+        g.rm_channel != 0) {
+        rm_nv906f_mmu_fault_info_t fault;
+        memset(&fault, 0, sizeof(fault));
+        if (rm_control_locked(g.rm_channel, RM_NV906F_CTRL_CMD_GET_MMU_FAULT_INFO,
+                              &fault, sizeof(fault), "rm_channel_mmu_fault_info") == 0) {
+            fault.faultString[sizeof(fault.faultString) - 1] = '\0';
+            rm_u64 address = ((rm_u64)fault.addrHi << 32) | fault.addrLo;
+            tracef("RM MMU fault addr=0x%llx type=0x%x string=%s compute_shader=0x%llx",
+                   (unsigned long long)address, fault.faultType,
+                   fault.faultString[0] != '\0' ? fault.faultString : "unknown",
+                   (unsigned long long)fault.shaderProgramVA[
+                       RM_NV906F_CTRL_MMU_FAULT_SHADER_TYPE_COMPUTE]);
+        }
+    }
+}
+
 static void rm_channel_kickoff_locked(rm_u32 old_put, rm_u32 new_put)
 {
     volatile rm_u32 *control = (volatile rm_u32 *)g.rm_userd_cpu;
+    rm_io_fence();
     if (control != NULL) {
         control[0x8c / 4] = new_put;
     }
-    __sync_synchronize();
+    rm_io_fence();
 
     if (!env_disabled("LANXIN_NVIDIA_CUDA_DOORBELL") &&
         g.rm_usermode_cpu != NULL && g.rm_doorbell_token != 0) {
+        rm_u32 refreshed_token =
+            rm_read_notifier_info32_locked(g.rm_token_notifier_index);
+        if (refreshed_token != 0) {
+            g.rm_doorbell_token = refreshed_token;
+        }
         volatile rm_u32 *doorbell =
             (volatile rm_u32 *)((volatile uint8_t *)g.rm_usermode_cpu +
                                 RM_NVC361_NOTIFY_CHANNEL_PENDING);
         *doorbell = g.rm_doorbell_token;
-        __sync_synchronize();
+        rm_io_fence();
         tracef("RM doorbell kickoff old_put=%u new_put=%u token=0x%08x usermode=0x%x class=0x%x",
                old_put, new_put, g.rm_doorbell_token, g.rm_usermode, g.rm_usermode_class);
     } else {
@@ -1974,18 +2393,23 @@ static int rm_channel_init_locked(void)
     rm_u32 sys_flags = RM_NVOS02_FLAGS_PHYSICALITY_NONCONTIGUOUS |
                        RM_NVOS02_FLAGS_LOCATION_PCI |
                        RM_NVOS02_FLAGS_COHERENCY_WRITE_COMBINE |
-                       RM_NVOS02_FLAGS_GPU_CACHEABLE_YES |
                        RM_NVOS02_FLAGS_MAPPING_NO_MAP;
     rm_u32 coherent_flags = RM_NVOS02_FLAGS_PHYSICALITY_NONCONTIGUOUS |
                             RM_NVOS02_FLAGS_LOCATION_PCI |
-                            RM_NVOS02_FLAGS_COHERENCY_WRITE_BACK |
-                            RM_NVOS02_FLAGS_GPU_CACHEABLE_YES |
+                            RM_NVOS02_FLAGS_COHERENCY_UNCACHED |
                             RM_NVOS02_FLAGS_MAPPING_NO_MAP;
+    rm_u32 userd_flags = RM_NVOS02_FLAGS_PHYSICALITY_NONCONTIGUOUS |
+                         RM_NVOS02_FLAGS_LOCATION_PCI |
+                         RM_NVOS02_FLAGS_COHERENCY_UNCACHED |
+                         RM_NVOS02_FLAGS_MAPPING_NO_MAP;
 
     g.rm_notifier_fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
     g.rm_gpfifo_fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
-    g.rm_userd_fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
-    g.rm_usermode_fd = g.gpu_fd >= 0 ? dup(g.gpu_fd) : -1;
+    g.rm_userd_fd = open("/dev/nvidia0", O_RDWR | O_CLOEXEC);
+    if (g.rm_userd_fd < 0) {
+        g.rm_userd_fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
+    }
+    g.rm_usermode_fd = open("/dev/nvidia0", O_RDWR | O_CLOEXEC);
     if (g.rm_usermode_fd < 0) {
         g.rm_usermode_fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
     }
@@ -2037,14 +2461,39 @@ static int rm_channel_init_locked(void)
     memset(g.rm_gpfifo_cpu, 0, gpfifo_bytes);
 
     g.rm_userd = g.next_rm_handle++;
-    if (rm_alloc_memory_locked(g.gpu_fd, g.rm_userd_fd, &g.rm_userd,
-                               RM_NV01_MEMORY_SYSTEM, sys_flags, page,
-                               "rm_alloc_userd") != 0 ||
-        rm_map_cpu_locked(g.rm_userd_fd, g.rm_userd, page, &g.rm_userd_linear,
-                          &g.rm_userd_cpu, "rm_map_userd_cpu") != 0) {
+    rm_memory_allocation_params_t userd_params;
+    memset(&userd_params, 0, sizeof(userd_params));
+    userd_params.owner = g.rm_client;
+    userd_params.type = RM_NVOS32_TYPE_DMA;
+    userd_params.flags = RM_NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE |
+                         RM_NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM;
+    userd_params.attr = RM_NVOS32_ATTR_PAGE_SIZE_4KB;
+    userd_params.size = RM_BLACKWELL_USERD_BYTES;
+    userd_params.alignment = RM_BLACKWELL_USERD_BYTES;
+    bool local_userd =
+        rm_alloc_object_locked(g.rm_client, g.rm_device, &g.rm_userd,
+                               RM_NV01_MEMORY_LOCAL_USER,
+                               &userd_params, sizeof(userd_params),
+                               "rm_alloc_userd_vidmem") == 0;
+    if (!local_userd) {
+        g.rm_userd = g.next_rm_handle++;
+        if (rm_alloc_memory_locked(g.gpu_fd, g.rm_userd_fd, &g.rm_userd,
+                                   RM_NV01_MEMORY_SYSTEM, userd_flags, page,
+                                   "rm_alloc_userd_sysmem") != 0) {
+            goto fail;
+        }
+    }
+    g.rm_userd_parent = local_userd && g.rm_subdevice != 0 ?
+                        g.rm_subdevice : g.rm_device;
+    size_t userd_map_bytes = local_userd ? RM_BLACKWELL_USERD_BYTES : page;
+    if (rm_map_cpu_with_parent_locked(g.rm_userd_fd, g.rm_userd_parent,
+                                      g.rm_userd, userd_map_bytes, &g.rm_userd_linear,
+                                      &g.rm_userd_cpu, "rm_map_userd_cpu") != 0) {
         goto fail;
     }
-    memset(g.rm_userd_cpu, 0, page);
+    tracef("RM UserD allocation path=%s handle=0x%x", local_userd ? "vidmem" : "sysmem",
+           g.rm_userd);
+    memset(g.rm_userd_cpu, 0, userd_map_bytes);
 
     if (rm_alloc_usermode_locked() != 0) {
         goto fail;
@@ -2153,6 +2602,18 @@ static rm_u32 rm_qmd_shared_mem_units(rm_u32 bytes)
     return units > 0x3ffffULL ? 0x3ffffu : (rm_u32)units;
 }
 
+static rm_u32 rm_qmd5_smem_config(rm_u32 bytes, rm_u32 workgroups)
+{
+    static const rm_u32 legal_kib[] = { 0, 8, 16, 32, 64, 100 };
+    rm_u64 required = (rm_u64)bytes * (rm_u64)(workgroups == 0 ? 1 : workgroups);
+    for (size_t i = 0; i < sizeof(legal_kib) / sizeof(legal_kib[0]); i++) {
+        if ((rm_u64)legal_kib[i] * 1024ULL >= required) {
+            return legal_kib[i] / 4U + 1U;
+        }
+    }
+    return legal_kib[sizeof(legal_kib) / sizeof(legal_kib[0]) - 1U] / 4U + 1U;
+}
+
 static rm_u64 rm_completion_host_va(const struct launch_staging *launch)
 {
     return launch->completion.gpu_va + offsetof(struct lanxin_launch_completion, host_progress);
@@ -2161,6 +2622,22 @@ static rm_u64 rm_completion_host_va(const struct launch_staging *launch)
 static rm_u64 rm_completion_qmd_va(const struct launch_staging *launch)
 {
     return launch->completion.gpu_va + offsetof(struct lanxin_launch_completion, qmd_done);
+}
+
+static void *rm_launch_qmd_cpu(const struct launch_staging *launch)
+{
+    return (uint8_t *)launch->qmd.cpu + launch->qmd_offset;
+}
+
+static rm_u64 rm_launch_qmd_va(const struct launch_staging *launch)
+{
+    return launch->qmd.gpu_va + launch->qmd_offset;
+}
+
+static struct lanxin_qmd_staging_desc *rm_launch_qmd_meta(const struct launch_staging *launch)
+{
+    return (struct lanxin_qmd_staging_desc *)
+           ((uint8_t *)launch->qmd.cpu + LANXIN_QMD_RING_BYTES);
 }
 
 static int rm_compute_init_locked(void)
@@ -2230,7 +2707,6 @@ static int rm_stage_alloc_locked(struct rm_stage_buffer *buf, size_t size, const
     }
     size_t mapped_size = page_align_size(size);
     if (buf->memory != 0 && buf->cpu != NULL && buf->gpu_va != 0 && buf->size >= mapped_size) {
-        memset(buf->cpu, 0, buf->size);
         return 0;
     }
     rm_stage_release_locked(buf);
@@ -2246,7 +2722,6 @@ static int rm_stage_alloc_locked(struct rm_stage_buffer *buf, size_t size, const
     rm_u32 flags = RM_NVOS02_FLAGS_PHYSICALITY_NONCONTIGUOUS |
                    RM_NVOS02_FLAGS_LOCATION_PCI |
                    RM_NVOS02_FLAGS_COHERENCY_WRITE_COMBINE |
-                   RM_NVOS02_FLAGS_GPU_CACHEABLE_YES |
                    RM_NVOS02_FLAGS_MAPPING_NO_MAP;
     buf->memory = g.next_rm_handle++;
     buf->size = mapped_size;
@@ -2275,33 +2750,61 @@ static size_t launch_code_stage_limit(void)
     return (size_t)limit;
 }
 
+static size_t rm_patch_blackwell_global_descriptors(void *code, size_t code_bytes)
+{
+    static const rm_u32 global_opcodes[] = {
+        0x981u, 0x982u, 0x985u, 0x986u, 0x98eu, 0x9a6u, 0x9a3u, 0x9a8u,
+        0x3a8u, 0x3a9u,
+    };
+    uint8_t *bytes = (uint8_t *)code;
+    size_t patched = 0;
+    for (size_t offset = 0; offset + 16U <= code_bytes; offset += 16U) {
+        rm_u32 opcode = rd16le(bytes + offset) & 0xfffu;
+        bool is_global = false;
+        for (size_t i = 0; i < sizeof(global_opcodes) / sizeof(global_opcodes[0]); i++) {
+            if (opcode == global_opcodes[i]) {
+                is_global = true;
+                break;
+            }
+        }
+        if (is_global && (bytes[offset + 9U] & 0x10u) != 0) {
+            bytes[offset + 9U] &= (uint8_t)~0x10u;
+            patched++;
+        }
+    }
+    return patched;
+}
+
 static int rm_stage_module_code_locked(CUfunction f)
 {
     if (!valid_function(f) || !valid_module(f->module)) {
         return -1;
     }
     CUmodule module = f->module;
-    if (module->image_hash == 0 && module->image != NULL && module->image_size != 0) {
-        module->image_hash = fnv1a64_bytes(module->image, module->image_size);
-    } else if (module->image_hash == 0) {
-        module->image_hash = fnv1a64_str(module->name);
+    if (f->image_hash == 0 && f->image != NULL && f->image_size != 0) {
+        f->image_hash = fnv1a64_bytes(f->image, f->image_size);
+    } else if (f->image_hash == 0) {
+        f->image_hash = fnv1a64_str(f->name);
     }
 
     rm_u32 layout = LANXIN_CODE_STAGE_WHOLE_IMAGE;
-    const unsigned char *copy_src = module->image != NULL ?
-                                    (const unsigned char *)module->image : NULL;
-    size_t copy_bytes = module->image != NULL ? module->image_size : 0;
+    const unsigned char *copy_src = f->image != NULL ?
+                                    (const unsigned char *)f->image : NULL;
+    size_t copy_bytes = f->image != NULL ? f->image_size : 0;
     rm_u64 text_file_offset = 0;
     rm_u64 text_size = 0;
-    if (env_enabled("LANXIN_NVIDIA_CUDA_CODE_STAGE_TEXT") &&
-        f->metadata.valid && module->image != NULL &&
+    bool stage_text = env_enabled("LANXIN_NVIDIA_CUDA_CODE_STAGE_TEXT") ||
+                      (g.rm_compute_class >= RM_BLACKWELL_COMPUTE_A &&
+                       !env_disabled("LANXIN_NVIDIA_CUDA_CODE_STAGE_TEXT"));
+    if (stage_text &&
+        f->metadata.valid && f->image != NULL &&
         range_in_image(f->metadata.text_file_offset, f->metadata.text_size,
-                       module->image_size) &&
+                       f->image_size) &&
         f->metadata.text_size != 0) {
         layout = LANXIN_CODE_STAGE_TEXT_ONLY;
         text_file_offset = f->metadata.text_file_offset;
         text_size = f->metadata.text_size;
-        copy_src = (const unsigned char *)module->image + f->metadata.text_file_offset;
+        copy_src = (const unsigned char *)f->image + f->metadata.text_file_offset;
         copy_bytes = f->metadata.text_size > (rm_u64)SIZE_MAX ?
                      SIZE_MAX : (size_t)f->metadata.text_size;
     }
@@ -2312,26 +2815,65 @@ static int rm_stage_module_code_locked(CUfunction f)
     if (copy_bytes == 0) {
         copy_bytes = 64;
     }
-    if (rm_stage_alloc_locked(&module->code, copy_bytes, "rm_stage_code_object") != 0) {
+    size_t code_guard_bytes = 0;
+    if (g.rm_compute_class >= RM_BLACKWELL_COMPUTE_A) {
+        size_t guard_pages = (size_t)env_ull("LANXIN_NVIDIA_CUDA_CODE_GUARD_PAGES", 1);
+        size_t page_bytes = page_align_size(1);
+        if (guard_pages <= SIZE_MAX / page_bytes) {
+            code_guard_bytes = guard_pages * page_bytes;
+        }
+    }
+    size_t code_alloc_bytes = page_align_size(copy_bytes);
+    if (code_guard_bytes <= SIZE_MAX - code_alloc_bytes) {
+        code_alloc_bytes += code_guard_bytes;
+    } else {
+        code_guard_bytes = 0;
+    }
+    if (f->code.memory != 0 && f->code.cpu != NULL &&
+        f->code.gpu_va != 0 && f->code.size >= code_alloc_bytes &&
+        f->staged_code_bytes == copy_bytes &&
+        f->staged_code_layout == layout &&
+        f->staged_text_file_offset == text_file_offset &&
+        f->staged_text_size == text_size) {
+        tracef("RM reused staged code object module=%s fn=%s gpu_va=0x%llx bytes=%zu",
+               module->name != NULL ? module->name : "<module>",
+               f->name != NULL ? f->name : "<unnamed>",
+               (unsigned long long)f->code.gpu_va, copy_bytes);
+        return 0;
+    }
+    if (rm_stage_alloc_locked(&f->code, code_alloc_bytes, "rm_stage_code_object") != 0) {
         return -1;
     }
+    memset(f->code.cpu, 0, f->code.size);
     if (copy_src != NULL && copy_bytes != 0) {
-        memcpy(module->code.cpu, copy_src, copy_bytes);
+        memcpy(f->code.cpu, copy_src, copy_bytes);
     } else {
-        snprintf((char *)module->code.cpu, module->code.size, "lanxin fake cuda code object: %s",
+        snprintf((char *)f->code.cpu, f->code.size, "lanxin fake cuda code object: %s",
                  module->name != NULL ? module->name : "<module>");
     }
-    module->staged_code_bytes = copy_bytes;
-    module->staged_code_layout = layout;
-    module->staged_text_file_offset = text_file_offset;
-    module->staged_text_size = text_size;
-    module->staged_function_name_hash = f->name_hash;
+    size_t direct_global_patches = 0;
+    bool preserve_native_descriptors =
+        f->name != NULL && strstr(f->name, "op_repeat") != NULL &&
+        env_enabled("LANXIN_NVIDIA_CUDA_REPEAT_NATIVE_DESCRIPTORS");
+    if (layout == LANXIN_CODE_STAGE_TEXT_ONLY &&
+        g.rm_compute_class >= RM_BLACKWELL_COMPUTE_A &&
+        !preserve_native_descriptors &&
+        !env_disabled("LANXIN_NVIDIA_CUDA_DIRECT_GLOBAL")) {
+        direct_global_patches = rm_patch_blackwell_global_descriptors(f->code.cpu,
+                                                                       copy_bytes);
+    }
+    f->staged_code_bytes = copy_bytes;
+    f->staged_code_layout = layout;
+    f->staged_text_file_offset = text_file_offset;
+    f->staged_text_size = text_size;
     __sync_synchronize();
-    tracef("RM staged code object module=%s image_bytes=%zu staged=%zu layout=%s text_off=0x%llx text_size=%llu hash=0x%016llx gpu_va=0x%llx",
-           module->name != NULL ? module->name : "<module>", module->image_size, module->staged_code_bytes,
+    tracef("RM staged code object module=%s image_bytes=%zu staged=%zu mapped=%zu guard=%zu layout=%s text_off=0x%llx text_size=%llu hash=0x%016llx gpu_va=0x%llx direct_global=%zu",
+           module->name != NULL ? module->name : "<module>", f->image_size, f->staged_code_bytes,
+           f->code.size, code_guard_bytes,
            layout == LANXIN_CODE_STAGE_TEXT_ONLY ? "text" : "whole",
            (unsigned long long)text_file_offset, (unsigned long long)text_size,
-           (unsigned long long)module->image_hash, (unsigned long long)module->code.gpu_va);
+           (unsigned long long)f->image_hash, (unsigned long long)f->code.gpu_va,
+           direct_global_patches);
     return 0;
 }
 
@@ -2339,9 +2881,8 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
                                          struct launch_staging *launch,
                                          struct lanxin_launch_completion *completion)
 {
-    rm_u32 *qmd = (rm_u32 *)launch->qmd.cpu;
-    struct lanxin_qmd_staging_desc *meta =
-        (struct lanxin_qmd_staging_desc *)((uint8_t *)launch->qmd.cpu + LANXIN_HW_QMD_BYTES);
+    rm_u32 *qmd = (rm_u32 *)rm_launch_qmd_cpu(launch);
+    struct lanxin_qmd_staging_desc *meta = rm_launch_qmd_meta(launch);
     memset(qmd, 0, LANXIN_HW_QMD_BYTES);
     memset(meta, 0, sizeof(*meta));
 
@@ -2358,10 +2899,10 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
 
     rm_u64 params_va = launch->params.gpu_va;
     rm_u64 qmd_release_va = rm_completion_qmd_va(launch);
+    bool qmd_release = rm_qmd_release_enabled();
     bool code_text_only = f->metadata.valid &&
-                          f->module->staged_code_layout == LANXIN_CODE_STAGE_TEXT_ONLY &&
-                          f->module->staged_function_name_hash == f->name_hash &&
-                          f->module->staged_text_file_offset == f->metadata.text_file_offset;
+                          f->staged_code_layout == LANXIN_CODE_STAGE_TEXT_ONLY &&
+                          f->staged_text_file_offset == f->metadata.text_file_offset;
     rm_u32 parsed_program_offset = f->metadata.valid ? f->metadata.qmd_program_offset : 0;
     if (code_text_only) {
         parsed_program_offset = 0;
@@ -2370,57 +2911,144 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
                               f->metadata.reg_count : 32;
     rm_u32 parsed_sass_version = f->metadata.valid ? f->metadata.sm_version : 0;
     rm_u32 parsed_static_smem = f->metadata.valid ? f->metadata.static_shared_mem_bytes : 0;
-    rm_u32 parsed_local_mem = f->metadata.valid ? f->metadata.local_mem_bytes : 0;
     rm_u32 shared_total = req->shared_mem_bytes + parsed_static_smem;
     if (shared_total < req->shared_mem_bytes) {
         shared_total = UINT32_MAX;
     }
-    rm_u32 qmd_version = env_u32("LANXIN_NVIDIA_CUDA_QMD_VERSION", LANXIN_QMD_MINOR_VERSION);
-    rm_u32 qmd_major = env_u32("LANXIN_NVIDIA_CUDA_QMD_MAJOR_VERSION", LANXIN_QMD_MAJOR_VERSION);
+    bool qmd5 = g.rm_compute_class >= RM_BLACKWELL_COMPUTE_A;
+    rm_u32 qmd_version = env_u32("LANXIN_NVIDIA_CUDA_QMD_VERSION", qmd5 ? 0u : 6u);
+    rm_u32 qmd_major = env_u32("LANXIN_NVIDIA_CUDA_QMD_MAJOR_VERSION", qmd5 ? 5u : 1u);
     rm_u32 program_offset = env_u32("LANXIN_NVIDIA_CUDA_QMD_PROGRAM_OFFSET",
                                     parsed_program_offset);
     rm_u32 reg_count = env_u32("LANXIN_NVIDIA_CUDA_QMD_REGISTER_COUNT", parsed_reg_count);
+    rm_u32 barrier_count = env_u32("LANXIN_NVIDIA_CUDA_QMD_BARRIER_COUNT",
+                                   shared_total != 0 ? 1u : 0u);
     rm_u32 sass_version = env_u32("LANXIN_NVIDIA_CUDA_QMD_SASS_VERSION", parsed_sass_version);
-    rm_u32 local_mem = env_u32("LANXIN_NVIDIA_CUDA_QMD_LOCAL_MEM_BYTES", parsed_local_mem);
+    rm_u32 local_mem = rm_effective_local_mem_bytes(f);
+    bool cga_shared = qmd5 && shared_total != 0 &&
+                      !env_disabled("LANXIN_NVIDIA_CUDA_QMD_CGA_SHARED");
 
-    rm_qmd_set_bits(qmd, 200, 200, 1);                      /* schedule-on-put-update */
-    rm_qmd_set_bits(qmd, 202, 202, 1);                      /* release0 enabled */
-    rm_qmd_set_bits(qmd, 204, 204,
-                    env_disabled("LANXIN_NVIDIA_CUDA_QMD_REQUIRE_PCAS") ? 0 : 1);
-    rm_qmd_set_bits(qmd, 250, 255, 0x3f);                   /* invalidate shader/texture caches */
-    rm_qmd_set_bits(qmd, 256, 287, program_offset);         /* program offset from SET_PROGRAM_REGION */
-    rm_qmd_set_bits(qmd, 366, 366, 1);                      /* FE sysmembar on release */
-    rm_qmd_set_bits(qmd, 368, 369, 1);                      /* CWD sysmembar */
-    rm_qmd_set_bits(qmd, 378, 378, 1);                      /* no API call-limit check */
-    rm_qmd_set_bits(qmd, 384, 415, grid_x);
-    rm_qmd_set_bits(qmd, 416, 431, grid_y);
-    rm_qmd_set_bits(qmd, 432, 447, grid_z);
-    rm_qmd_set_bits(qmd, 448, 479, 0);
-    rm_qmd_set_bits(qmd, 480, 495, 0);
-    rm_qmd_set_bits(qmd, 496, 511, 0);
-    rm_qmd_set_bits(qmd, 544, 561, rm_qmd_shared_mem_units(shared_total));
-    rm_qmd_set_bits(qmd, 576, 579, qmd_version & 0xfu);
-    rm_qmd_set_bits(qmd, 580, 583, qmd_major & 0xfu);
-    rm_qmd_set_bits(qmd, 592, 607, block_x);
-    rm_qmd_set_bits(qmd, 608, 623, block_y);
-    rm_qmd_set_bits(qmd, 624, 639, block_z);
-    if (params_va != 0 && launch->params.size != 0) {
-        rm_qmd_set_bits(qmd, 640, 640, 1);                  /* constant buffer 0 valid */
-        rm_qmd_set_bits(qmd, 928, 959, (rm_u32)(params_va & 0xffffffffu));
-        rm_qmd_set_bits(qmd, 960, 967, (rm_u32)((params_va >> 32) & 0xffu));
-        rm_qmd_set_bits(qmd, 974, 974, 1);
-        rm_qmd_set_bits(qmd, 975, 991, (rm_u32)launch->params.size);
+    if (qmd5) {
+        rm_u64 program_va = f->code.gpu_va + program_offset;
+        rm_u64 program_shifted4 = program_va >> 4;
+        rm_u64 params_shifted6 = params_va >> 6;
+        rm_u64 cbuf_bytes = req->params_size;
+        if (f->metadata.valid) {
+            rm_u64 params_end = (rm_u64)f->metadata.param_cbank_offset + req->params_size;
+            if (params_end > cbuf_bytes) {
+                cbuf_bytes = params_end;
+            }
+            if (f->metadata.const0_size > cbuf_bytes) {
+                cbuf_bytes = f->metadata.const0_size;
+            }
+        }
+        if (cbuf_bytes > 0x1fff0ULL) {
+            cbuf_bytes = 0x1fff0ULL;
+        }
+        rm_u32 params_size = (rm_u32)((cbuf_bytes + 15ULL) & ~15ULL);
+        rm_u32 shared_aligned = (shared_total + 255u) & ~255u;
+        rm_u64 threads = (rm_u64)block_x * block_y * block_z;
+        rm_u32 warps = (rm_u32)((threads + 31ULL) / 32ULL);
+        rm_u32 resident_workgroups = warps == 0 ? 1u : 48u / warps;
+        if (resident_workgroups == 0) {
+            resident_workgroups = 1;
+        }
+        if (shared_aligned != 0) {
+            rm_u32 smem_limited = (100u * 1024u) / shared_aligned;
+            if (smem_limited == 0) {
+                smem_limited = 1;
+            }
+            if (resident_workgroups > smem_limited) {
+                resident_workgroups = smem_limited;
+            }
+        }
+
+        rm_qmd_set_bits(qmd, 144, 149, 0x1fu);              /* QMD group ID */
+        rm_qmd_set_bits(qmd, 151, 153, cga_shared ? 0x3u : 0x2u);
+        rm_qmd_set_bits(qmd, 624, 625, 1);                  /* CWD L1 sysmembar */
+        if (qmd_release) {
+            rm_qmd_set_bits(qmd, 288, 288, 1);              /* release semaphore 0 */
+            rm_qmd_set_bits(qmd, 289, 290, 1);              /* one-word semaphore */
+            rm_qmd_set_bits(qmd, 291, 291, 1);              /* FE sysmembar */
+            rm_qmd_set_bits(qmd, 480, 511, (rm_u32)qmd_release_va);
+            rm_qmd_set_bits(qmd, 512, 536, (qmd_release_va >> 32) & 0x1ffffffu);
+            rm_qmd_set_bits(qmd, 544, 575, qmd_payload);
+        }
+        if (env_enabled("LANXIN_NVIDIA_CUDA_QMD_PROGRAM_PRE_EXIT")) {
+            rm_qmd_set_bits(qmd, 638, 638, 1);              /* pre-exit at last CTA */
+            rm_qmd_set_bits(qmd, 639, 639, 1);              /* SASS PREEXIT enabled */
+        }
+        rm_qmd_set_bits(qmd, 456, 456, 1);                  /* no API call-limit check */
+        rm_qmd_set_bits(qmd, 464, 467, qmd_version & 0xfu);
+        rm_qmd_set_bits(qmd, 468, 471, qmd_major & 0xfu);
+        rm_qmd_set_bits(qmd, 1024, 1055, (rm_u32)program_shifted4);
+        rm_qmd_set_bits(qmd, 1056, 1076, (program_shifted4 >> 32) & 0x1fffffu);
+        rm_qmd_set_bits(qmd, 1088, 1103, block_x);
+        rm_qmd_set_bits(qmd, 1104, 1119, block_y);
+        rm_qmd_set_bits(qmd, 1120, 1127, block_z);
+        rm_qmd_set_bits(qmd, 1128, 1136, reg_count & 0x1ffu);
+        rm_qmd_set_bits(qmd, 1137, 1141, barrier_count & 0x1fu);
+        rm_qmd_set_bits(qmd, 1152, 1162, shared_aligned >> 7);
+        rm_qmd_set_bits(qmd, 1163, 1168, rm_qmd5_smem_config(shared_aligned, 1));
+        rm_qmd_set_bits(qmd, 1169, 1174, rm_qmd5_smem_config(100u * 1024u, 1));
+        rm_qmd_set_bits(qmd, 1175, 1180,
+                        rm_qmd5_smem_config(shared_aligned, resident_workgroups));
+        if (barrier_count != 0) {
+            rm_qmd_set_bits(qmd, 1181, 1181, 1);
+        }
+        rm_qmd_set_bits(qmd, 1184, 1199, ((local_mem + 15u) & ~15u) >> 4);
+        rm_qmd_set_bits(qmd, 1248, 1279, grid_x);
+        rm_qmd_set_bits(qmd, 1280, 1295, grid_y);
+        rm_qmd_set_bits(qmd, 1312, 1327, grid_z);
+        if (cga_shared) {
+            rm_qmd_set_bits(qmd, 2048, 2053, 1);            /* GPC CGA width */
+            rm_qmd_set_bits(qmd, 2056, 2061, 1);            /* GPC CGA height */
+            rm_qmd_set_bits(qmd, 2064, 2069, 1);            /* GPC CGA depth */
+        }
+        if (params_va != 0 && params_size != 0) {
+            rm_qmd_set_bits(qmd, 1344, 1375, (rm_u32)params_shifted6);
+            rm_qmd_set_bits(qmd, 1376, 1394, (params_shifted6 >> 32) & 0x7ffffu);
+            rm_qmd_set_bits(qmd, 1395, 1407, (params_size >> 4) & 0x1fffu);
+            rm_qmd_set_bits(qmd, 1856, 1856, 1);
+        }
+    } else {
+        rm_qmd_set_bits(qmd, 200, 200, 1);                  /* schedule-on-put-update */
+        rm_qmd_set_bits(qmd, 202, 202, 1);                  /* release0 enabled */
+        rm_qmd_set_bits(qmd, 204, 204,
+                        env_disabled("LANXIN_NVIDIA_CUDA_QMD_REQUIRE_PCAS") ? 0 : 1);
+        rm_qmd_set_bits(qmd, 250, 255, 0x3f);               /* invalidate shader/texture caches */
+        rm_qmd_set_bits(qmd, 256, 287, program_offset);     /* program offset from SET_PROGRAM_REGION */
+        rm_qmd_set_bits(qmd, 366, 366, 1);                  /* FE sysmembar on release */
+        rm_qmd_set_bits(qmd, 368, 369, 1);                  /* CWD sysmembar */
+        rm_qmd_set_bits(qmd, 378, 378, 1);                  /* no API call-limit check */
+        rm_qmd_set_bits(qmd, 384, 415, grid_x);
+        rm_qmd_set_bits(qmd, 416, 431, grid_y);
+        rm_qmd_set_bits(qmd, 432, 447, grid_z);
+        rm_qmd_set_bits(qmd, 544, 561, rm_qmd_shared_mem_units(shared_total));
+        rm_qmd_set_bits(qmd, 576, 579, qmd_version & 0xfu);
+        rm_qmd_set_bits(qmd, 580, 583, qmd_major & 0xfu);
+        rm_qmd_set_bits(qmd, 592, 607, block_x);
+        rm_qmd_set_bits(qmd, 608, 623, block_y);
+        rm_qmd_set_bits(qmd, 624, 639, block_z);
+        if (params_va != 0 && launch->params.size != 0) {
+            rm_qmd_set_bits(qmd, 640, 640, 1);              /* constant buffer 0 valid */
+            rm_qmd_set_bits(qmd, 928, 959, (rm_u32)params_va);
+            rm_qmd_set_bits(qmd, 960, 967, (params_va >> 32) & 0xffu);
+            rm_qmd_set_bits(qmd, 974, 974, 1);
+            rm_qmd_set_bits(qmd, 975, 991, (rm_u32)launch->params.size);
+        }
+        if (qmd_release) {
+            rm_qmd_set_bits(qmd, 736, 767, (rm_u32)qmd_release_va);
+            rm_qmd_set_bits(qmd, 768, 775, (qmd_release_va >> 32) & 0xffu);
+            rm_qmd_set_bits(qmd, 799, 799, 1);              /* one-word release */
+            rm_qmd_set_bits(qmd, 800, 831, qmd_payload);
+        }
+        rm_qmd_set_bits(qmd, 1440, 1463, local_mem & 0xffffffu);
+        rm_qmd_set_bits(qmd, 1496, 1503, reg_count);
+        rm_qmd_set_bits(qmd, 1528, 1535, sass_version);
     }
-    rm_qmd_set_bits(qmd, 736, 767, (rm_u32)(qmd_release_va & 0xffffffffu));
-    rm_qmd_set_bits(qmd, 768, 775, (rm_u32)((qmd_release_va >> 32) & 0xffu));
-    rm_qmd_set_bits(qmd, 794, 794, 0);                      /* no release reduction */
-    rm_qmd_set_bits(qmd, 799, 799, 1);                      /* one-word release */
-    rm_qmd_set_bits(qmd, 800, 831, qmd_payload);
-    rm_qmd_set_bits(qmd, 1440, 1463, local_mem & 0xffffffu);
-    rm_qmd_set_bits(qmd, 1496, 1503, reg_count);
-    rm_qmd_set_bits(qmd, 1528, 1535, sass_version);
 
-    completion->expected_qmd_done = qmd_payload;
+    completion->expected_qmd_done = qmd_release ? qmd_payload : 0;
 
     meta->magic = LANXIN_QMD_STAGING_MAGIC;
     meta->version = LANXIN_QMD_STAGING_VERSION;
@@ -2433,14 +3061,14 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
     meta->block[1] = block_y;
     meta->block[2] = block_z;
     meta->shared_mem_bytes = shared_total;
-    meta->code_va = f->module->code.gpu_va;
-    meta->code_bytes = f->module->staged_code_bytes;
-    meta->qmd_va = launch->qmd.gpu_va;
+    meta->code_va = f->code.gpu_va;
+    meta->code_bytes = f->staged_code_bytes;
+    meta->qmd_va = rm_launch_qmd_va(launch);
     meta->params_va = params_va;
     meta->params_bytes = req->params_size;
     meta->completion_va = launch->completion.gpu_va;
-    meta->module_image_bytes = f->module->image_size;
-    meta->module_image_hash = f->module->image_hash;
+    meta->module_image_bytes = f->image_size;
+    meta->module_image_hash = f->image_hash;
     meta->function_name_hash = f->name_hash != 0 ? f->name_hash : fnv1a64_str(f->name);
     meta->compute_class = g.rm_compute_class;
     meta->class_engine_id = g.rm_compute_class_engine_id;
@@ -2460,28 +3088,143 @@ static void rm_build_hardware_qmd_locked(CUfunction f, const struct launch_reque
     meta->sm_version = sass_version;
 }
 
-static int rm_prepare_launch_packet_locked(CUfunction f, const struct launch_request *req)
+static int rm_prepare_launch_packet_locked(CUfunction f, const struct launch_request *req,
+                                           struct launch_staging *launch)
 {
-    if (!valid_function(f) || req == NULL || rm_stage_module_code_locked(f) != 0) {
+    if (!valid_function(f) || req == NULL || launch == NULL ||
+        rm_stage_module_code_locked(f) != 0) {
         return -1;
     }
-    struct launch_staging *launch = &f->launch;
     size_t pushbuffer_bytes = page_align_size(4096);
-    size_t qmd_bytes = page_align_size(LANXIN_HW_QMD_BYTES + sizeof(struct lanxin_qmd_staging_desc));
-    size_t params_bytes = req->params_size != 0 ? req->params_size : 64;
+    size_t qmd_bytes = page_align_size(LANXIN_QMD_RING_BYTES +
+                                       sizeof(struct lanxin_qmd_staging_desc));
+    size_t params_offset = f->metadata.valid ? f->metadata.param_cbank_offset : 0;
+    size_t params_bytes = req->params_size != 0 ? params_offset + req->params_size : 64;
+    if (f->metadata.valid && f->metadata.const0_size > params_bytes &&
+        f->metadata.const0_size <= SIZE_MAX) {
+        params_bytes = (size_t)f->metadata.const0_size;
+    }
     size_t completion_bytes = page_align_size(sizeof(struct lanxin_launch_completion));
-    if (rm_stage_alloc_locked(&launch->pushbuffer, pushbuffer_bytes, "rm_stage_pushbuffer") != 0 ||
+    bool needs_fallback_pushbuffer =
+        g.rm_gpfifo_cpu == NULL ||
+        g.rm_gpfifo_size < 0x1000u + 32u * 0x400u;
+    if ((needs_fallback_pushbuffer &&
+         rm_stage_alloc_locked(&launch->pushbuffer, pushbuffer_bytes,
+                               "rm_stage_pushbuffer") != 0) ||
         rm_stage_alloc_locked(&launch->qmd, qmd_bytes, "rm_stage_qmd") != 0 ||
         rm_stage_alloc_locked(&launch->params, params_bytes, "rm_stage_params") != 0 ||
         rm_stage_alloc_locked(&launch->completion, completion_bytes, "rm_stage_completion") != 0) {
         return -1;
     }
+    size_t params_clear_bytes = (params_bytes + 15u) & ~15u;
+    if (params_clear_bytes > launch->params.size) {
+        params_clear_bytes = launch->params.size;
+    }
+    memset(launch->params.cpu, 0, params_clear_bytes);
 
+    if (f->metadata.valid && f->metadata.const0_size != 0 &&
+        f->metadata.const0_size <= launch->params.size &&
+        range_in_image(f->metadata.const0_file_offset, f->metadata.const0_size,
+                       f->image_size)) {
+        memcpy(launch->params.cpu,
+               (const uint8_t *)f->image + f->metadata.const0_file_offset,
+               (size_t)f->metadata.const0_size);
+    }
+    if (g.rm_compute_class >= RM_BLACKWELL_COMPUTE_A &&
+        launch->params.size >= LANXIN_SM120_CBANK_STACK_SIZE + sizeof(rm_u32)) {
+        static const size_t offsets[6] = {
+            LANXIN_SM120_CBANK_NTID_X,
+            LANXIN_SM120_CBANK_NTID_Y,
+            LANXIN_SM120_CBANK_NTID_Z,
+            LANXIN_SM120_CBANK_NCTAID_X,
+            LANXIN_SM120_CBANK_NCTAID_Y,
+            LANXIN_SM120_CBANK_NCTAID_Z,
+        };
+        const rm_u32 values[6] = {
+            req->block[0], req->block[1], req->block[2],
+            req->grid[0], req->grid[1], req->grid[2],
+        };
+        for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+            memcpy((uint8_t *)launch->params.cpu + offsets[i], &values[i], sizeof(values[i]));
+        }
+        rm_u32 stack_size = rm_effective_local_stack_bytes(f);
+        rm_u64 local_window = env_ull("LANXIN_NVIDIA_CUDA_SHADER_LOCAL_MEMORY_WINDOW_BASE",
+                                      0xffULL << 24);
+        rm_u64 local_cbank_base = stack_size != 0 ?
+            env_ull("LANXIN_NVIDIA_CUDA_SHADER_LOCAL_MEMORY_CBANK_BASE", local_window) :
+            local_window;
+        memcpy((uint8_t *)launch->params.cpu + LANXIN_SM120_CBANK_LOCAL_BASE,
+               &local_cbank_base, sizeof(local_cbank_base));
+        memcpy((uint8_t *)launch->params.cpu + LANXIN_SM120_CBANK_STACK_SIZE,
+               &stack_size, sizeof(stack_size));
+        tracef("RM staged SM120 launch builtins ntid=%ux%ux%u nctaid=%ux%ux%u stack=%u local_cbank=0x%llx local_window=0x%llx",
+               req->block[0], req->block[1], req->block[2],
+               req->grid[0], req->grid[1], req->grid[2], stack_size,
+               (unsigned long long)local_cbank_base,
+               (unsigned long long)local_window);
+    }
     if (req->params != NULL && req->params_size != 0) {
-        memcpy(launch->params.cpu, req->params, req->params_size);
+        if (params_offset > launch->params.size ||
+            req->params_size > launch->params.size - params_offset) {
+            tracef("RM parameter cbank overflow offset=%zu bytes=%zu staged=%zu",
+                   params_offset, req->params_size, launch->params.size);
+            return -1;
+        }
+        memcpy((uint8_t *)launch->params.cpu + params_offset, req->params, req->params_size);
+        rm_u64 first_arg = 0;
+        size_t first_arg_bytes = req->params_size < sizeof(first_arg) ?
+                                 req->params_size : sizeof(first_arg);
+        memcpy(&first_arg, (uint8_t *)launch->params.cpu + params_offset,
+               first_arg_bytes);
+        tracef("RM staged parameter cbank offset=0x%zx declared=%u/%u arg_bytes=%zu first=0x%llx",
+               params_offset, f->metadata.param_cbank_offset,
+               f->metadata.param_cbank_size, req->params_size,
+               (unsigned long long)first_arg);
+        if (env_enabled("LANXIN_NVIDIA_CUDA_TRACE") && f->metadata.valid) {
+            for (rm_u32 i = 0; i < f->metadata.param_count; i++) {
+                rm_u32 offset = f->metadata.params[i].offset;
+                rm_u32 size = f->metadata.params[i].size;
+                if (offset > req->params_size || size > req->params_size - offset) {
+                    continue;
+                }
+                rm_u64 raw = 0;
+                size_t raw_bytes = size < sizeof(raw) ? size : sizeof(raw);
+                memcpy(&raw, (const uint8_t *)req->params + offset, raw_bytes);
+                rm_u64 raw_tail = 0;
+                if (size > sizeof(raw)) {
+                    size_t tail_bytes = size - sizeof(raw);
+                    if (tail_bytes > sizeof(raw_tail)) {
+                        tail_bytes = sizeof(raw_tail);
+                    }
+                    memcpy(&raw_tail, (const uint8_t *)req->params + offset + sizeof(raw),
+                           tail_bytes);
+                }
+                const char *mapping = "scalar/unmapped";
+                rm_u64 allocation_offset = 0;
+                for (struct allocation *a = g.allocs; a != NULL; a = a->next) {
+                    if (raw >= a->dptr && raw - a->dptr < a->size) {
+                        mapping = a->rm_backed ? "gpu-rm" : "gpu-host-fallback";
+                        allocation_offset = raw - a->dptr;
+                        break;
+                    }
+                    rm_u64 host_base = (rm_u64)(uintptr_t)a->host;
+                    if (raw >= host_base && raw - host_base < a->size) {
+                        mapping = a->rm_backed ? "cpu-alias-rm" : "cpu-host";
+                        allocation_offset = raw - host_base;
+                        break;
+                    }
+                }
+                tracef("RM launch param ordinal=%u offset=0x%x size=%u raw=0x%llx tail=0x%llx map=%s+0x%llx",
+                       f->metadata.params[i].ordinal, offset, size,
+                       (unsigned long long)raw, (unsigned long long)raw_tail, mapping,
+                       (unsigned long long)allocation_offset);
+            }
+        }
     }
 
     launch->launch_id = g.next_id++;
+    launch->qmd_offset = (size_t)(launch->launch_id % LANXIN_QMD_RING_SLOTS) *
+                         LANXIN_QMD_SLOT_BYTES;
     struct lanxin_launch_completion *completion = (struct lanxin_launch_completion *)launch->completion.cpu;
     memset(completion, 0, sizeof(*completion));
     completion->magic = LANXIN_COMPLETION_MAGIC;
@@ -2492,17 +3235,15 @@ static int rm_prepare_launch_packet_locked(CUfunction f, const struct launch_req
     if (completion->expected_host_progress == 0) {
         completion->expected_host_progress = 1;
     }
-
     rm_build_hardware_qmd_locked(f, req, launch, completion);
     __sync_synchronize();
 
-    struct lanxin_qmd_staging_desc *qmd_meta =
-        (struct lanxin_qmd_staging_desc *)((uint8_t *)launch->qmd.cpu + LANXIN_HW_QMD_BYTES);
+    struct lanxin_qmd_staging_desc *qmd_meta = rm_launch_qmd_meta(launch);
     tracef("RM staged hardware QMD launch_id=%llu fn=%s pb=0x%llx qmd=0x%llx code=0x%llx params=0x%llx/%zu completion=0x%llx host_sem=0x%llx qmd_sem=0x%llx grid=%ux%ux%u block=%ux%ux%u qmd_payload=0x%x meta=0x%x program_offset=0x%x regs=%u smem=%u local=%u sm=%u",
            launch->launch_id, f->name != NULL ? f->name : "<unnamed>",
            (unsigned long long)launch->pushbuffer.gpu_va,
-           (unsigned long long)launch->qmd.gpu_va,
-           (unsigned long long)f->module->code.gpu_va,
+           (unsigned long long)rm_launch_qmd_va(launch),
+           (unsigned long long)f->code.gpu_va,
            (unsigned long long)launch->params.gpu_va, req->params_size,
            (unsigned long long)launch->completion.gpu_va,
            (unsigned long long)rm_completion_host_va(launch),
@@ -2515,16 +3256,20 @@ static int rm_prepare_launch_packet_locked(CUfunction f, const struct launch_req
     return 0;
 }
 
-static int rm_poll_launch_completion_locked(CUfunction f, bool require_qmd_release)
+static int rm_poll_launch_completion_locked(struct launch_staging *launch,
+                                            bool require_qmd_release)
 {
-    if (!valid_function(f) || f->launch.completion.cpu == NULL) {
+    if (launch == NULL || launch->completion.cpu == NULL) {
         return -1;
     }
-    unsigned long long timeout_ms = env_ull("LANXIN_NVIDIA_CUDA_COMPLETION_TIMEOUT_MS", 10);
-    struct lanxin_launch_completion *completion = (struct lanxin_launch_completion *)f->launch.completion.cpu;
+    unsigned long long timeout_ms = env_ull("LANXIN_NVIDIA_CUDA_COMPLETION_TIMEOUT_MS", 5000);
+    unsigned long long spin_us = env_ull("LANXIN_NVIDIA_CUDA_COMPLETION_SPIN_US", 2000);
+    unsigned long long sleep_us = env_ull("LANXIN_NVIDIA_CUDA_COMPLETION_SLEEP_US", 50);
+    struct lanxin_launch_completion *completion =
+        (struct lanxin_launch_completion *)launch->completion.cpu;
     rm_u64 start = now_ns();
     while (completion->magic == LANXIN_COMPLETION_MAGIC &&
-           completion->launch_id == f->launch.launch_id &&
+           completion->launch_id == launch->launch_id &&
            completion->status == LANXIN_COMPLETION_PENDING) {
         __sync_synchronize();
         bool host_done = completion->host_progress == completion->expected_host_progress;
@@ -2537,37 +3282,118 @@ static int rm_poll_launch_completion_locked(CUfunction f, bool require_qmd_relea
         rm_u64 elapsed_ns = now_ns() - start;
         if (elapsed_ns >= timeout_ms * 1000000ULL) {
             completion->status = LANXIN_COMPLETION_TIMEOUT;
-            tracef("RM launch completion timeout launch_id=%llu status=%u put=%llu host=0x%llx/0x%llx qmd=0x%x/0x%x require_qmd=%d",
-                   f->launch.launch_id, completion->status,
+            tracef("RM launch completion timeout launch_id=%llu status=%u put=%llu host=0x%llx/0x%llx qmd=0x%x/0x%x require_qmd=%d selftest=0x%llx",
+                   launch->launch_id, completion->status,
                    (unsigned long long)completion->gpfifo_put,
                    (unsigned long long)completion->host_progress,
                    (unsigned long long)completion->expected_host_progress,
                    completion->qmd_done, completion->expected_qmd_done,
-                   require_qmd_release ? 1 : 0);
+                   require_qmd_release ? 1 : 0,
+                   (unsigned long long)completion->reserved[0]);
+            rm_trace_channel_state_locked("completion-timeout");
             return -1;
         }
-        usleep(1000);
+        if (elapsed_ns < spin_us * 1000ULL) {
+            __asm__ __volatile__("" ::: "memory");
+        } else if (sleep_us != 0) {
+            usleep((useconds_t)sleep_us);
+        } else {
+            sched_yield();
+        }
     }
-    tracef("RM launch completion observed launch_id=%llu status=%u put=%llu host=0x%llx/0x%llx qmd=0x%x/0x%x require_qmd=%d",
-           f->launch.launch_id, completion->status,
+    tracef("RM launch completion observed launch_id=%llu status=%u put=%llu host=0x%llx/0x%llx qmd=0x%x/0x%x require_qmd=%d selftest=0x%llx",
+           launch->launch_id, completion->status,
            (unsigned long long)completion->gpfifo_put,
            (unsigned long long)completion->host_progress,
            (unsigned long long)completion->expected_host_progress,
            completion->qmd_done, completion->expected_qmd_done,
-           require_qmd_release ? 1 : 0);
+           require_qmd_release ? 1 : 0,
+           (unsigned long long)completion->reserved[0]);
     return completion->status == LANXIN_COMPLETION_DONE ? 0 : -1;
 }
 
-static void rm_release_function_launch_locked(CUfunction f)
+static int rm_wait_launch_slot_locked(size_t slot)
 {
-    if (f == NULL) {
-        return;
+    if (slot >= LANXIN_LAUNCH_SLOTS || !g.rm_launch_pending[slot]) {
+        return 0;
     }
-    rm_stage_release_locked(&f->launch.pushbuffer);
-    rm_stage_release_locked(&f->launch.qmd);
-    rm_stage_release_locked(&f->launch.params);
-    rm_stage_release_locked(&f->launch.completion);
-    f->launch.launch_id = 0;
+    int rc = rm_poll_launch_completion_locked(&g.rm_launch[slot],
+                                              rm_qmd_release_enabled());
+    if (rc == 0) {
+        g.rm_launch_pending[slot] = false;
+    }
+    return rc;
+}
+
+static int rm_wait_all_launches_locked(void)
+{
+    for (size_t slot = 0; slot < LANXIN_LAUNCH_SLOTS; slot++) {
+        if (rm_wait_launch_slot_locked(slot) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void rm_release_launch_slots_locked(void)
+{
+    for (size_t slot = 0; slot < LANXIN_LAUNCH_SLOTS; slot++) {
+        rm_stage_release_locked(&g.rm_launch[slot].pushbuffer);
+        rm_stage_release_locked(&g.rm_launch[slot].qmd);
+        rm_stage_release_locked(&g.rm_launch[slot].params);
+        rm_stage_release_locked(&g.rm_launch[slot].completion);
+        g.rm_launch[slot].launch_id = 0;
+        g.rm_launch[slot].qmd_offset = 0;
+        g.rm_launch_pending[slot] = false;
+    }
+}
+
+static rm_u32 rm_userd_gp_get_locked(void)
+{
+    if (g.rm_userd_cpu == NULL) {
+        return g.rm_gpfifo_put;
+    }
+    rm_io_fence();
+    volatile rm_u32 *control = (volatile rm_u32 *)g.rm_userd_cpu;
+    return control[0x88 / 4] % 32U;
+}
+
+static int rm_wait_gpfifo_space_locked(rm_u32 next_put)
+{
+    if (rm_userd_gp_get_locked() != next_put) {
+        return 0;
+    }
+
+    /*
+     * The Blackwell UserD mapping exposed by the RISC-V RM keeps GPGet at
+     * zero even after the channel consumes entries.  Each submission uses
+     * two of the 32 GPFIFO entries, so drain the pending WFI completions at
+     * the wrap boundary instead of guessing that the ring advanced.
+     */
+    if (next_put == 0 && rm_wait_all_launches_locked() == 0) {
+        tracef("RM GPFIFO wrap drained pending launches put=%u", g.rm_gpfifo_put);
+        return 0;
+    }
+
+    rm_u64 start = now_ns();
+    unsigned long long timeout_ms =
+        env_ull("LANXIN_NVIDIA_CUDA_GPFIFO_TIMEOUT_MS", 5000);
+    unsigned long long sleep_us =
+        env_ull("LANXIN_NVIDIA_CUDA_GPFIFO_SLEEP_US", 25);
+    while (rm_userd_gp_get_locked() == next_put) {
+        if (now_ns() - start >= timeout_ms * 1000000ULL) {
+            tracef("RM GPFIFO space timeout get=%u put=%u next=%u",
+                   rm_userd_gp_get_locked(), g.rm_gpfifo_put, next_put);
+            rm_trace_channel_state_locked("gpfifo-full");
+            return -1;
+        }
+        if (sleep_us != 0) {
+            usleep((useconds_t)sleep_us);
+        } else {
+            sched_yield();
+        }
+    }
+    return 0;
 }
 
 static int rm_submit_noop_locked(void)
@@ -2599,16 +3425,59 @@ static rm_u32 env_u32(const char *name, rm_u32 fallback)
     return (rm_u32)value;
 }
 
+static rm_u32 rm_effective_local_mem_bytes(CUfunction f)
+{
+    rm_u32 parsed = valid_function(f) && f->metadata.valid ?
+                    f->metadata.local_mem_bytes : 0;
+    if (parsed == 0) {
+        return 0;
+    }
+    return env_u32("LANXIN_NVIDIA_CUDA_QMD_LOCAL_MEM_BYTES", parsed);
+}
+
+static rm_u32 rm_effective_local_stack_bytes(CUfunction f)
+{
+    rm_u32 local_bytes = rm_effective_local_mem_bytes(f);
+    if (local_bytes == 0) {
+        return 0;
+    }
+    return env_u32("LANXIN_NVIDIA_CUDA_CBANK_STACK_BYTES", local_bytes);
+}
+
+static rm_u32 rm_effective_slm_bytes_per_lane(CUfunction f)
+{
+    rm_u32 local_bytes = rm_effective_local_mem_bytes(f);
+    if (local_bytes == 0) {
+        return 0;
+    }
+    return env_u32("LANXIN_NVIDIA_CUDA_SLM_BYTES_PER_LANE", local_bytes);
+}
+
 static int rm_submit_compute_set_object_locked(CUfunction f, const struct launch_request *req, bool qmd_requested)
 {
     if (rm_compute_init_locked() != 0) {
         return -1;
     }
 
+    rm_u32 entry = g.rm_gpfifo_put % 32U;
+    if (entry & 1U) {
+        entry = (entry + 1U) % 32U;
+    }
+    rm_u32 progress_entry = (entry + 1U) % 32U;
+    rm_u32 next_put = (entry + 2U) % 32U;
+    size_t launch_slot = entry / 2U;
+    if (rm_wait_gpfifo_space_locked(next_put) != 0 ||
+        (qmd_requested && rm_wait_launch_slot_locked(launch_slot) != 0)) {
+        tracef("RM launch slot unavailable fn=%s slot=%zu entry=%u",
+               f->name != NULL ? f->name : "<unnamed>", launch_slot, entry);
+        return -1;
+    }
+    struct launch_staging *launch = &g.rm_launch[launch_slot];
+
     bool qmd_stage = !env_disabled("LANXIN_NVIDIA_CUDA_QMD_STAGE");
     bool qmd_ready = false;
     if (qmd_stage && valid_function(f) && req != NULL) {
-        if (rm_prepare_launch_packet_locked(f, req) == 0) {
+        if (rm_prepare_launch_packet_locked(f, req, launch) == 0) {
             qmd_ready = true;
         } else if (qmd_requested) {
             return -1;
@@ -2617,12 +3486,16 @@ static int rm_submit_compute_set_object_locked(CUfunction f, const struct launch
         }
     }
 
-    volatile rm_u32 *gp_words = (volatile rm_u32 *)g.rm_gpfifo_cpu;
-    rm_u32 entry = g.rm_gpfifo_put % 32U;
-    if (entry & 1U) {
-        entry = (entry + 1U) % 32U;
+    rm_u32 local_bytes = rm_effective_local_mem_bytes(f);
+    rm_u32 slm_bytes_per_lane = rm_effective_slm_bytes_per_lane(f);
+    bool needs_local_window = local_bytes != 0;
+    if (needs_local_window && rm_ensure_slm_locked(slm_bytes_per_lane) != 0) {
+        tracef("RM shader local-memory backing allocation failed bytes_per_lane=%u",
+               slm_bytes_per_lane);
+        return -1;
     }
-    rm_u32 progress_entry = (entry + 1U) % 32U;
+
+    volatile rm_u32 *gp_words = (volatile rm_u32 *)g.rm_gpfifo_cpu;
     rm_u32 pb_stride = 0x400u;
     rm_u32 pb_offset = 0x1000u + (entry * pb_stride);
     rm_u32 progress_offset = 0x1000u + (progress_entry * pb_stride);
@@ -2634,10 +3507,10 @@ static int rm_submit_compute_set_object_locked(CUfunction f, const struct launch
         pb_words = (volatile rm_u32 *)((volatile uint8_t *)g.rm_gpfifo_cpu + pb_offset);
         memset((void *)pb_words, 0, pb_stride);
         pb_va = g.rm_gpfifo_va + pb_offset;
-    } else if (qmd_ready && f->launch.pushbuffer.cpu != NULL && f->launch.pushbuffer.gpu_va != 0) {
-        pb_words = (volatile rm_u32 *)f->launch.pushbuffer.cpu;
-        memset((void *)pb_words, 0, f->launch.pushbuffer.size);
-        pb_va = f->launch.pushbuffer.gpu_va;
+    } else if (qmd_ready && launch->pushbuffer.cpu != NULL && launch->pushbuffer.gpu_va != 0) {
+        pb_words = (volatile rm_u32 *)launch->pushbuffer.cpu;
+        memset((void *)pb_words, 0, launch->pushbuffer.size);
+        pb_va = launch->pushbuffer.gpu_va;
     } else {
         pb_offset = 0x200u + (entry * 0x40u);
         pb_words = (volatile rm_u32 *)((volatile uint8_t *)g.rm_gpfifo_cpu + pb_offset);
@@ -2651,59 +3524,129 @@ static int rm_submit_compute_set_object_locked(CUfunction f, const struct launch
     rm_u32 pb_count = 0;
     rm_u32 progress_count = 0;
     struct lanxin_launch_completion *completion =
-        qmd_ready ? (struct lanxin_launch_completion *)f->launch.completion.cpu : NULL;
+        qmd_ready ? (struct lanxin_launch_completion *)launch->completion.cpu : NULL;
 
     pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE, RM_COMPUTE_SET_OBJECT,
                                                  1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
     pb_words[pb_count++] = g.rm_compute_class_engine_id;
 
+    bool needs_shared_window = req != NULL &&
+                               (req->shared_mem_bytes != 0 ||
+                                (valid_function(f) && f->metadata.static_shared_mem_bytes != 0));
+    if (needs_local_window && g.rm_slm.rm_backed && g.rm_slm.rm_gpu_va != 0) {
+        pb_words[pb_count++] = rm_push_method_header(
+            RM_NVA06F_SUBCHANNEL_COMPUTE, RM_COMPUTE_SET_SHADER_LOCAL_MEMORY_A,
+            2, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+        pb_words[pb_count++] = (rm_u32)((g.rm_slm.rm_gpu_va >> 32) & 0x1ffffffu);
+        pb_words[pb_count++] = (rm_u32)g.rm_slm.rm_gpu_va;
+
+        pb_words[pb_count++] = rm_push_method_header(
+            RM_NVA06F_SUBCHANNEL_COMPUTE,
+            RM_COMPUTE_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A,
+            3, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+        pb_words[pb_count++] = (rm_u32)((g.rm_slm_bytes_per_tpc >> 32) & 0xffu);
+        pb_words[pb_count++] = (rm_u32)g.rm_slm_bytes_per_tpc;
+        pb_words[pb_count++] = env_u32("LANXIN_NVIDIA_CUDA_SLM_MAX_SM_COUNT", 0xffu);
+        tracef("RM shader local-memory methods addr=0x%llx bytes=%zu per_tpc=%llu per_lane=%u",
+               (unsigned long long)g.rm_slm.rm_gpu_va, g.rm_slm.mapped_size,
+               (unsigned long long)g.rm_slm_bytes_per_tpc,
+               g.rm_slm_bytes_per_lane);
+    }
+    if (g.rm_compute_class >= RM_HOPPER_COMPUTE_A && needs_shared_window &&
+        !env_disabled("LANXIN_NVIDIA_CUDA_SHADER_SHARED_MEMORY_WINDOW")) {
+        rm_u64 shared_window = env_ull("LANXIN_NVIDIA_CUDA_SHADER_SHARED_MEMORY_WINDOW_BASE",
+                                       4ULL << 32);
+        pb_words[pb_count++] = rm_push_method_header(
+            RM_NVA06F_SUBCHANNEL_COMPUTE, RM_COMPUTE_SET_SHADER_SHARED_MEMORY_WINDOW_A,
+            2, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+        pb_words[pb_count++] = (rm_u32)((shared_window >> 32) & 0x1ffffu);
+        pb_words[pb_count++] = (rm_u32)shared_window;
+    }
+    if (g.rm_compute_class >= RM_HOPPER_COMPUTE_A && needs_local_window &&
+        !env_disabled("LANXIN_NVIDIA_CUDA_SHADER_LOCAL_MEMORY_WINDOW")) {
+        rm_u64 local_window = env_ull("LANXIN_NVIDIA_CUDA_SHADER_LOCAL_MEMORY_WINDOW_BASE",
+                                      0xffULL << 24);
+        pb_words[pb_count++] = rm_push_method_header(
+            RM_NVA06F_SUBCHANNEL_COMPUTE, RM_COMPUTE_SET_SHADER_LOCAL_MEMORY_WINDOW_A,
+            2, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+        pb_words[pb_count++] = (rm_u32)((local_window >> 32) & 0x1ffffu);
+        pb_words[pb_count++] = (rm_u32)local_window;
+    }
+
     if (qmd_requested && qmd_ready) {
-        rm_u64 qmd_va = f->launch.qmd.gpu_va;
-        rm_u64 code_va = f->module->code.gpu_va;
+        rm_u64 qmd_va = rm_launch_qmd_va(launch);
+        rm_u64 code_va = f->code.gpu_va;
+        bool minimal_qmd_pb = env_enabled("LANXIN_NVIDIA_CUDA_QMD_MINIMAL_PB") ||
+                              (g.rm_compute_class >= RM_BLACKWELL_COMPUTE_A &&
+                               !env_disabled("LANXIN_NVIDIA_CUDA_QMD_MINIMAL_PB"));
+        rm_u32 default_qmd_method_version = g.rm_compute_class >= RM_BLACKWELL_COMPUTE_A ?
+                                            LANXIN_QMD_VERSION_05_00 :
+                                            LANXIN_QMD_VERSION_01_06;
         rm_u32 qmd_version_method =
             env_u32("LANXIN_NVIDIA_CUDA_QMD_METHOD_VERSION",
-                    (LANXIN_QMD_VERSION_01_06 << 16) | LANXIN_QMD_VERSION_01_06);
+                    (default_qmd_method_version << 16) | default_qmd_method_version);
         rm_u32 cwd_slots = env_u32("LANXIN_NVIDIA_CUDA_QMD_CWD_SLOT_COUNT", 32);
-        rm_u32 pcas_b = env_u32("LANXIN_NVIDIA_CUDA_QMD_PCAS_B", 0);
         rm_u32 pcas_signal =
             env_u32("LANXIN_NVIDIA_CUDA_QMD_PCAS_SIGNAL",
-                    (1u << 0) | (1u << 1)); /* invalidate + schedule */
+                    RM_COMPUTE_PCAS_ACTION_INVALIDATE_COPY_SCHEDULE);
 
-        pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE,
-                                                     RM_COMPUTE_SET_PROGRAM_REGION_A,
-                                                     2, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
-        pb_words[pb_count++] = (rm_u32)((code_va >> 32) & 0x1ffffu);
-        pb_words[pb_count++] = (rm_u32)(code_va & 0xffffffffu);
+        if (g.rm_compute_class >= RM_BLACKWELL_COMPUTE_A &&
+            !env_disabled("LANXIN_NVIDIA_CUDA_SHADER_CACHE_INVALIDATE")) {
+            rm_u32 invalidate_mask = env_u32(
+                "LANXIN_NVIDIA_CUDA_SHADER_CACHE_INVALIDATE_MASK",
+                RM_COMPUTE_INVALIDATE_SHADER_CACHES_INSTRUCTION |
+                RM_COMPUTE_INVALIDATE_SHADER_CACHES_FLUSH_DATA |
+                RM_COMPUTE_INVALIDATE_SHADER_CACHES_DATA |
+                RM_COMPUTE_INVALIDATE_SHADER_CACHES_CONSTANT);
+            pb_words[pb_count++] = rm_push_method_header(
+                RM_NVA06F_SUBCHANNEL_COMPUTE,
+                RM_COMPUTE_INVALIDATE_SHADER_CACHES,
+                1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+            pb_words[pb_count++] = invalidate_mask;
+            tracef("RM invalidate shader caches mask=0x%08x", invalidate_mask);
+        }
 
-        pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE,
-                                                     RM_COMPUTE_SET_QMD_VERSION,
-                                                     1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
-        pb_words[pb_count++] = qmd_version_method;
-
-        if (env_enabled("LANXIN_NVIDIA_CUDA_CHECK_QMD_VERSION")) {
+        if (!minimal_qmd_pb) {
             pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE,
-                                                         RM_COMPUTE_CHECK_QMD_VERSION,
+                                                         RM_COMPUTE_SET_PROGRAM_REGION_A,
+                                                         2, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+            pb_words[pb_count++] = (rm_u32)((code_va >> 32) & 0x1ffffu);
+            pb_words[pb_count++] = (rm_u32)(code_va & 0xffffffffu);
+
+            pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE,
+                                                         RM_COMPUTE_SET_QMD_VERSION,
                                                          1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
             pb_words[pb_count++] = qmd_version_method;
+
+            if (env_enabled("LANXIN_NVIDIA_CUDA_CHECK_QMD_VERSION")) {
+                pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE,
+                                                             RM_COMPUTE_CHECK_QMD_VERSION,
+                                                             1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+                pb_words[pb_count++] = qmd_version_method;
+            }
+
+            pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE,
+                                                         RM_COMPUTE_SET_CWD_SLOT_COUNT,
+                                                         1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
+            pb_words[pb_count++] = cwd_slots & 0xffu;
         }
 
         pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE,
-                                                     RM_COMPUTE_SET_CWD_SLOT_COUNT,
+                                                     RM_COMPUTE_SEND_PCAS_A,
                                                      1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
-        pb_words[pb_count++] = cwd_slots & 0xffu;
+        pb_words[pb_count++] = (rm_u32)((qmd_va >> 8) & 0xffffffffu);
 
         pb_words[pb_count++] = rm_push_method_header(RM_NVA06F_SUBCHANNEL_COMPUTE,
-                                                     RM_COMPUTE_SEND_PCAS_A,
-                                                     3, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
-        pb_words[pb_count++] = (rm_u32)((qmd_va >> 8) & 0xffffffffu);
-        pb_words[pb_count++] = pcas_b;
+                                                     RM_COMPUTE_SEND_SIGNALING_PCAS2_B,
+                                                     1, RM_NVC46F_DMA_SEC_OP_INC_METHOD);
         pb_words[pb_count++] = pcas_signal;
         if (completion != NULL) {
             completion->qmd_submitted = 1;
         }
-        tracef("RM QMD PCAS submit qmd_va=0x%llx qmd_shifted8=0x%x code_region=0x%llx version=0x%08x pcas_b=0x%08x signal=0x%08x",
+        tracef("RM QMD PCAS2 submit qmd_va=0x%llx qmd_shifted8=0x%x code_region=0x%llx version=0x%08x signal=0x%08x minimal=%d",
                (unsigned long long)qmd_va, (rm_u32)((qmd_va >> 8) & 0xffffffffu),
-               (unsigned long long)code_va, qmd_version_method, pcas_b, pcas_signal);
+               (unsigned long long)code_va, qmd_version_method, pcas_signal,
+               minimal_qmd_pb ? 1 : 0);
     } else if (qmd_requested) {
         tracef("RM QMD submit requested but hardware QMD staging is not ready");
     }
@@ -2720,8 +3663,11 @@ static int rm_submit_compute_set_object_locked(CUfunction f, const struct launch
             tracef("RM progress tracker PB unavailable for completion");
             return -1;
         }
-        bool progress_wfi = env_enabled("LANXIN_NVIDIA_CUDA_PROGRESS_WFI");
-        rm_u64 host_sem_va = rm_completion_host_va(&f->launch);
+        bool progress_wfi = env_enabled("LANXIN_NVIDIA_CUDA_PROGRESS_WFI") ||
+                            (qmd_requested && !rm_qmd_release_enabled() &&
+                             g.rm_compute_class >= RM_BLACKWELL_COMPUTE_A &&
+                             !env_disabled("LANXIN_NVIDIA_CUDA_PROGRESS_WFI"));
+        rm_u64 host_sem_va = rm_completion_host_va(launch);
         rm_u32 host_payload = (rm_u32)completion->expected_host_progress;
         rm_u32 sem_execute = RM_CHANNEL_SEM_EXECUTE_RELEASE |
                              RM_CHANNEL_SEM_EXECUTE_PAYLOAD_SIZE_32BIT |
@@ -2751,11 +3697,14 @@ static int rm_submit_compute_set_object_locked(CUfunction f, const struct launch
     }
     __sync_synchronize();
     rm_u32 old_put = g.rm_gpfifo_put;
-    g.rm_gpfifo_put = (entry + 2U) % 32U;
+    g.rm_gpfifo_put = next_put;
     if (completion != NULL) {
         completion->gpfifo_put = g.rm_gpfifo_put;
     }
     rm_channel_kickoff_locked(old_put, g.rm_gpfifo_put);
+    if (qmd_requested && qmd_ready) {
+        g.rm_launch_pending[launch_slot] = true;
+    }
     tracef("RM submitted compute PB channel=0x%x compute=0x%x class=0x%x put=%u entry=%u/%u words=%u/%u pb=0x%llx progress=0x%llx token=0x%08x doorbell=0x%08x qmd_ready=%d qmd_requested=%d qmd_submitted=%d",
            g.rm_channel, g.rm_compute, g.rm_compute_class, g.rm_gpfifo_put,
            entry, progress_entry, pb_count, progress_count,
@@ -2766,14 +3715,20 @@ static int rm_submit_compute_set_object_locked(CUfunction f, const struct launch
     bool must_wait_completion = env_enabled("LANXIN_NVIDIA_CUDA_WAIT_COMPLETION") ||
                                 (qmd_requested && env_enabled("LANXIN_NVIDIA_CUDA_STRICT_LAUNCH"));
     if (qmd_ready && must_wait_completion) {
-        return rm_poll_launch_completion_locked(f, qmd_requested);
+        int wait_rc = rm_poll_launch_completion_locked(
+            launch, qmd_requested && rm_qmd_release_enabled());
+        if (wait_rc == 0) {
+            rm_trace_launch_pointer_data_locked(f, req);
+            g.rm_launch_pending[launch_slot] = false;
+        }
+        return wait_rc;
     }
     return 0;
 }
 
 static int rm_alloc_mapped_system_locked(size_t size, struct allocation *a)
 {
-    if (rm_init_locked() != 0 || !g.rm_ready) {
+    if (rm_init_locked() != 0 || !g.rm_ready || rm_channel_init_locked() != 0) {
         return -1;
     }
 
@@ -2782,7 +3737,6 @@ static int rm_alloc_mapped_system_locked(size_t size, struct allocation *a)
     rm_u32 flags = RM_NVOS02_FLAGS_PHYSICALITY_NONCONTIGUOUS |
                    RM_NVOS02_FLAGS_LOCATION_PCI |
                    RM_NVOS02_FLAGS_COHERENCY_WRITE_COMBINE |
-                   RM_NVOS02_FLAGS_GPU_CACHEABLE_YES |
                    RM_NVOS02_FLAGS_MAPPING_NO_MAP;
 
     rm_nvos02_with_fd_t alloc_api;
@@ -2830,8 +3784,23 @@ static int rm_alloc_mapped_system_locked(size_t size, struct allocation *a)
         return -1;
     }
 
-    memset(addr, 0, mapped_size);
-    a->dptr = (CUdeviceptr)(uintptr_t)addr;
+    rm_u64 gpu_va = env_disabled("LANXIN_NVIDIA_CUDA_FIXED_DEVICE_VA") ?
+                    0 : rm_reserve_device_va_locked(mapped_size);
+    if (rm_map_dma_locked(g.rm_vaspace, hMemory, mapped_size,
+                          &gpu_va, "rm_map_device_allocation_dma") != 0) {
+        munmap(addr, mapped_size);
+        rm_nvos34_t unmap_api;
+        memset(&unmap_api, 0, sizeof(unmap_api));
+        unmap_api.hClient = g.rm_client;
+        unmap_api.hDevice = g.rm_device;
+        unmap_api.hMemory = hMemory;
+        unmap_api.pLinearAddress = map_api.params.pLinearAddress;
+        rm_ioctl_xfer(g.ctl_fd, RM_ESC_RM_UNMAP_MEMORY, &unmap_api, sizeof(unmap_api));
+        rm_free_object_locked(g.rm_client, g.rm_device, hMemory);
+        return -1;
+    }
+
+    a->dptr = (CUdeviceptr)gpu_va;
     a->host = addr;
     a->size = size;
     a->mapped_size = mapped_size;
@@ -2840,8 +3809,84 @@ static int rm_alloc_mapped_system_locked(size_t size, struct allocation *a)
     a->rm_backed = true;
     a->rm_memory = hMemory;
     a->rm_linear = map_api.params.pLinearAddress;
-    tracef("RM alloc+map system memory %zu/%zu -> handle=0x%x addr=%p linear=0x%llx",
-           size, mapped_size, hMemory, addr, (unsigned long long)a->rm_linear);
+    a->rm_gpu_va = gpu_va;
+    a->rm_cpu_parent = g.rm_device;
+    a->rm_map_fd = -1;
+    tracef("RM alloc+map system memory %zu/%zu -> handle=0x%x host=%p linear=0x%llx gpu_va=0x%llx",
+           size, mapped_size, hMemory, addr, (unsigned long long)a->rm_linear,
+           (unsigned long long)a->rm_gpu_va);
+    return 0;
+}
+
+static int rm_alloc_mapped_local_locked(size_t size, struct allocation *a)
+{
+    if (rm_init_locked() != 0 || !g.rm_ready || rm_channel_init_locked() != 0) {
+        return -1;
+    }
+
+    size_t mapped_size = page_align_size(size);
+    int map_fd = open("/dev/nvidia0", O_RDWR | O_CLOEXEC);
+    if (map_fd < 0) {
+        tracef("RM local memory map fd open failed errno=%d", errno);
+        return -1;
+    }
+
+    rm_handle hMemory = g.next_rm_handle++;
+    rm_memory_allocation_params_t params;
+    memset(&params, 0, sizeof(params));
+    params.owner = g.rm_client;
+    params.type = RM_NVOS32_TYPE_DMA;
+    params.flags = RM_NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE |
+                   RM_NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM;
+    params.attr = RM_NVOS32_ATTR_PAGE_SIZE_4KB;
+    params.size = mapped_size;
+    params.alignment = 4096;
+    if (rm_alloc_object_locked(g.rm_client, g.rm_device, &hMemory,
+                               RM_NV01_MEMORY_LOCAL_USER, &params, sizeof(params),
+                               "rm_alloc_device_vidmem") != 0) {
+        close(map_fd);
+        return -1;
+    }
+
+    rm_u64 gpu_va = env_disabled("LANXIN_NVIDIA_CUDA_FIXED_DEVICE_VA") ?
+                    0 : rm_reserve_device_va_locked(mapped_size);
+    if (rm_map_dma_locked(g.rm_vaspace, hMemory, mapped_size, &gpu_va,
+                          "rm_map_device_vidmem_dma") != 0) {
+        if (gpu_va != 0) {
+            rm_unmap_dma_locked(g.rm_vaspace, hMemory, gpu_va, mapped_size);
+        }
+        rm_free_object_locked(g.rm_client, g.rm_device, hMemory);
+        close(map_fd);
+        return -1;
+    }
+
+    rm_handle cpu_parent = g.rm_subdevice != 0 ? g.rm_subdevice : g.rm_device;
+    rm_p64 linear = 0;
+    void *host = NULL;
+    if (env_enabled("LANXIN_NVIDIA_CUDA_PERSISTENT_VRAM_MAP") &&
+        rm_map_cpu_with_parent_locked(map_fd, cpu_parent, hMemory, mapped_size,
+                                      &linear, &host,
+                                      "rm_map_device_vidmem_cpu") != 0) {
+        tracef("RM persistent local mapping unavailable; using transient BAR1 windows");
+        linear = 0;
+        host = NULL;
+    }
+
+    a->dptr = (CUdeviceptr)gpu_va;
+    a->host = host;
+    a->size = size;
+    a->mapped_size = mapped_size;
+    a->memory_type = CU_MEMORYTYPE_DEVICE;
+    a->owns_host = false;
+    a->rm_backed = true;
+    a->rm_memory = hMemory;
+    a->rm_linear = linear;
+    a->rm_gpu_va = gpu_va;
+    a->rm_cpu_parent = cpu_parent;
+    a->rm_map_fd = map_fd;
+    tracef("RM alloc+map local memory %zu/%zu -> handle=0x%x host=%p linear=0x%llx gpu_va=0x%llx",
+           size, mapped_size, hMemory, host, (unsigned long long)linear,
+           (unsigned long long)gpu_va);
     return 0;
 }
 
@@ -2850,21 +3895,76 @@ static void rm_release_allocation_locked(struct allocation *a)
     if (a == NULL || !a->rm_backed) {
         return;
     }
-    if (a->host != NULL && a->mapped_size != 0) {
-        munmap(a->host, a->mapped_size);
-    }
     if (g.rm_ready && a->rm_memory != 0) {
-        rm_nvos34_t unmap_api;
-        memset(&unmap_api, 0, sizeof(unmap_api));
-        unmap_api.hClient = g.rm_client;
-        unmap_api.hDevice = g.rm_device;
-        unmap_api.hMemory = a->rm_memory;
-        unmap_api.pLinearAddress = a->rm_linear;
-        int rc = rm_ioctl_xfer(g.ctl_fd, RM_ESC_RM_UNMAP_MEMORY, &unmap_api, sizeof(unmap_api));
-        tracef("RM unmap memory handle=0x%x ioctl=%d errno=%d status=0x%08x",
-               a->rm_memory, rc, rc == 0 ? 0 : errno, unmap_api.status);
+        if (a->rm_gpu_va != 0 && g.rm_vaspace != 0) {
+            rm_unmap_dma_locked(g.rm_vaspace, a->rm_memory, a->rm_gpu_va,
+                                a->mapped_size);
+        }
+        rm_unmap_cpu_with_parent_locked(a->rm_cpu_parent, a->rm_memory,
+                                        a->rm_linear, a->host, a->mapped_size);
         rm_free_object_locked(g.rm_client, g.rm_device, a->rm_memory);
     }
+    if (a->rm_map_fd >= 0) {
+        close(a->rm_map_fd);
+        a->rm_map_fd = -1;
+    }
+}
+
+static rm_u64 align_u64(rm_u64 value, rm_u64 alignment)
+{
+    return alignment == 0 ? value : (value + alignment - 1ULL) & ~(alignment - 1ULL);
+}
+
+static int rm_ensure_slm_locked(rm_u32 bytes_per_lane)
+{
+    if (bytes_per_lane == 0) {
+        return 0;
+    }
+    rm_u64 max_warps_per_sm = env_ull("LANXIN_NVIDIA_CUDA_MAX_WARPS_PER_SM", 48);
+    rm_u64 sms_per_tpc = env_ull("LANXIN_NVIDIA_CUDA_SMS_PER_TPC", 2);
+    rm_u64 sm_count = g.sm_count > 0 ? (rm_u64)g.sm_count : DEFAULT_SM_COUNT;
+    if (max_warps_per_sm == 0 || sms_per_tpc == 0) {
+        return -1;
+    }
+    rm_u64 bytes_per_warp = align_u64((rm_u64)bytes_per_lane * 32ULL, 0x200ULL);
+    rm_u64 bytes_per_tpc = align_u64(bytes_per_warp * max_warps_per_sm * sms_per_tpc,
+                                     0x8000ULL);
+    rm_u64 tpc_count = (sm_count + sms_per_tpc - 1ULL) / sms_per_tpc;
+    rm_u64 total_bytes = align_u64(bytes_per_tpc * tpc_count, 0x20000ULL);
+    if (total_bytes == 0 || total_bytes > SIZE_MAX) {
+        return -1;
+    }
+    if (g.rm_slm.rm_backed && g.rm_slm.mapped_size >= (size_t)total_bytes &&
+        g.rm_slm_bytes_per_tpc >= bytes_per_tpc &&
+        g.rm_slm_bytes_per_lane >= bytes_per_lane) {
+        return 0;
+    }
+
+    struct allocation next;
+    memset(&next, 0, sizeof(next));
+    next.rm_map_fd = -1;
+    if (rm_alloc_mapped_local_locked((size_t)total_bytes, &next) != 0) {
+        return -1;
+    }
+    if (next.host != NULL) {
+        if (next.host != NULL) {
+            memset(next.host, 0, next.mapped_size);
+        }
+    }
+    if (g.rm_slm.rm_backed) {
+        rm_release_allocation_locked(&g.rm_slm);
+    }
+    g.rm_slm = next;
+    g.rm_slm_bytes_per_tpc = bytes_per_tpc;
+    g.rm_slm_bytes_per_lane = bytes_per_lane;
+    tracef("RM shader local-memory backing ready addr=0x%llx bytes=%llu per_tpc=%llu per_warp=%llu per_lane=%u tpcs=%llu",
+           (unsigned long long)g.rm_slm.rm_gpu_va,
+           (unsigned long long)total_bytes,
+           (unsigned long long)bytes_per_tpc,
+           (unsigned long long)bytes_per_warp,
+           bytes_per_lane,
+           (unsigned long long)tpc_count);
+    return 0;
 }
 
 static char *read_text_file(const char *path)
@@ -3134,6 +4234,381 @@ static struct allocation *find_alloc_locked(CUdeviceptr ptr, size_t bytes)
     return NULL;
 }
 
+static CUresult rm_access_allocation_locked(struct allocation *a, size_t offset,
+                                            void *buffer, size_t bytes,
+                                            bool write_to_device)
+{
+    if (a == NULL || offset > a->size || bytes > a->size - offset ||
+        (buffer == NULL && bytes != 0)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (bytes == 0) {
+        return CUDA_SUCCESS;
+    }
+    if (a->host != NULL) {
+        if (write_to_device) {
+            memcpy((uint8_t *)a->host + offset, buffer, bytes);
+        } else {
+            memcpy(buffer, (const uint8_t *)a->host + offset, bytes);
+        }
+        return CUDA_SUCCESS;
+    }
+    if (!a->rm_backed || a->rm_memory == 0 || a->rm_map_fd < 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    const size_t page = 4096;
+    size_t done = 0;
+    while (done < bytes) {
+        size_t logical_offset = offset + done;
+        size_t map_offset = logical_offset & ~(page - 1U);
+        size_t prefix = logical_offset - map_offset;
+        size_t payload = bytes - done;
+        size_t window_payload = (size_t)RM_TRANSIENT_BAR1_CHUNK - prefix;
+        if (payload > window_payload) {
+            payload = window_payload;
+        }
+        size_t map_size = page_align_size(prefix + payload);
+        if (map_size > a->mapped_size - map_offset) {
+            map_size = a->mapped_size - map_offset;
+        }
+
+        int transient_fd = open("/dev/nvidia0", O_RDWR | O_CLOEXEC);
+        if (transient_fd < 0) {
+            return CUDA_ERROR_UNKNOWN;
+        }
+        rm_p64 linear = 0;
+        void *cpu = NULL;
+        if (rm_map_cpu_range_with_parent_flags_locked(
+                transient_fd, a->rm_cpu_parent, a->rm_memory,
+                map_offset, map_size, 0, &linear, &cpu,
+                write_to_device ? "rm_map_vram_write_window" :
+                                  "rm_map_vram_read_window") != 0) {
+            close(transient_fd);
+            return CUDA_ERROR_UNKNOWN;
+        }
+        if (write_to_device) {
+            memcpy((uint8_t *)cpu + prefix, (const uint8_t *)buffer + done, payload);
+            __sync_synchronize();
+        } else {
+            __sync_synchronize();
+            memcpy((uint8_t *)buffer + done, (const uint8_t *)cpu + prefix, payload);
+        }
+        rm_unmap_cpu_with_parent_locked(a->rm_cpu_parent, a->rm_memory,
+                                        linear, cpu, map_size);
+        close(transient_fd);
+        done += payload;
+    }
+    return CUDA_SUCCESS;
+}
+
+static void rm_trace_launch_pointer_data_locked(CUfunction f,
+                                                const struct launch_request *req)
+{
+    if (!env_enabled("LANXIN_NVIDIA_CUDA_TRACE_LAUNCH_POINTER_DATA") ||
+        req == NULL || req->params == NULL || req->params_size < sizeof(rm_u64)) {
+        return;
+    }
+    const char *filter = getenv("LANXIN_NVIDIA_CUDA_TRACE_LAUNCH_POINTER_FILTER");
+    if (filter != NULL && filter[0] != '\0' &&
+        (f == NULL || f->name == NULL || strstr(f->name, filter) == NULL)) {
+        return;
+    }
+    size_t pointer_count = req->params_size / sizeof(rm_u64);
+    if (pointer_count > 2) {
+        pointer_count = 2;
+    }
+    for (size_t i = 0; i < pointer_count; i++) {
+        rm_u64 pointer = 0;
+        memcpy(&pointer, (const uint8_t *)req->params + i * sizeof(pointer),
+               sizeof(pointer));
+        size_t trace_bytes = 16;
+        if (i == 1) {
+            trace_bytes = (size_t)env_ull(
+                "LANXIN_NVIDIA_CUDA_TRACE_LAUNCH_POINTER_BYTES", trace_bytes);
+            if (trace_bytes < 16) {
+                trace_bytes = 16;
+            } else if (trace_bytes > 4U * 1024U * 1024U) {
+                trace_bytes = 4U * 1024U * 1024U;
+            }
+        }
+        struct allocation *a = find_alloc_locked((CUdeviceptr)pointer, trace_bytes);
+        if (a == NULL) {
+            tracef("RM launch pointer data param=%zu ptr=0x%llx unmapped",
+                   i, (unsigned long long)pointer);
+            continue;
+        }
+        uint8_t *data = calloc(1, trace_bytes);
+        if (data == NULL) {
+            tracef("RM launch pointer data param=%zu ptr=0x%llx allocation failed",
+                   i, (unsigned long long)pointer);
+            continue;
+        }
+        size_t allocation_offset = (size_t)((CUdeviceptr)pointer - a->dptr);
+        CUresult rc = rm_access_allocation_locked(a, allocation_offset,
+                                                  data, trace_bytes, false);
+        rm_u64 first[2] = {0, 0};
+        rm_u64 last[2] = {0, 0};
+        memcpy(first, data, sizeof(first));
+        memcpy(last, data + trace_bytes - sizeof(last), sizeof(last));
+        size_t nonfinite_f32 = 0;
+        size_t nonfinite_f16 = 0;
+        for (size_t offset = 0; offset + sizeof(rm_u32) <= trace_bytes;
+             offset += sizeof(rm_u32)) {
+            rm_u32 word = 0;
+            memcpy(&word, data + offset, sizeof(word));
+            if ((word & 0x7f800000u) == 0x7f800000u) {
+                nonfinite_f32++;
+            }
+        }
+        for (size_t offset = 0; offset + sizeof(uint16_t) <= trace_bytes;
+             offset += sizeof(uint16_t)) {
+            uint16_t half = 0;
+            memcpy(&half, data + offset, sizeof(half));
+            if ((half & 0x7c00u) == 0x7c00u) {
+                nonfinite_f16++;
+            }
+        }
+        tracef("RM launch pointer data param=%zu ptr=0x%llx alloc=0x%llx+0x%zx "
+               "bytes=%zu first=0x%016llx,0x%016llx "
+               "last=0x%016llx,0x%016llx nonfinite_f32=%zu nonfinite_f16=%zu -> %d",
+               i, (unsigned long long)pointer,
+               (unsigned long long)a->dptr, allocation_offset,
+               trace_bytes,
+               (unsigned long long)first[0], (unsigned long long)first[1],
+               (unsigned long long)last[0], (unsigned long long)last[1],
+               nonfinite_f32, nonfinite_f16,
+               (int)rc);
+        free(data);
+    }
+}
+
+static void maybe_dump_launch_allocation_locked(CUfunction f,
+                                                const void *params,
+                                                size_t params_size)
+{
+    const char *dump_dir = getenv("LANXIN_NVIDIA_CUDA_DUMP_LAUNCH_DIR");
+    const char *pointer_text = getenv("LANXIN_NVIDIA_CUDA_DUMP_LAUNCH_POINTER");
+    if (!valid_function(f) || params == NULL || params_size < sizeof(rm_u64) ||
+        dump_dir == NULL || dump_dir[0] == '\0' ||
+        pointer_text == NULL || pointer_text[0] == '\0') {
+        return;
+    }
+    const char *name_filter = getenv("LANXIN_NVIDIA_CUDA_DUMP_LAUNCH_NAME");
+    if (name_filter != NULL && name_filter[0] != '\0' &&
+        (f->name == NULL || strstr(f->name, name_filter) == NULL)) {
+        return;
+    }
+    rm_u64 requested = 0;
+    if (strcmp(pointer_text, "param0") == 0) {
+        memcpy(&requested, params, sizeof(requested));
+    } else {
+        char *end = NULL;
+        requested = strtoull(pointer_text, &end, 0);
+        if (end == pointer_text || *end != '\0') {
+            return;
+        }
+        bool found = false;
+        for (size_t offset = 0; offset + sizeof(requested) <= params_size;
+             offset += sizeof(rm_u32)) {
+            rm_u64 value = 0;
+            memcpy(&value, (const uint8_t *)params + offset, sizeof(value));
+            if (value == requested) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return;
+        }
+    }
+    if (requested == 0) {
+        return;
+    }
+    struct allocation *a = find_alloc_locked((CUdeviceptr)requested, 1);
+    if (a == NULL) {
+        tracef("launch allocation dump pointer is unmapped ptr=0x%llx",
+               (unsigned long long)requested);
+        return;
+    }
+    size_t allocation_offset = (size_t)((CUdeviceptr)requested - a->dptr);
+    size_t available = a->size - allocation_offset;
+    size_t bytes = (size_t)env_ull("LANXIN_NVIDIA_CUDA_DUMP_LAUNCH_BYTES",
+                                   32ULL * 1024ULL * 1024ULL);
+    if (bytes > available) {
+        bytes = available;
+    }
+    if (bytes == 0 || (mkdir(dump_dir, 0755) != 0 && errno != EEXIST)) {
+        return;
+    }
+    char data_path[PATH_MAX];
+    char params_path[PATH_MAX];
+    rm_u64 name_hash = f->name_hash != 0 ? f->name_hash : fnv1a64_str(f->name);
+    int data_length = snprintf(data_path, sizeof(data_path),
+                               "%s/launch-%016llx-ptr-%llx-%zu.bin", dump_dir,
+                               (unsigned long long)name_hash,
+                               (unsigned long long)requested, bytes);
+    int params_length = snprintf(params_path, sizeof(params_path),
+                                 "%s/launch-%016llx-ptr-%llx.params", dump_dir,
+                                 (unsigned long long)name_hash,
+                                 (unsigned long long)requested);
+    if (data_length < 0 || (size_t)data_length >= sizeof(data_path) ||
+        params_length < 0 || (size_t)params_length >= sizeof(params_path)) {
+        return;
+    }
+    int data_fd = open(data_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (data_fd < 0) {
+        return;
+    }
+    void *buffer = malloc(bytes);
+    if (buffer == NULL ||
+        rm_access_allocation_locked(a, allocation_offset, buffer, bytes, false) !=
+            CUDA_SUCCESS) {
+        free(buffer);
+        close(data_fd);
+        unlink(data_path);
+        return;
+    }
+    size_t written = 0;
+    while (written < bytes) {
+        ssize_t rc = write(data_fd, (const uint8_t *)buffer + written,
+                           bytes - written);
+        if (rc < 0 && errno == EINTR) {
+            continue;
+        }
+        if (rc <= 0) {
+            break;
+        }
+        written += (size_t)rc;
+    }
+    free(buffer);
+    close(data_fd);
+    if (written != bytes) {
+        unlink(data_path);
+        return;
+    }
+    int params_fd = open(params_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (params_fd >= 0) {
+        size_t params_written = 0;
+        while (params_written < params_size) {
+            ssize_t rc = write(params_fd,
+                               (const uint8_t *)params + params_written,
+                               params_size - params_written);
+            if (rc < 0 && errno == EINTR) {
+                continue;
+            }
+            if (rc <= 0) {
+                break;
+            }
+            params_written += (size_t)rc;
+        }
+        close(params_fd);
+        if (params_written != params_size) {
+            unlink(params_path);
+        }
+    }
+    tracef("launch allocation dumped fn=%s ptr=0x%llx bytes=%zu path=%s",
+           f->name != NULL ? f->name : "<unnamed>",
+           (unsigned long long)requested, bytes, data_path);
+}
+
+static CUresult rm_copy_allocation_locked(struct allocation *dst, size_t dst_offset,
+                                          struct allocation *src, size_t src_offset,
+                                          size_t bytes)
+{
+    if (dst == NULL || src == NULL || dst_offset > dst->size || src_offset > src->size ||
+        bytes > dst->size - dst_offset || bytes > src->size - src_offset) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (bytes == 0) {
+        return CUDA_SUCCESS;
+    }
+    if (dst->host != NULL && src->host != NULL) {
+        memmove((uint8_t *)dst->host + dst_offset,
+                (const uint8_t *)src->host + src_offset, bytes);
+        return CUDA_SUCCESS;
+    }
+
+    size_t chunk = bytes < RM_COPY_BOUNCE_CHUNK ? bytes : (size_t)RM_COPY_BOUNCE_CHUNK;
+    void *bounce = malloc(chunk);
+    if (bounce == NULL) {
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    bool backwards = dst == src && dst_offset > src_offset &&
+                     dst_offset < src_offset + bytes;
+    CUresult result = CUDA_SUCCESS;
+    size_t done = 0;
+    while (done < bytes) {
+        size_t part = bytes - done;
+        if (part > chunk) {
+            part = chunk;
+        }
+        size_t position = backwards ? bytes - done - part : done;
+        result = rm_access_allocation_locked(src, src_offset + position,
+                                             bounce, part, false);
+        if (result == CUDA_SUCCESS) {
+            result = rm_access_allocation_locked(dst, dst_offset + position,
+                                                 bounce, part, true);
+        }
+        if (result != CUDA_SUCCESS) {
+            break;
+        }
+        done += part;
+    }
+    free(bounce);
+    return result;
+}
+
+static CUresult rm_fill_allocation_locked(struct allocation *a, size_t offset,
+                                          rm_u32 value, size_t element_size,
+                                          size_t count)
+{
+    if ((element_size != 1 && element_size != 2 && element_size != 4) ||
+        count > SIZE_MAX / element_size) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    size_t bytes = count * element_size;
+    if (a == NULL || offset > a->size || bytes > a->size - offset) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    size_t chunk = bytes < RM_COPY_BOUNCE_CHUNK ? bytes : (size_t)RM_COPY_BOUNCE_CHUNK;
+    if (chunk == 0) {
+        return CUDA_SUCCESS;
+    }
+    chunk -= chunk % element_size;
+    uint8_t *pattern = malloc(chunk);
+    if (pattern == NULL) {
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    if (element_size == 1) {
+        memset(pattern, (uint8_t)value, chunk);
+    } else if (element_size == 2) {
+        for (size_t i = 0; i < chunk / 2; i++) {
+            ((uint16_t *)pattern)[i] = (uint16_t)value;
+        }
+    } else {
+        for (size_t i = 0; i < chunk / 4; i++) {
+            ((uint32_t *)pattern)[i] = value;
+        }
+    }
+
+    CUresult result = CUDA_SUCCESS;
+    size_t done = 0;
+    while (done < bytes) {
+        size_t part = bytes - done;
+        if (part > chunk) {
+            part = chunk;
+        }
+        result = rm_access_allocation_locked(a, offset + done, pattern, part, true);
+        if (result != CUDA_SUCCESS) {
+            break;
+        }
+        done += part;
+    }
+    free(pattern);
+    return result;
+}
+
 static void *alloc_host_memory(size_t bytes)
 {
     void *ptr = NULL;
@@ -3171,7 +4646,7 @@ static CUresult add_allocation_locked(CUdeviceptr *dptr, void *host, size_t size
 static CUresult resolve_device_ptr_locked(CUdeviceptr dptr, size_t bytes, void **host_out)
 {
     struct allocation *a = find_alloc_locked(dptr, bytes);
-    if (a == NULL) {
+    if (a == NULL || a->host == NULL) {
         return CUDA_ERROR_INVALID_VALUE;
     }
     *host_out = (char *)a->host + (dptr - a->dptr);
@@ -3181,7 +4656,7 @@ static CUresult resolve_device_ptr_locked(CUdeviceptr dptr, size_t bytes, void *
 static void *resolve_uva_ptr_locked(CUdeviceptr ptr, size_t bytes)
 {
     struct allocation *a = find_alloc_locked(ptr, bytes);
-    if (a != NULL) {
+    if (a != NULL && a->host != NULL) {
         return (char *)a->host + (ptr - a->dptr);
     }
     if (ptr < 4096U || (bytes != 0 && ptr > (CUdeviceptr)(UINTPTR_MAX - bytes))) {
@@ -3639,7 +5114,13 @@ CUresult CUDAAPI cuCtxGetFlags(unsigned int *flags)
 
 CUresult CUDAAPI cuCtxSynchronize(void)
 {
-    return ensure_initialized();
+    pthread_mutex_lock(&g_lock);
+    CUresult result = ensure_initialized_locked();
+    if (result == CUDA_SUCCESS && rm_wait_all_launches_locked() != 0) {
+        result = CUDA_ERROR_UNKNOWN;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return result;
 }
 
 CUresult CUDAAPI cuCtxGetApiVersion(CUcontext ctx, unsigned int *version)
@@ -3785,8 +5266,18 @@ CUresult CUDAAPI cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize)
     if (!env_enabled("LANXIN_NVIDIA_CUDA_HOST_ALLOC_ONLY")) {
         struct allocation *rm_alloc = calloc(1, sizeof(*rm_alloc));
         if (rm_alloc != NULL) {
+            rm_alloc->rm_map_fd = -1;
             pthread_mutex_lock(&g_lock);
-            if (rm_alloc_mapped_system_locked(bytesize, rm_alloc) == 0) {
+            bool prefer_system = env_enabled("LANXIN_NVIDIA_CUDA_DEVICE_SYSMEM");
+            int rm_rc = prefer_system ?
+                        rm_alloc_mapped_system_locked(bytesize, rm_alloc) :
+                        rm_alloc_mapped_local_locked(bytesize, rm_alloc);
+            if (rm_rc != 0) {
+                rm_rc = prefer_system ?
+                        rm_alloc_mapped_local_locked(bytesize, rm_alloc) :
+                        rm_alloc_mapped_system_locked(bytesize, rm_alloc);
+            }
+            if (rm_rc == 0) {
                 rm_alloc->id = g.next_id++;
                 rm_alloc->next = g.allocs;
                 g.allocs = rm_alloc;
@@ -3803,6 +5294,12 @@ CUresult CUDAAPI cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize)
         }
     } else {
         tracef("cuMemAlloc_v2 host-only path %zu", bytesize);
+    }
+    if (env_enabled("LANXIN_NVIDIA_CUDA_QMD_SUBMIT") ||
+        env_enabled("LANXIN_NVIDIA_CUDA_REQUIRE_RM_MEMORY")) {
+        tracef("cuMemAlloc_v2 refusing unmapped host fallback bytes=%zu", bytesize);
+        *dptr = 0;
+        return CUDA_ERROR_OUT_OF_MEMORY;
     }
     void *host = alloc_host_memory(bytesize);
     if (host == NULL) {
@@ -3997,11 +5494,15 @@ CUresult CUDAAPI cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost, siz
         return CUDA_ERROR_INVALID_VALUE;
     }
     pthread_mutex_lock(&g_lock);
-    void *dst = NULL;
-    CUresult result = resolve_device_ptr_locked(dstDevice, ByteCount, &dst);
-    if (result == CUDA_SUCCESS && ByteCount != 0) {
-        memcpy(dst, srcHost, ByteCount);
+    if (rm_wait_all_launches_locked() != 0) {
+        pthread_mutex_unlock(&g_lock);
+        return CUDA_ERROR_UNKNOWN;
     }
+    struct allocation *dst = find_alloc_locked(dstDevice, ByteCount);
+    CUresult result = dst != NULL ?
+        rm_access_allocation_locked(dst, (size_t)(dstDevice - dst->dptr),
+                                    (void *)srcHost, ByteCount, true) :
+        CUDA_ERROR_INVALID_VALUE;
     pthread_mutex_unlock(&g_lock);
     return result;
 }
@@ -4017,11 +5518,26 @@ CUresult CUDAAPI cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice, size_t By
         return CUDA_ERROR_INVALID_VALUE;
     }
     pthread_mutex_lock(&g_lock);
-    void *src = NULL;
-    CUresult result = resolve_device_ptr_locked(srcDevice, ByteCount, &src);
-    if (result == CUDA_SUCCESS && ByteCount != 0) {
-        memcpy(dstHost, src, ByteCount);
+    if (rm_wait_all_launches_locked() != 0) {
+        pthread_mutex_unlock(&g_lock);
+        return CUDA_ERROR_UNKNOWN;
     }
+    struct allocation *src = find_alloc_locked(srcDevice, ByteCount);
+    CUresult result = src != NULL ?
+        rm_access_allocation_locked(src, (size_t)(srcDevice - src->dptr),
+                                    dstHost, ByteCount, false) :
+        CUDA_ERROR_INVALID_VALUE;
+    rm_u64 first[2] = {0, 0};
+    if (result == CUDA_SUCCESS && ByteCount != 0) {
+        size_t copy = ByteCount < sizeof(first) ? ByteCount : sizeof(first);
+        memcpy(first, dstHost, copy);
+    }
+    tracef("cuMemcpyDtoH src=0x%llx+0x%llx bytes=%zu "
+           "first=0x%016llx,0x%016llx -> %d",
+           src != NULL ? (unsigned long long)src->dptr : 0ULL,
+           src != NULL ? (unsigned long long)(srcDevice - src->dptr) : 0ULL,
+           ByteCount, (unsigned long long)first[0],
+           (unsigned long long)first[1], (int)result);
     pthread_mutex_unlock(&g_lock);
     return result;
 }
@@ -4034,15 +5550,22 @@ CUresult CUDAAPI cuMemcpyDtoH(void *dstHost, CUdeviceptr srcDevice, size_t ByteC
 CUresult CUDAAPI cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount)
 {
     pthread_mutex_lock(&g_lock);
-    void *dst = NULL;
-    void *src = NULL;
-    CUresult result = resolve_device_ptr_locked(dstDevice, ByteCount, &dst);
-    if (result == CUDA_SUCCESS) {
-        result = resolve_device_ptr_locked(srcDevice, ByteCount, &src);
+    if (rm_wait_all_launches_locked() != 0) {
+        pthread_mutex_unlock(&g_lock);
+        return CUDA_ERROR_UNKNOWN;
     }
-    if (result == CUDA_SUCCESS && ByteCount != 0) {
-        memmove(dst, src, ByteCount);
-    }
+    struct allocation *dst = find_alloc_locked(dstDevice, ByteCount);
+    struct allocation *src = find_alloc_locked(srcDevice, ByteCount);
+    CUresult result = dst != NULL && src != NULL ?
+        rm_copy_allocation_locked(dst, (size_t)(dstDevice - dst->dptr),
+                                  src, (size_t)(srcDevice - src->dptr), ByteCount) :
+        CUDA_ERROR_INVALID_VALUE;
+    tracef("cuMemcpyDtoD dst=0x%llx+0x%llx src=0x%llx+0x%llx bytes=%zu -> %d",
+           dst != NULL ? (unsigned long long)dst->dptr : 0ULL,
+           dst != NULL ? (unsigned long long)(dstDevice - dst->dptr) : 0ULL,
+           src != NULL ? (unsigned long long)src->dptr : 0ULL,
+           src != NULL ? (unsigned long long)(srcDevice - src->dptr) : 0ULL,
+           ByteCount, (int)result);
     pthread_mutex_unlock(&g_lock);
     return result;
 }
@@ -4055,15 +5578,42 @@ CUresult CUDAAPI cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size
 CUresult CUDAAPI cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount)
 {
     pthread_mutex_lock(&g_lock);
-    void *dstp = resolve_uva_ptr_locked(dst, ByteCount);
-    void *srcp = resolve_uva_ptr_locked(src, ByteCount);
-    if ((dstp == NULL || srcp == NULL) && ByteCount != 0) {
+    if (rm_wait_all_launches_locked() != 0) {
         pthread_mutex_unlock(&g_lock);
-        return CUDA_ERROR_INVALID_VALUE;
+        return CUDA_ERROR_UNKNOWN;
     }
-    memmove(dstp, srcp, ByteCount);
+    struct allocation *dst_alloc = find_alloc_locked(dst, ByteCount);
+    struct allocation *src_alloc = find_alloc_locked(src, ByteCount);
+    CUresult result = CUDA_SUCCESS;
+    if (dst_alloc != NULL && src_alloc != NULL) {
+        result = rm_copy_allocation_locked(dst_alloc, (size_t)(dst - dst_alloc->dptr),
+                                           src_alloc, (size_t)(src - src_alloc->dptr),
+                                           ByteCount);
+    } else if (dst_alloc != NULL) {
+        if (src < 4096U || (ByteCount != 0 && src > (CUdeviceptr)(UINTPTR_MAX - ByteCount))) {
+            result = CUDA_ERROR_INVALID_VALUE;
+        } else {
+            result = rm_access_allocation_locked(dst_alloc,
+                                                 (size_t)(dst - dst_alloc->dptr),
+                                                 (void *)(uintptr_t)src,
+                                                 ByteCount, true);
+        }
+    } else if (src_alloc != NULL) {
+        if (dst < 4096U || (ByteCount != 0 && dst > (CUdeviceptr)(UINTPTR_MAX - ByteCount))) {
+            result = CUDA_ERROR_INVALID_VALUE;
+        } else {
+            result = rm_access_allocation_locked(src_alloc,
+                                                 (size_t)(src - src_alloc->dptr),
+                                                 (void *)(uintptr_t)dst,
+                                                 ByteCount, false);
+        }
+    } else if ((dst < 4096U || src < 4096U) && ByteCount != 0) {
+        result = CUDA_ERROR_INVALID_VALUE;
+    } else {
+        memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, ByteCount);
+    }
     pthread_mutex_unlock(&g_lock);
-    return CUDA_SUCCESS;
+    return result;
 }
 
 CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream)
@@ -4122,33 +5672,33 @@ CUresult CUDAAPI cuMemcpy2D_v2(const CUDA_MEMCPY2D *pCopy)
         return CUDA_ERROR_NOT_SUPPORTED;
     }
     for (size_t row = 0; row < pCopy->Height; row++) {
-        const char *src = NULL;
-        char *dst = NULL;
-        pthread_mutex_lock(&g_lock);
-        if (pCopy->srcMemoryType == CU_MEMORYTYPE_HOST) {
-            src = (const char *)pCopy->srcHost + (pCopy->srcY + row) * pCopy->srcPitch + pCopy->srcXInBytes;
+        const void *src_host = pCopy->srcMemoryType == CU_MEMORYTYPE_HOST ?
+            (const char *)pCopy->srcHost +
+                (pCopy->srcY + row) * pCopy->srcPitch + pCopy->srcXInBytes : NULL;
+        void *dst_host = pCopy->dstMemoryType == CU_MEMORYTYPE_HOST ?
+            (char *)pCopy->dstHost +
+                (pCopy->dstY + row) * pCopy->dstPitch + pCopy->dstXInBytes : NULL;
+        CUdeviceptr src_device = pCopy->srcDevice +
+                                 (pCopy->srcY + row) * pCopy->srcPitch +
+                                 pCopy->srcXInBytes;
+        CUdeviceptr dst_device = pCopy->dstDevice +
+                                 (pCopy->dstY + row) * pCopy->dstPitch +
+                                 pCopy->dstXInBytes;
+        CUresult result;
+        if (pCopy->srcMemoryType == CU_MEMORYTYPE_HOST &&
+            pCopy->dstMemoryType == CU_MEMORYTYPE_HOST) {
+            memmove(dst_host, src_host, pCopy->WidthInBytes);
+            result = CUDA_SUCCESS;
+        } else if (pCopy->srcMemoryType == CU_MEMORYTYPE_HOST) {
+            result = cuMemcpyHtoD_v2(dst_device, src_host, pCopy->WidthInBytes);
+        } else if (pCopy->dstMemoryType == CU_MEMORYTYPE_HOST) {
+            result = cuMemcpyDtoH_v2(dst_host, src_device, pCopy->WidthInBytes);
         } else {
-            void *tmp = NULL;
-            CUresult r = resolve_device_ptr_locked(pCopy->srcDevice + (pCopy->srcY + row) * pCopy->srcPitch + pCopy->srcXInBytes, pCopy->WidthInBytes, &tmp);
-            if (r != CUDA_SUCCESS) {
-                pthread_mutex_unlock(&g_lock);
-                return r;
-            }
-            src = tmp;
+            result = cuMemcpyDtoD_v2(dst_device, src_device, pCopy->WidthInBytes);
         }
-        if (pCopy->dstMemoryType == CU_MEMORYTYPE_HOST) {
-            dst = (char *)pCopy->dstHost + (pCopy->dstY + row) * pCopy->dstPitch + pCopy->dstXInBytes;
-        } else {
-            void *tmp = NULL;
-            CUresult r = resolve_device_ptr_locked(pCopy->dstDevice + (pCopy->dstY + row) * pCopy->dstPitch + pCopy->dstXInBytes, pCopy->WidthInBytes, &tmp);
-            if (r != CUDA_SUCCESS) {
-                pthread_mutex_unlock(&g_lock);
-                return r;
-            }
-            dst = tmp;
+        if (result != CUDA_SUCCESS) {
+            return result;
         }
-        memmove(dst, src, pCopy->WidthInBytes);
-        pthread_mutex_unlock(&g_lock);
     }
     return CUDA_SUCCESS;
 }
@@ -4184,11 +5734,10 @@ CUresult CUDAAPI cuMemcpy2DAsync(const CUDA_MEMCPY2D *pCopy, CUstream hStream)
 CUresult CUDAAPI cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc, size_t N)
 {
     pthread_mutex_lock(&g_lock);
-    void *dst = NULL;
-    CUresult result = resolve_device_ptr_locked(dstDevice, N, &dst);
-    if (result == CUDA_SUCCESS) {
-        memset(dst, uc, N);
-    }
+    struct allocation *dst = find_alloc_locked(dstDevice, N);
+    CUresult result = dst != NULL ?
+        rm_fill_allocation_locked(dst, (size_t)(dstDevice - dst->dptr), uc, 1, N) :
+        CUDA_ERROR_INVALID_VALUE;
     pthread_mutex_unlock(&g_lock);
     return result;
 }
@@ -4200,14 +5749,14 @@ CUresult CUDAAPI cuMemsetD8(CUdeviceptr dstDevice, unsigned char uc, size_t N)
 
 CUresult CUDAAPI cuMemsetD16_v2(CUdeviceptr dstDevice, unsigned short us, size_t N)
 {
-    pthread_mutex_lock(&g_lock);
-    uint16_t *dst = NULL;
-    CUresult result = resolve_device_ptr_locked(dstDevice, N * sizeof(uint16_t), (void **)&dst);
-    if (result == CUDA_SUCCESS) {
-        for (size_t i = 0; i < N; i++) {
-            dst[i] = us;
-        }
+    if (N > SIZE_MAX / sizeof(uint16_t)) {
+        return CUDA_ERROR_INVALID_VALUE;
     }
+    pthread_mutex_lock(&g_lock);
+    struct allocation *dst = find_alloc_locked(dstDevice, N * sizeof(uint16_t));
+    CUresult result = dst != NULL ?
+        rm_fill_allocation_locked(dst, (size_t)(dstDevice - dst->dptr), us, 2, N) :
+        CUDA_ERROR_INVALID_VALUE;
     pthread_mutex_unlock(&g_lock);
     return result;
 }
@@ -4219,14 +5768,14 @@ CUresult CUDAAPI cuMemsetD16(CUdeviceptr dstDevice, unsigned short us, size_t N)
 
 CUresult CUDAAPI cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui, size_t N)
 {
-    pthread_mutex_lock(&g_lock);
-    uint32_t *dst = NULL;
-    CUresult result = resolve_device_ptr_locked(dstDevice, N * sizeof(uint32_t), (void **)&dst);
-    if (result == CUDA_SUCCESS) {
-        for (size_t i = 0; i < N; i++) {
-            dst[i] = ui;
-        }
+    if (N > SIZE_MAX / sizeof(uint32_t)) {
+        return CUDA_ERROR_INVALID_VALUE;
     }
+    pthread_mutex_lock(&g_lock);
+    struct allocation *dst = find_alloc_locked(dstDevice, N * sizeof(uint32_t));
+    CUresult result = dst != NULL ?
+        rm_fill_allocation_locked(dst, (size_t)(dstDevice - dst->dptr), ui, 4, N) :
+        CUDA_ERROR_INVALID_VALUE;
     pthread_mutex_unlock(&g_lock);
     return result;
 }
@@ -4340,7 +5889,10 @@ CUresult CUDAAPI cuStreamQuery(CUstream hStream)
 
 CUresult CUDAAPI cuStreamSynchronize(CUstream hStream)
 {
-    return valid_stream(hStream) ? CUDA_SUCCESS : CUDA_ERROR_INVALID_HANDLE;
+    if (!valid_stream(hStream)) {
+        return CUDA_ERROR_INVALID_HANDLE;
+    }
+    return cuCtxSynchronize();
 }
 
 CUresult CUDAAPI cuStreamGetPriority(CUstream hStream, int *priority)
@@ -4462,6 +6014,62 @@ CUresult CUDAAPI cuEventElapsedTime_v2(float *pMilliseconds, CUevent hStart, CUe
     return cuEventElapsedTime(pMilliseconds, hStart, hEnd);
 }
 
+static void maybe_dump_module_image(CUmodule module)
+{
+    const char *dump_dir = getenv("LANXIN_NVIDIA_CUDA_DUMP_MODULES_DIR");
+    if (!valid_module(module) || dump_dir == NULL || dump_dir[0] == '\0' ||
+        module->image == NULL || module->image_size == 0) {
+        return;
+    }
+    const char *hash_filter = getenv("LANXIN_NVIDIA_CUDA_DUMP_MODULE_HASH");
+    if (hash_filter != NULL && hash_filter[0] != '\0') {
+        char *end = NULL;
+        unsigned long long requested = strtoull(hash_filter, &end, 0);
+        if (end == hash_filter || *end != '\0' || requested != module->image_hash) {
+            return;
+        }
+    }
+    if (mkdir(dump_dir, 0755) != 0 && errno != EEXIST) {
+        tracef("module dump mkdir failed dir=%s errno=%d", dump_dir, errno);
+        return;
+    }
+    char path[PATH_MAX];
+    int length = snprintf(path, sizeof(path), "%s/module-%016llx-%zu.cubin",
+                          dump_dir, (unsigned long long)module->image_hash,
+                          module->image_size);
+    if (length < 0 || (size_t)length >= sizeof(path)) {
+        tracef("module dump path too long dir=%s", dump_dir);
+        return;
+    }
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        if (errno != EEXIST) {
+            tracef("module dump open failed path=%s errno=%d", path, errno);
+        }
+        return;
+    }
+    const uint8_t *src = (const uint8_t *)module->image;
+    size_t written = 0;
+    while (written < module->image_size) {
+        ssize_t rc = write(fd, src + written, module->image_size - written);
+        if (rc < 0 && errno == EINTR) {
+            continue;
+        }
+        if (rc <= 0) {
+            break;
+        }
+        written += (size_t)rc;
+    }
+    close(fd);
+    if (written != module->image_size) {
+        tracef("module dump short write path=%s bytes=%zu/%zu", path, written,
+               module->image_size);
+        unlink(path);
+        return;
+    }
+    tracef("module dumped path=%s bytes=%zu", path, module->image_size);
+}
+
 static CUmodule make_module(const char *name, const void *image, size_t image_size, bool copy_image)
 {
     CUmodule module = calloc(1, sizeof(*module));
@@ -4484,6 +6092,7 @@ static CUmodule make_module(const char *name, const void *image, size_t image_si
         ((char *)module->owned_image)[image_size] = '\0';
         module->image = module->owned_image;
     }
+    maybe_dump_module_image(module);
     (void)module_discover_cubin_kernels(module);
     pthread_mutex_lock(&g_lock);
     module->next = g.modules;
@@ -4731,6 +6340,10 @@ CUresult CUDAAPI cuModuleUnload(CUmodule hmod)
         return CUDA_ERROR_INVALID_HANDLE;
     }
     pthread_mutex_lock(&g_lock);
+    if (rm_wait_all_launches_locked() != 0) {
+        pthread_mutex_unlock(&g_lock);
+        return CUDA_ERROR_UNKNOWN;
+    }
     struct CUmod_st **prev = (struct CUmod_st **)&g.modules;
     while (*prev != NULL) {
         if (*prev == hmod) {
@@ -4740,7 +6353,7 @@ CUresult CUDAAPI cuModuleUnload(CUmodule hmod)
         prev = &(*prev)->next;
     }
     for (struct CUfunc_st *fn = hmod->functions; fn != NULL; fn = fn->next) {
-        rm_release_function_launch_locked(fn);
+        rm_stage_release_locked(&fn->code);
     }
     rm_stage_release_locked(&hmod->code);
     pthread_mutex_unlock(&g_lock);
@@ -5158,12 +6771,22 @@ CUresult CUDAAPI cuKernelGetParamInfo(CUkernel kernel, size_t paramIndex, size_t
     if (!valid_kernel(kernel) || paramOffset == NULL || paramSize == NULL) {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    CUfunction function = kernel->function;
+    if (valid_function(function) && function->metadata.valid) {
+        for (rm_u32 i = 0; i < function->metadata.param_count; i++) {
+            if (function->metadata.params[i].ordinal == paramIndex) {
+                *paramOffset = function->metadata.params[i].offset;
+                *paramSize = function->metadata.params[i].size;
+                return CUDA_SUCCESS;
+            }
+        }
+    }
     *paramOffset = paramIndex * sizeof(void *);
     *paramSize = sizeof(void *);
     return CUDA_SUCCESS;
 }
 
-static CUresult capture_launch_params(void **kernelParams, void **extra,
+static CUresult capture_launch_params(CUfunction function, void **kernelParams, void **extra,
                                       void **params_out, size_t *params_size_out, rm_u32 *flags_out)
 {
     if (params_out == NULL || params_size_out == NULL || flags_out == NULL) {
@@ -5200,6 +6823,41 @@ static CUresult capture_launch_params(void **kernelParams, void **extra,
             *flags_out = LANXIN_LAUNCH_PARAM_EXTRA_BUFFER;
             return CUDA_SUCCESS;
         }
+    }
+
+    if (kernelParams != NULL && valid_function(function) &&
+        function->metadata.valid && function->metadata.param_count != 0) {
+        size_t bytes = function->metadata.param_cbank_size;
+        for (rm_u32 i = 0; i < function->metadata.param_count; i++) {
+            size_t end = (size_t)function->metadata.params[i].offset +
+                         function->metadata.params[i].size;
+            if (end > bytes) {
+                bytes = end;
+            }
+        }
+        if (bytes > max_bytes) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        void *copy = calloc(1, bytes == 0 ? 1 : bytes);
+        if (copy == NULL) {
+            return CUDA_ERROR_OUT_OF_MEMORY;
+        }
+        for (rm_u32 i = 0; i < function->metadata.param_count; i++) {
+            rm_u32 ordinal = function->metadata.params[i].ordinal;
+            rm_u32 offset = function->metadata.params[i].offset;
+            rm_u32 size = function->metadata.params[i].size;
+            if (size != 0 && kernelParams[ordinal] == NULL) {
+                free(copy);
+                return CUDA_ERROR_INVALID_VALUE;
+            }
+            if (size != 0) {
+                memcpy((uint8_t *)copy + offset, kernelParams[ordinal], size);
+            }
+        }
+        *params_out = copy;
+        *params_size_out = bytes;
+        *flags_out = LANXIN_LAUNCH_PARAM_POINTER_ARRAY;
+        return CUDA_SUCCESS;
     }
 
     unsigned long long param_ptr_count = env_ull("LANXIN_NVIDIA_CUDA_KERNEL_PARAM_PTRS", 0);
@@ -6572,7 +8230,8 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f,
     void *param_copy = NULL;
     size_t param_size = 0;
     rm_u32 param_flags = 0;
-    CUresult param_result = capture_launch_params(kernelParams, extra, &param_copy, &param_size, &param_flags);
+    CUresult param_result = capture_launch_params(f, kernelParams, extra,
+                                                  &param_copy, &param_size, &param_flags);
     if (param_result != CUDA_SUCCESS) {
         return param_result;
     }
@@ -6587,14 +8246,26 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f,
     bool noop_success = env_enabled("LANXIN_NVIDIA_CUDA_NOOP_KERNEL");
     bool rm_submit_only = env_enabled("LANXIN_NVIDIA_CUDA_RM_SUBMIT");
     bool rm_pb_submit = env_enabled("LANXIN_NVIDIA_CUDA_PB_SUBMIT");
-    bool rm_qmd_submit = env_enabled("LANXIN_NVIDIA_CUDA_QMD_SUBMIT");
+    bool rm_qmd_submit = !env_disabled("LANXIN_NVIDIA_CUDA_QMD_SUBMIT");
     bool strict_launch = env_enabled("LANXIN_NVIDIA_CUDA_STRICT_LAUNCH");
     bool fail_unsupported_kernel = env_enabled("LANXIN_NVIDIA_CUDA_FAIL_UNSUPPORTED_KERNEL");
     bool default_pb_submit = !noop_success && !rm_submit_only && !env_disabled("LANXIN_NVIDIA_CUDA_PB_SUBMIT");
+    if (rm_qmd_submit && !f->metadata.valid) {
+        tracef("RM refusing QMD launch without cubin metadata fn=%s image_bytes=%zu",
+               f->name != NULL ? f->name : "<unnamed>", f->image_size);
+        free(param_copy);
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
     pthread_mutex_lock(&g_lock);
     CUresult init = ensure_initialized_locked();
     CUresult host_rc = CUDA_ERROR_NOT_SUPPORTED;
-    if (init == CUDA_SUCCESS) {
+    bool allow_host_fallback = !rm_qmd_submit ||
+                               env_enabled("LANXIN_NVIDIA_CUDA_HOST_FALLBACK");
+    bool dump_launch_on_error = env_enabled("LANXIN_NVIDIA_CUDA_DUMP_LAUNCH_ON_ERROR");
+    if (init == CUDA_SUCCESS && !dump_launch_on_error) {
+        maybe_dump_launch_allocation_locked(f, param_copy, param_size);
+    }
+    if (init == CUDA_SUCCESS && allow_host_fallback) {
         host_rc = try_host_kernel_fallback_locked(f, gridDimX, gridDimY, gridDimZ,
                                                   blockDimX, blockDimY, blockDimZ,
                                                   kernelParams);
@@ -6613,6 +8284,9 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f,
                 submit_rc = rm_submit_noop_locked();
             }
         }
+    }
+    if (init == CUDA_SUCCESS && submit_rc != 0 && dump_launch_on_error) {
+        maybe_dump_launch_allocation_locked(f, param_copy, param_size);
     }
     pthread_mutex_unlock(&g_lock);
     tracef("RM cuLaunchKernel scaffold(%s) submit_rc=%d host_rc=%d noop_success=%d submit_only=%d pb_submit=%d qmd_submit=%d default_pb=%d strict=%d fail_unsupported=%d params=%zu flags=0x%x",

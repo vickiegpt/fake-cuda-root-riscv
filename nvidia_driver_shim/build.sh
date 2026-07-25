@@ -35,7 +35,8 @@ ln -sfn libcudart_nvidia.so.12 "$ROOT/lib64/libcudart.so"
   -I"$ROOT/include" $CFLAGS \
   -Wl,-soname,libcublas.so.12 \
   -o "$ROOT/lib64/libcublas_nvidia.so.12" \
-  "$ROOT/nvidia_driver_shim/libcublas_nvidia.c"
+  "$ROOT/nvidia_driver_shim/libcublas_nvidia.c" \
+  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" -l:libcuda_nvidia.so.1
 ln -sfn libcublas_nvidia.so.12 "$ROOT/lib64/libcublas.so.12"
 ln -sfn libcublas_nvidia.so.12 "$ROOT/lib64/libcublas.so"
 
@@ -64,6 +65,11 @@ ln -sfn libcublas_nvidia.so.12 "$ROOT/lib64/libcublas.so"
   "$ROOT/nvidia_driver_shim/cubin_launch_probe.c" \
   -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" -l:libcuda_nvidia.so.1
 
+"$CC" -O2 -g -Wall -Wextra -I"$ROOT/include" \
+  -o "$ROOT/nvidia_driver_shim/build/sm120_qmd_probe" \
+  "$ROOT/nvidia_driver_shim/sm120_qmd_probe.c" \
+  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" -l:libcuda_nvidia.so.1
+
 "$CC" -O2 -g -Wall -Wextra \
   -o "$ROOT/nvidia_driver_shim/build/rm_probe" \
   "$ROOT/nvidia_driver_shim/rm_probe.c"
@@ -86,6 +92,7 @@ echo "built $ROOT/nvidia_driver_shim/build/launch_probe"
 echo "built $ROOT/nvidia_driver_shim/build/api_probe"
 echo "built $ROOT/nvidia_driver_shim/build/module_image_probe"
 echo "built $ROOT/nvidia_driver_shim/build/cubin_launch_probe"
+echo "built $ROOT/nvidia_driver_shim/build/sm120_qmd_probe"
 echo "built $ROOT/nvidia_driver_shim/build/rm_probe"
 echo "built $ROOT/nvidia_driver_shim/build/channel_probe"
 echo "built $ROOT/nvidia_driver_shim/build/nvidia-smi"

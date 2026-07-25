@@ -1,0 +1,26 @@
+.version 8.8
+.target sm_120a
+.address_size 64
+
+.visible .entry sm120_shared_probe(
+    .param .u64 output
+)
+{
+    .reg .pred %p;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<5>;
+    .shared .align 4 .u32 value[1];
+
+    mov.u32 %r1, %tid.x;
+    setp.ne.u32 %p, %r1, 0;
+    @%p bra done;
+    mov.u64 %rd1, value;
+    mov.u32 %r2, 496;
+    st.shared.u32 [%rd1], %r2;
+    ld.shared.u32 %r3, [%rd1];
+    ld.param.u64 %rd4, [output];
+    st.global.u32 [%rd4], %r3;
+
+done:
+    ret;
+}

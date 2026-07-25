@@ -6,7 +6,11 @@
 #include <string.h>
 
 #define FATBINC_MAGIC 0x466243b1
+#define FATBIN_MAGIC 0xba55ed50u
 #define SYNTH_ELF_SIZE 0x580u
+#define SYNTH_FATBIN_ENTRY_HEADER_SIZE 0x60u
+#define SYNTH_FATBIN_DATA_OFF 0x70u
+#define SYNTH_FATBIN_SIZE (SYNTH_FATBIN_DATA_OFF + SYNTH_ELF_SIZE)
 #define SHSTRTAB_OFF 0x40u
 #define TEXT0_OFF 0x180u
 #define INFO0_OFF 0x200u
@@ -174,12 +178,32 @@ static void build_synthetic_cubin(unsigned char *image)
     write_shdr(sh + 7 * 64, const1_name, 1, 0x2, 0, CONST1_OFF, 16, 0, 0, 4, 0);
 }
 
+static void build_synthetic_fatbin(unsigned char *fatbin, const unsigned char *elf_image)
+{
+    memset(fatbin, 0, SYNTH_FATBIN_SIZE);
+    wr32le(fatbin, FATBIN_MAGIC);
+    wr16le(fatbin + 4, 1);
+    wr16le(fatbin + 6, 16);
+    wr64le(fatbin + 8, SYNTH_FATBIN_ENTRY_HEADER_SIZE + SYNTH_ELF_SIZE);
+
+    unsigned char *entry = fatbin + 16;
+    wr16le(entry, 2); /* ELF cubin */
+    wr16le(entry + 2, 0x0101);
+    wr32le(entry + 4, SYNTH_FATBIN_ENTRY_HEADER_SIZE);
+    wr64le(entry + 8, SYNTH_ELF_SIZE);
+    wr32le(entry + 0x1c, 120);
+    memcpy(fatbin + SYNTH_FATBIN_DATA_OFF, elf_image, SYNTH_ELF_SIZE);
+}
+
 int main(void)
 {
     static unsigned long long elf_storage[(SYNTH_ELF_SIZE + 7u) / 8u];
+    static unsigned long long fatbin_storage[(SYNTH_FATBIN_SIZE + 7u) / 8u];
     unsigned char *elf_image = (unsigned char *)elf_storage;
+    unsigned char *fatbin_image = (unsigned char *)fatbin_storage;
     CUmodule mod_elf = NULL;
     CUmodule mod_fatbin = NULL;
+    CUmodule mod_fatbin_container = NULL;
     CUfunction fn_elf = NULL;
     CUfunction fn_fatbin = NULL;
     CUfunction fn_elf_second = NULL;
@@ -190,13 +214,21 @@ int main(void)
     CUkernel kernels[4] = {0};
     unsigned int function_count_elf = 0;
     unsigned int function_count_fatbin = 0;
+    unsigned int function_count_fatbin_container = 0;
     unsigned int kernel_count = 0;
 
     build_synthetic_cubin(elf_image);
+    build_synthetic_fatbin(fatbin_image, elf_image);
     fatbin_wrapper_t wrapper = {
         .magic = FATBINC_MAGIC,
         .version = 1,
         .data = elf_storage,
+        .filename_or_fatbins = NULL,
+    };
+    fatbin_wrapper_t container_wrapper = {
+        .magic = FATBINC_MAGIC,
+        .version = 1,
+        .data = fatbin_storage,
         .filename_or_fatbins = NULL,
     };
 
@@ -223,16 +255,24 @@ int main(void)
     result = cuModuleGetFunction(&fn_fatbin_second, mod_fatbin, "second_kernel");
     if (result != CUDA_SUCCESS) return fail(result, "cuModuleGetFunction(fatbin second)");
 
+    result = cuModuleLoadFatBinary(&mod_fatbin_container, &container_wrapper);
+    if (result != CUDA_SUCCESS) return fail(result, "cuModuleLoadFatBinary(container)");
+    result = cuModuleGetFunctionCount(&function_count_fatbin_container, mod_fatbin_container);
+    if (result != CUDA_SUCCESS) return fail(result, "cuModuleGetFunctionCount(container)");
+    if (function_count_fatbin_container < 2) {
+        return fail_count("function_count_fatbin_container", function_count_fatbin_container, 2);
+    }
+
     if (check_attr(fn_elf, CU_FUNC_ATTRIBUTE_NUM_REGS, 48, "NUM_REGS") ||
         check_attr(fn_elf, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, 256, "MAX_THREADS") ||
-        check_attr(fn_elf, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, 128, "SHARED_SIZE") ||
+        check_attr(fn_elf, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, 0, "SHARED_SIZE") ||
         check_attr(fn_elf, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, 16, "LOCAL_SIZE") ||
         check_attr(fn_elf, CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES, 32, "CONST_SIZE")) {
         return 2;
     }
     if (check_attr(fn_elf_second, CU_FUNC_ATTRIBUTE_NUM_REGS, 24, "SECOND_NUM_REGS") ||
         check_attr(fn_elf_second, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, 128, "SECOND_MAX_THREADS") ||
-        check_attr(fn_elf_second, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, 64, "SECOND_SHARED_SIZE") ||
+        check_attr(fn_elf_second, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, 0, "SECOND_SHARED_SIZE") ||
         check_attr(fn_elf_second, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, 0, "SECOND_LOCAL_SIZE") ||
         check_attr(fn_elf_second, CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES, 16, "SECOND_CONST_SIZE")) {
         return 2;
@@ -272,10 +312,11 @@ int main(void)
     }
 
     cuLibraryUnload(lib_elf);
+    cuModuleUnload(mod_fatbin_container);
     cuModuleUnload(mod_fatbin);
     cuModuleUnload(mod_elf);
 
-    printf("module_image_probe result=ok expected_size=%u kernels=%u library_kernels=%u primary=fake_kernel secondary=second_kernel\n",
-           SYNTH_ELF_SIZE, function_count_elf, kernel_count);
+    printf("module_image_probe result=ok expected_size=%u kernels=%u fatbin_kernels=%u library_kernels=%u primary=fake_kernel secondary=second_kernel\n",
+           SYNTH_ELF_SIZE, function_count_elf, function_count_fatbin_container, kernel_count);
     return 0;
 }

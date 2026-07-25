@@ -1,0 +1,31 @@
+.version 8.8
+.target sm_120a
+.address_size 64
+
+.visible .entry sm120_builtin_probe(
+    .param .u64 output
+)
+{
+    .reg .pred %p;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<3>;
+
+    ld.param.u64 %rd1, [output];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    or.b32 %r3, %r1, %r2;
+    setp.ne.u32 %p, %r3, 0;
+    @%p bra done;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %ntid.y;
+    mov.u32 %r3, %ntid.z;
+    mov.u32 %r4, %nctaid.x;
+    mov.u32 %r5, %nctaid.y;
+    mov.u32 %r6, %nctaid.z;
+    st.global.v4.u32 [%rd1], {%r1, %r2, %r3, %r4};
+    add.s64 %rd2, %rd1, 16;
+    st.global.v2.u32 [%rd2], {%r5, %r6};
+
+done:
+    ret;
+}
