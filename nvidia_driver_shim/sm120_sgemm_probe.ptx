@@ -1,0 +1,635 @@
+.version 8.8
+.target sm_120a
+.address_size 64
+
+.visible .entry sm120_sgemm(
+    .param .u64 matrix_a,
+    .param .u64 matrix_b,
+    .param .u64 matrix_c,
+    .param .u64 matrix_d,
+    .param .u32 rows_m,
+    .param .u32 cols_n,
+    .param .u32 inner_k,
+    .param .u32 leading_a,
+    .param .u32 leading_b,
+    .param .u32 leading_c,
+    .param .u32 leading_d,
+    .param .u32 transpose_a,
+    .param .u32 transpose_b,
+    .param .f32 alpha,
+    .param .f32 beta
+)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<12>;
+    .shared .align 16 .f32 tile_a[256];
+    .shared .align 16 .f32 tile_b[256];
+
+    ld.param.u64 %rd1, [matrix_a];
+    ld.param.u64 %rd2, [matrix_b];
+    ld.param.u64 %rd3, [matrix_c];
+    ld.param.u64 %rd19, [matrix_d];
+    ld.param.u32 %r1, [rows_m];
+    ld.param.u32 %r2, [cols_n];
+    ld.param.u32 %r3, [inner_k];
+    ld.param.u32 %r4, [leading_a];
+    ld.param.u32 %r5, [leading_b];
+    ld.param.u32 %r6, [leading_c];
+    ld.param.u32 %r23, [leading_d];
+    ld.param.u32 %r24, [transpose_a];
+    ld.param.u32 %r25, [transpose_b];
+    ld.param.f32 %f8, [alpha];
+    ld.param.f32 %f9, [beta];
+
+    mov.u32 %r7, %tid.x;
+    mov.u32 %r8, %tid.y;
+    mov.u32 %r9, %ctaid.x;
+    mov.u32 %r10, %ctaid.y;
+    mad.lo.u32 %r11, %r9, 16, %r7;
+    mad.lo.u32 %r12, %r10, 16, %r8;
+    mad.lo.u32 %r13, %r8, 16, %r7;
+    mul.wide.u32 %rd4, %r13, 4;
+    mov.u64 %rd5, tile_a;
+    mov.u64 %rd6, tile_b;
+    add.s64 %rd7, %rd5, %rd4;
+    add.s64 %rd8, %rd6, %rd4;
+
+    mov.f32 %f1, 0f00000000;
+    mov.u32 %r14, 0;
+
+tile_loop:
+    add.u32 %r15, %r14, %r8;
+    setp.lt.u32 %p1, %r11, %r1;
+    setp.lt.u32 %p2, %r15, %r3;
+    and.pred %p3, %p1, %p2;
+    mov.f32 %f2, 0f00000000;
+    @!%p3 bra load_a_done;
+    setp.eq.u32 %p7, %r24, 0;
+    @!%p7 bra load_a_transposed;
+    mad.lo.u32 %r16, %r15, %r4, %r11;
+    bra load_a_address_done;
+load_a_transposed:
+    mad.lo.u32 %r16, %r11, %r4, %r15;
+load_a_address_done:
+    mul.wide.u32 %rd9, %r16, 4;
+    add.s64 %rd10, %rd1, %rd9;
+    ld.global.f32 %f2, [%rd10];
+load_a_done:
+    st.shared.f32 [%rd7], %f2;
+
+    add.u32 %r17, %r14, %r7;
+    setp.lt.u32 %p4, %r17, %r3;
+    setp.lt.u32 %p5, %r12, %r2;
+    and.pred %p6, %p4, %p5;
+    mov.f32 %f3, 0f00000000;
+    @!%p6 bra load_b_done;
+    setp.eq.u32 %p7, %r25, 0;
+    @!%p7 bra load_b_transposed;
+    mad.lo.u32 %r18, %r12, %r5, %r17;
+    bra load_b_address_done;
+load_b_transposed:
+    mad.lo.u32 %r18, %r17, %r5, %r12;
+load_b_address_done:
+    mul.wide.u32 %rd11, %r18, 4;
+    add.s64 %rd12, %rd2, %rd11;
+    ld.global.f32 %f3, [%rd12];
+load_b_done:
+    st.shared.f32 [%rd8], %f3;
+    bar.sync 0;
+
+    mov.u32 %r19, 0;
+inner_loop:
+    mad.lo.u32 %r20, %r19, 16, %r7;
+    mul.wide.u32 %rd13, %r20, 4;
+    add.s64 %rd14, %rd5, %rd13;
+    ld.shared.f32 %f4, [%rd14];
+    mad.lo.u32 %r21, %r8, 16, %r19;
+    mul.wide.u32 %rd15, %r21, 4;
+    add.s64 %rd16, %rd6, %rd15;
+    ld.shared.f32 %f5, [%rd16];
+    fma.rn.f32 %f1, %f4, %f5, %f1;
+    add.u32 %r19, %r19, 1;
+    setp.lt.u32 %p7, %r19, 16;
+    @%p7 bra inner_loop;
+
+    bar.sync 0;
+    add.u32 %r14, %r14, 16;
+    setp.lt.u32 %p7, %r14, %r3;
+    @%p7 bra tile_loop;
+
+    setp.ge.u32 %p1, %r11, %r1;
+    setp.ge.u32 %p2, %r12, %r2;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra done;
+    mad.lo.u32 %r22, %r12, %r6, %r11;
+    mul.wide.u32 %rd17, %r22, 4;
+    add.s64 %rd18, %rd3, %rd17;
+    ld.global.f32 %f6, [%rd18];
+    mul.f32 %f7, %f9, %f6;
+    fma.rn.f32 %f10, %f8, %f1, %f7;
+    mad.lo.u32 %r26, %r12, %r23, %r11;
+    mul.wide.u32 %rd17, %r26, 4;
+    add.s64 %rd18, %rd19, %rd17;
+    st.global.f32 [%rd18], %f10;
+
+done:
+    ret;
+}
+
+.visible .entry sm120_sgemm_wide(
+    .param .u64 matrix_a,
+    .param .u64 matrix_b,
+    .param .u64 matrix_c,
+    .param .u64 matrix_d,
+    .param .u32 rows_m,
+    .param .u32 cols_n,
+    .param .u32 inner_k,
+    .param .u32 leading_a,
+    .param .u32 leading_b,
+    .param .u32 leading_c,
+    .param .u32 leading_d,
+    .param .u32 transpose_a,
+    .param .u32 transpose_b,
+    .param .f32 alpha,
+    .param .f32 beta
+)
+{
+    .reg .pred %wp<8>;
+    .reg .b32 %wr<64>;
+    .reg .b64 %wrd<32>;
+    .reg .f32 %wf<40>;
+    .shared .align 16 .f32 wide_a[1024];
+    .shared .align 16 .f32 wide_b[1024];
+
+    ld.param.u64 %wrd1, [matrix_a];
+    ld.param.u64 %wrd2, [matrix_b];
+    ld.param.u64 %wrd3, [matrix_c];
+    ld.param.u64 %wrd4, [matrix_d];
+    ld.param.u32 %wr1, [rows_m];
+    ld.param.u32 %wr2, [cols_n];
+    ld.param.u32 %wr3, [inner_k];
+    ld.param.u32 %wr4, [leading_a];
+    ld.param.u32 %wr5, [leading_b];
+    ld.param.u32 %wr6, [leading_c];
+    ld.param.u32 %wr7, [leading_d];
+    ld.param.u32 %wr8, [transpose_a];
+    ld.param.u32 %wr9, [transpose_b];
+    ld.param.f32 %wf1, [alpha];
+    ld.param.f32 %wf2, [beta];
+
+    mov.u32 %wr10, %tid.x;
+    mov.u32 %wr11, %tid.y;
+    mov.u32 %wr12, %ctaid.x;
+    mov.u32 %wr13, %ctaid.y;
+    mad.lo.u32 %wr14, %wr12, 64, %wr10;
+    mad.lo.u32 %wr15, %wr13, 64, %wr11;
+    add.u32 %wr16, %wr14, 16;
+    add.u32 %wr17, %wr14, 32;
+    add.u32 %wr18, %wr14, 48;
+    add.u32 %wr19, %wr15, 16;
+    add.u32 %wr20, %wr15, 32;
+    add.u32 %wr21, %wr15, 48;
+
+    mov.f32 %wf10, 0f00000000;
+    mov.f32 %wf11, 0f00000000;
+    mov.f32 %wf12, 0f00000000;
+    mov.f32 %wf13, 0f00000000;
+    mov.f32 %wf14, 0f00000000;
+    mov.f32 %wf15, 0f00000000;
+    mov.f32 %wf16, 0f00000000;
+    mov.f32 %wf17, 0f00000000;
+    mov.f32 %wf18, 0f00000000;
+    mov.f32 %wf19, 0f00000000;
+    mov.f32 %wf20, 0f00000000;
+    mov.f32 %wf21, 0f00000000;
+    mov.f32 %wf22, 0f00000000;
+    mov.f32 %wf23, 0f00000000;
+    mov.f32 %wf24, 0f00000000;
+    mov.f32 %wf25, 0f00000000;
+    mov.u32 %wr22, 0;
+    mov.u64 %wrd5, wide_a;
+    mov.u64 %wrd6, wide_b;
+
+wide_tile_loop:
+    add.u32 %wr23, %wr22, %wr11;
+    setp.lt.u32 %wp1, %wr23, %wr3;
+    setp.eq.u32 %wp2, %wr8, 0;
+
+    mov.f32 %wf3, 0f00000000;
+    setp.lt.u32 %wp3, %wr14, %wr1;
+    and.pred %wp3, %wp3, %wp1;
+    @!%wp3 bra wide_a0_done;
+    @!%wp2 bra wide_a0_t;
+    mad.lo.u32 %wr24, %wr23, %wr4, %wr14;
+    bra wide_a0_addr;
+wide_a0_t:
+    mad.lo.u32 %wr24, %wr14, %wr4, %wr23;
+wide_a0_addr:
+    mul.wide.u32 %wrd7, %wr24, 4;
+    add.s64 %wrd8, %wrd1, %wrd7;
+    ld.global.f32 %wf3, [%wrd8];
+wide_a0_done:
+    mad.lo.u32 %wr25, %wr11, 64, %wr10;
+    mul.wide.u32 %wrd9, %wr25, 4;
+    add.s64 %wrd10, %wrd5, %wrd9;
+    st.shared.f32 [%wrd10], %wf3;
+
+    mov.f32 %wf4, 0f00000000;
+    setp.lt.u32 %wp3, %wr16, %wr1;
+    and.pred %wp3, %wp3, %wp1;
+    @!%wp3 bra wide_a1_done;
+    @!%wp2 bra wide_a1_t;
+    mad.lo.u32 %wr24, %wr23, %wr4, %wr16;
+    bra wide_a1_addr;
+wide_a1_t:
+    mad.lo.u32 %wr24, %wr16, %wr4, %wr23;
+wide_a1_addr:
+    mul.wide.u32 %wrd7, %wr24, 4;
+    add.s64 %wrd8, %wrd1, %wrd7;
+    ld.global.f32 %wf4, [%wrd8];
+wide_a1_done:
+    st.shared.f32 [%wrd10+64], %wf4;
+
+    mov.f32 %wf5, 0f00000000;
+    setp.lt.u32 %wp3, %wr17, %wr1;
+    and.pred %wp3, %wp3, %wp1;
+    @!%wp3 bra wide_a2_done;
+    @!%wp2 bra wide_a2_t;
+    mad.lo.u32 %wr24, %wr23, %wr4, %wr17;
+    bra wide_a2_addr;
+wide_a2_t:
+    mad.lo.u32 %wr24, %wr17, %wr4, %wr23;
+wide_a2_addr:
+    mul.wide.u32 %wrd7, %wr24, 4;
+    add.s64 %wrd8, %wrd1, %wrd7;
+    ld.global.f32 %wf5, [%wrd8];
+wide_a2_done:
+    st.shared.f32 [%wrd10+128], %wf5;
+
+    mov.f32 %wf6, 0f00000000;
+    setp.lt.u32 %wp3, %wr18, %wr1;
+    and.pred %wp3, %wp3, %wp1;
+    @!%wp3 bra wide_a3_done;
+    @!%wp2 bra wide_a3_t;
+    mad.lo.u32 %wr24, %wr23, %wr4, %wr18;
+    bra wide_a3_addr;
+wide_a3_t:
+    mad.lo.u32 %wr24, %wr18, %wr4, %wr23;
+wide_a3_addr:
+    mul.wide.u32 %wrd7, %wr24, 4;
+    add.s64 %wrd8, %wrd1, %wrd7;
+    ld.global.f32 %wf6, [%wrd8];
+wide_a3_done:
+    st.shared.f32 [%wrd10+192], %wf6;
+
+    add.u32 %wr26, %wr22, %wr10;
+    setp.lt.u32 %wp1, %wr26, %wr3;
+    setp.eq.u32 %wp2, %wr9, 0;
+    mad.lo.u32 %wr27, %wr11, 16, %wr10;
+    mul.wide.u32 %wrd11, %wr27, 4;
+    add.s64 %wrd12, %wrd6, %wrd11;
+
+    mov.f32 %wf3, 0f00000000;
+    setp.lt.u32 %wp3, %wr15, %wr2;
+    and.pred %wp3, %wp3, %wp1;
+    @!%wp3 bra wide_b0_done;
+    @!%wp2 bra wide_b0_t;
+    mad.lo.u32 %wr28, %wr15, %wr5, %wr26;
+    bra wide_b0_addr;
+wide_b0_t:
+    mad.lo.u32 %wr28, %wr26, %wr5, %wr15;
+wide_b0_addr:
+    mul.wide.u32 %wrd13, %wr28, 4;
+    add.s64 %wrd14, %wrd2, %wrd13;
+    ld.global.f32 %wf3, [%wrd14];
+wide_b0_done:
+    st.shared.f32 [%wrd12], %wf3;
+
+    mov.f32 %wf4, 0f00000000;
+    setp.lt.u32 %wp3, %wr19, %wr2;
+    and.pred %wp3, %wp3, %wp1;
+    @!%wp3 bra wide_b1_done;
+    @!%wp2 bra wide_b1_t;
+    mad.lo.u32 %wr28, %wr19, %wr5, %wr26;
+    bra wide_b1_addr;
+wide_b1_t:
+    mad.lo.u32 %wr28, %wr26, %wr5, %wr19;
+wide_b1_addr:
+    mul.wide.u32 %wrd13, %wr28, 4;
+    add.s64 %wrd14, %wrd2, %wrd13;
+    ld.global.f32 %wf4, [%wrd14];
+wide_b1_done:
+    st.shared.f32 [%wrd12+1024], %wf4;
+
+    mov.f32 %wf5, 0f00000000;
+    setp.lt.u32 %wp3, %wr20, %wr2;
+    and.pred %wp3, %wp3, %wp1;
+    @!%wp3 bra wide_b2_done;
+    @!%wp2 bra wide_b2_t;
+    mad.lo.u32 %wr28, %wr20, %wr5, %wr26;
+    bra wide_b2_addr;
+wide_b2_t:
+    mad.lo.u32 %wr28, %wr26, %wr5, %wr20;
+wide_b2_addr:
+    mul.wide.u32 %wrd13, %wr28, 4;
+    add.s64 %wrd14, %wrd2, %wrd13;
+    ld.global.f32 %wf5, [%wrd14];
+wide_b2_done:
+    st.shared.f32 [%wrd12+2048], %wf5;
+
+    mov.f32 %wf6, 0f00000000;
+    setp.lt.u32 %wp3, %wr21, %wr2;
+    and.pred %wp3, %wp3, %wp1;
+    @!%wp3 bra wide_b3_done;
+    @!%wp2 bra wide_b3_t;
+    mad.lo.u32 %wr28, %wr21, %wr5, %wr26;
+    bra wide_b3_addr;
+wide_b3_t:
+    mad.lo.u32 %wr28, %wr26, %wr5, %wr21;
+wide_b3_addr:
+    mul.wide.u32 %wrd13, %wr28, 4;
+    add.s64 %wrd14, %wrd2, %wrd13;
+    ld.global.f32 %wf6, [%wrd14];
+wide_b3_done:
+    st.shared.f32 [%wrd12+3072], %wf6;
+    bar.sync 0;
+
+    mov.u32 %wr29, 0;
+wide_inner_loop:
+    mad.lo.u32 %wr30, %wr29, 64, %wr10;
+    mul.wide.u32 %wrd15, %wr30, 4;
+    add.s64 %wrd16, %wrd5, %wrd15;
+    ld.shared.f32 %wf3, [%wrd16];
+    ld.shared.f32 %wf4, [%wrd16+64];
+    ld.shared.f32 %wf5, [%wrd16+128];
+    ld.shared.f32 %wf6, [%wrd16+192];
+
+    mad.lo.u32 %wr31, %wr11, 16, %wr29;
+    mul.wide.u32 %wrd17, %wr31, 4;
+    add.s64 %wrd18, %wrd6, %wrd17;
+    ld.shared.f32 %wf7, [%wrd18];
+    ld.shared.f32 %wf8, [%wrd18+1024];
+    ld.shared.f32 %wf9, [%wrd18+2048];
+    ld.shared.f32 %wf26, [%wrd18+3072];
+
+    fma.rn.f32 %wf10, %wf3, %wf7, %wf10;
+    fma.rn.f32 %wf11, %wf4, %wf7, %wf11;
+    fma.rn.f32 %wf12, %wf5, %wf7, %wf12;
+    fma.rn.f32 %wf13, %wf6, %wf7, %wf13;
+    fma.rn.f32 %wf14, %wf3, %wf8, %wf14;
+    fma.rn.f32 %wf15, %wf4, %wf8, %wf15;
+    fma.rn.f32 %wf16, %wf5, %wf8, %wf16;
+    fma.rn.f32 %wf17, %wf6, %wf8, %wf17;
+    fma.rn.f32 %wf18, %wf3, %wf9, %wf18;
+    fma.rn.f32 %wf19, %wf4, %wf9, %wf19;
+    fma.rn.f32 %wf20, %wf5, %wf9, %wf20;
+    fma.rn.f32 %wf21, %wf6, %wf9, %wf21;
+    fma.rn.f32 %wf22, %wf3, %wf26, %wf22;
+    fma.rn.f32 %wf23, %wf4, %wf26, %wf23;
+    fma.rn.f32 %wf24, %wf5, %wf26, %wf24;
+    fma.rn.f32 %wf25, %wf6, %wf26, %wf25;
+
+    add.u32 %wr29, %wr29, 1;
+    setp.lt.u32 %wp1, %wr29, 16;
+    @%wp1 bra wide_inner_loop;
+    bar.sync 0;
+    add.u32 %wr22, %wr22, 16;
+    setp.lt.u32 %wp1, %wr22, %wr3;
+    @%wp1 bra wide_tile_loop;
+
+    setp.lt.u32 %wp1, %wr14, %wr1;
+    setp.lt.u32 %wp2, %wr15, %wr2;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_01;
+    mad.lo.u32 %wr32, %wr15, %wr6, %wr14;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf10, %wf27;
+    mad.lo.u32 %wr32, %wr15, %wr7, %wr14;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+wide_store_01:
+    setp.lt.u32 %wp1, %wr16, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_02;
+    mad.lo.u32 %wr32, %wr15, %wr6, %wr16;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf11, %wf27;
+    mad.lo.u32 %wr32, %wr15, %wr7, %wr16;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+wide_store_02:
+    setp.lt.u32 %wp1, %wr17, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_03;
+    mad.lo.u32 %wr32, %wr15, %wr6, %wr17;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf12, %wf27;
+    mad.lo.u32 %wr32, %wr15, %wr7, %wr17;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+wide_store_03:
+    setp.lt.u32 %wp1, %wr18, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_10;
+    mad.lo.u32 %wr32, %wr15, %wr6, %wr18;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf13, %wf27;
+    mad.lo.u32 %wr32, %wr15, %wr7, %wr18;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+
+wide_store_10:
+    setp.lt.u32 %wp2, %wr19, %wr2;
+    setp.lt.u32 %wp1, %wr14, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_11;
+    mad.lo.u32 %wr32, %wr19, %wr6, %wr14;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf14, %wf27;
+    mad.lo.u32 %wr32, %wr19, %wr7, %wr14;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+wide_store_11:
+    setp.lt.u32 %wp1, %wr16, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_12;
+    mad.lo.u32 %wr32, %wr19, %wr6, %wr16;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf15, %wf27;
+    mad.lo.u32 %wr32, %wr19, %wr7, %wr16;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+wide_store_12:
+    setp.lt.u32 %wp1, %wr17, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_13;
+    mad.lo.u32 %wr32, %wr19, %wr6, %wr17;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf16, %wf27;
+    mad.lo.u32 %wr32, %wr19, %wr7, %wr17;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+wide_store_13:
+    setp.lt.u32 %wp1, %wr18, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_20;
+    mad.lo.u32 %wr32, %wr19, %wr6, %wr18;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf17, %wf27;
+    mad.lo.u32 %wr32, %wr19, %wr7, %wr18;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+
+wide_store_20:
+    setp.lt.u32 %wp2, %wr20, %wr2;
+    setp.lt.u32 %wp1, %wr14, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_21;
+    mad.lo.u32 %wr32, %wr20, %wr6, %wr14;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf18, %wf27;
+    mad.lo.u32 %wr32, %wr20, %wr7, %wr14;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+wide_store_21:
+    setp.lt.u32 %wp1, %wr16, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_22;
+    mad.lo.u32 %wr32, %wr20, %wr6, %wr16;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf19, %wf27;
+    mad.lo.u32 %wr32, %wr20, %wr7, %wr16;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+wide_store_22:
+    setp.lt.u32 %wp1, %wr17, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_23;
+    mad.lo.u32 %wr32, %wr20, %wr6, %wr17;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf20, %wf27;
+    mad.lo.u32 %wr32, %wr20, %wr7, %wr17;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+wide_store_23:
+    setp.lt.u32 %wp1, %wr18, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_30;
+    mad.lo.u32 %wr32, %wr20, %wr6, %wr18;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf21, %wf27;
+    mad.lo.u32 %wr32, %wr20, %wr7, %wr18;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+
+wide_store_30:
+    setp.lt.u32 %wp2, %wr21, %wr2;
+    setp.lt.u32 %wp1, %wr14, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_31;
+    mad.lo.u32 %wr32, %wr21, %wr6, %wr14;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf22, %wf27;
+    mad.lo.u32 %wr32, %wr21, %wr7, %wr14;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+wide_store_31:
+    setp.lt.u32 %wp1, %wr16, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_32;
+    mad.lo.u32 %wr32, %wr21, %wr6, %wr16;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf23, %wf27;
+    mad.lo.u32 %wr32, %wr21, %wr7, %wr16;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+wide_store_32:
+    setp.lt.u32 %wp1, %wr17, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_store_33;
+    mad.lo.u32 %wr32, %wr21, %wr6, %wr17;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf24, %wf27;
+    mad.lo.u32 %wr32, %wr21, %wr7, %wr17;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+wide_store_33:
+    setp.lt.u32 %wp1, %wr18, %wr1;
+    and.pred %wp3, %wp1, %wp2;
+    @!%wp3 bra wide_done;
+    mad.lo.u32 %wr32, %wr21, %wr6, %wr18;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd3, %wrd19;
+    ld.global.f32 %wf27, [%wrd20];
+    mul.f32 %wf27, %wf2, %wf27;
+    fma.rn.f32 %wf28, %wf1, %wf25, %wf27;
+    mad.lo.u32 %wr32, %wr21, %wr7, %wr18;
+    mul.wide.u32 %wrd19, %wr32, 4;
+    add.s64 %wrd20, %wrd4, %wrd19;
+    st.global.f32 [%wrd20], %wf28;
+
+wide_done:
+    ret;
+}

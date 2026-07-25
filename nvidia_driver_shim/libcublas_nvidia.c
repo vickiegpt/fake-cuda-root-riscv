@@ -1,3 +1,7 @@
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <limits.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +11,13 @@ typedef uint64_t lanxin_CUdeviceptr;
 
 extern int cuMemcpyDtoH_v2(void *dstHost, lanxin_CUdeviceptr srcDevice, size_t ByteCount);
 extern int cuMemcpyHtoD_v2(lanxin_CUdeviceptr dstDevice, const void *srcHost, size_t ByteCount);
+extern int cuModuleLoad(void **module, const char *fname);
+extern int cuModuleGetFunction(void **function, void *module, const char *name);
+extern int cuLaunchKernel(void *function,
+                          unsigned int grid_x, unsigned int grid_y, unsigned int grid_z,
+                          unsigned int block_x, unsigned int block_y, unsigned int block_z,
+                          unsigned int shared_mem_bytes, void *stream,
+                          void **kernel_params, void **extra);
 
 typedef void *cudaStream_t;
 typedef int cudaDataType;
@@ -88,6 +99,224 @@ struct lanxin_cublaslt_layout {
     int32_t batch_count;
     int64_t stride;
 };
+
+static int lanxin_cublas_trace_enabled(void);
+
+static pthread_mutex_t lanxin_gpu_kernel_lock = PTHREAD_MUTEX_INITIALIZER;
+static void *lanxin_sgemm_module;
+static void *lanxin_sgemm_function;
+static void *lanxin_sgemm_wide_function;
+static int lanxin_sgemm_load_attempted;
+static void *lanxin_hgemm_module;
+static void *lanxin_hgemm_function;
+static int lanxin_hgemm_load_attempted;
+
+static int lanxin_env_enabled(const char *name)
+{
+    const char *value = getenv(name);
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static int lanxin_sgemm_load_locked(void)
+{
+    char derived_path[PATH_MAX];
+    const char *path = getenv("LANXIN_NVIDIA_CUBLAS_SGEMM_CUBIN");
+
+    if (lanxin_sgemm_load_attempted) {
+        return lanxin_sgemm_function != NULL ? 0 : -1;
+    }
+    lanxin_sgemm_load_attempted = 1;
+    if (path == NULL || path[0] == '\0') {
+        Dl_info info;
+        if (dladdr((const void *)&lanxin_sgemm_load_locked, &info) == 0 ||
+            info.dli_fname == NULL ||
+            snprintf(derived_path, sizeof(derived_path), "%s", info.dli_fname) >=
+                (int)sizeof(derived_path)) {
+            return -1;
+        }
+        char *slash = strrchr(derived_path, '/');
+        if (slash == NULL) {
+            return -1;
+        }
+        *slash = '\0';
+        size_t used = strlen(derived_path);
+        const char suffix[] = "/../nvidia_driver_shim/sm120_sgemm.cubin";
+        if (used + sizeof(suffix) > sizeof(derived_path)) {
+            return -1;
+        }
+        memcpy(derived_path + used, suffix, sizeof(suffix));
+        path = derived_path;
+    }
+    if (cuModuleLoad(&lanxin_sgemm_module, path) != LANXIN_CUDA_SUCCESS ||
+        cuModuleGetFunction(&lanxin_sgemm_function, lanxin_sgemm_module,
+                            "sm120_sgemm") != LANXIN_CUDA_SUCCESS ||
+        cuModuleGetFunction(&lanxin_sgemm_wide_function, lanxin_sgemm_module,
+                            "sm120_sgemm_wide") != LANXIN_CUDA_SUCCESS) {
+        lanxin_sgemm_module = NULL;
+        lanxin_sgemm_function = NULL;
+        lanxin_sgemm_wide_function = NULL;
+        return -1;
+    }
+    if (lanxin_cublas_trace_enabled()) {
+        fprintf(stderr, "lanxin-cublas: loaded GPU SGEMM cubin %s\n", path);
+    }
+    return 0;
+}
+
+static int lanxin_hgemm_load_locked(void)
+{
+    char derived_path[PATH_MAX];
+    const char *path = getenv("LANXIN_NVIDIA_CUBLAS_HGEMM_CUBIN");
+
+    if (lanxin_hgemm_load_attempted) {
+        return lanxin_hgemm_function != NULL ? 0 : -1;
+    }
+    lanxin_hgemm_load_attempted = 1;
+    if (path == NULL || path[0] == '\0') {
+        Dl_info info;
+        if (dladdr((const void *)&lanxin_hgemm_load_locked, &info) == 0 ||
+            info.dli_fname == NULL ||
+            snprintf(derived_path, sizeof(derived_path), "%s", info.dli_fname) >=
+                (int)sizeof(derived_path)) {
+            return -1;
+        }
+        char *slash = strrchr(derived_path, '/');
+        if (slash == NULL) {
+            return -1;
+        }
+        *slash = '\0';
+        size_t used = strlen(derived_path);
+        const char suffix[] = "/../nvidia_driver_shim/sm120_hgemm_wmma.cubin";
+        if (used + sizeof(suffix) > sizeof(derived_path)) {
+            return -1;
+        }
+        memcpy(derived_path + used, suffix, sizeof(suffix));
+        path = derived_path;
+    }
+    if (cuModuleLoad(&lanxin_hgemm_module, path) != LANXIN_CUDA_SUCCESS ||
+        cuModuleGetFunction(&lanxin_hgemm_function, lanxin_hgemm_module,
+                            "sm120_hgemm_wmma") != LANXIN_CUDA_SUCCESS) {
+        lanxin_hgemm_module = NULL;
+        lanxin_hgemm_function = NULL;
+        return -1;
+    }
+    if (lanxin_cublas_trace_enabled()) {
+        fprintf(stderr, "lanxin-cublas: loaded GPU HGEMM cubin %s\n", path);
+    }
+    return 0;
+}
+
+static cublasStatus_t lanxin_gemm_gpu(cublasOperation_t transa,
+                                      cublasOperation_t transb,
+                                      int m, int n, int k,
+                                      const void *alpha, const void *A,
+                                      cudaDataType Atype, int lda,
+                                      const void *B, cudaDataType Btype, int ldb,
+                                      const void *beta, const void *C,
+                                      cudaDataType Ctype, int ldc,
+                                      void *D, cudaDataType Dtype, int ldd,
+                                      cublasComputeType_t computeType)
+{
+    if (m <= 0 || n <= 0 || k <= 0 || alpha == NULL || beta == NULL ||
+        A == NULL || B == NULL || D == NULL ||
+        computeType != LANXIN_CUBLAS_COMPUTE_32F) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+
+    float alpha_value = *(const float *)alpha;
+    float beta_value = *(const float *)beta;
+    if (Atype == LANXIN_CUDA_R_16F && Btype == LANXIN_CUDA_R_16F &&
+        Ctype == LANXIN_CUDA_R_32F && Dtype == LANXIN_CUDA_R_32F &&
+        transa == LANXIN_CUBLAS_OP_N && transb == LANXIN_CUBLAS_OP_N &&
+        (m & 15) == 0 && (n & 15) == 0 && (k & 15) == 0 &&
+        alpha_value == 1.0f && beta_value == 0.0f) {
+        pthread_mutex_lock(&lanxin_gpu_kernel_lock);
+        int load_rc = lanxin_hgemm_load_locked();
+        pthread_mutex_unlock(&lanxin_gpu_kernel_lock);
+        if (load_rc != 0) {
+            return CUBLAS_STATUS_NOT_SUPPORTED;
+        }
+        lanxin_CUdeviceptr device_a = (lanxin_CUdeviceptr)(uintptr_t)A;
+        lanxin_CUdeviceptr device_b = (lanxin_CUdeviceptr)(uintptr_t)B;
+        lanxin_CUdeviceptr device_d = (lanxin_CUdeviceptr)(uintptr_t)D;
+        uint32_t rows_m = (uint32_t)m;
+        uint32_t cols_n = (uint32_t)n;
+        uint32_t inner_k = (uint32_t)k;
+        uint32_t leading_a = (uint32_t)lda;
+        uint32_t leading_b = (uint32_t)ldb;
+        uint32_t leading_d = (uint32_t)ldd;
+        void *params[] = {
+            &device_a, &device_b, &device_d,
+            &rows_m, &cols_n, &inner_k,
+            &leading_a, &leading_b, &leading_d
+        };
+        uint32_t tiles = (rows_m / 16U) * (cols_n / 16U);
+        int launch_rc = cuLaunchKernel(lanxin_hgemm_function,
+                                       (tiles + 7U) / 8U, 1, 1,
+                                       256, 1, 1, 0, NULL, params, NULL);
+        if (lanxin_cublas_trace_enabled()) {
+            fprintf(stderr,
+                    "lanxin-cublas: GPU hgemm-wmma m=%d n=%d k=%d "
+                    "ld=%d,%d,%d launch_rc=%d\n",
+                    m, n, k, lda, ldb, ldd, launch_rc);
+        }
+        return launch_rc == LANXIN_CUDA_SUCCESS ?
+               CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+
+    if (Atype != LANXIN_CUDA_R_32F || Btype != LANXIN_CUDA_R_32F ||
+        Ctype != LANXIN_CUDA_R_32F || Dtype != LANXIN_CUDA_R_32F ||
+        (transa != LANXIN_CUBLAS_OP_N && transa != LANXIN_CUBLAS_OP_T &&
+         transa != LANXIN_CUBLAS_OP_C) ||
+        (transb != LANXIN_CUBLAS_OP_N && transb != LANXIN_CUBLAS_OP_T &&
+         transb != LANXIN_CUBLAS_OP_C)) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+
+    pthread_mutex_lock(&lanxin_gpu_kernel_lock);
+    int load_rc = lanxin_sgemm_load_locked();
+    pthread_mutex_unlock(&lanxin_gpu_kernel_lock);
+    if (load_rc != 0) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+
+    lanxin_CUdeviceptr device_a = (lanxin_CUdeviceptr)(uintptr_t)A;
+    lanxin_CUdeviceptr device_b = (lanxin_CUdeviceptr)(uintptr_t)B;
+    lanxin_CUdeviceptr device_d = (lanxin_CUdeviceptr)(uintptr_t)D;
+    lanxin_CUdeviceptr device_c =
+        (lanxin_CUdeviceptr)(uintptr_t)(C != NULL ? C : D);
+    uint32_t rows_m = (uint32_t)m;
+    uint32_t cols_n = (uint32_t)n;
+    uint32_t inner_k = (uint32_t)k;
+    uint32_t leading_a = (uint32_t)lda;
+    uint32_t leading_b = (uint32_t)ldb;
+    uint32_t leading_c = (uint32_t)ldc;
+    uint32_t leading_d = (uint32_t)ldd;
+    uint32_t transpose_a = transa == LANXIN_CUBLAS_OP_N ? 0U : 1U;
+    uint32_t transpose_b = transb == LANXIN_CUBLAS_OP_N ? 0U : 1U;
+    void *params[] = {
+        &device_a, &device_b, &device_c, &device_d,
+        &rows_m, &cols_n, &inner_k,
+        &leading_a, &leading_b, &leading_c, &leading_d,
+        &transpose_a, &transpose_b, &alpha_value, &beta_value
+    };
+    int use_wide = rows_m >= 64U && cols_n >= 64U &&
+                   !lanxin_env_enabled("LANXIN_NVIDIA_CUBLAS_DISABLE_WIDE");
+    void *function = use_wide ? lanxin_sgemm_wide_function : lanxin_sgemm_function;
+    uint32_t tile = use_wide ? 64U : 16U;
+    int launch_rc = cuLaunchKernel(function,
+                                   (rows_m + tile - 1U) / tile,
+                                   (cols_n + tile - 1U) / tile, 1,
+                                   16, 16, 1, 0, NULL, params, NULL);
+    if (lanxin_cublas_trace_enabled()) {
+        fprintf(stderr,
+                "lanxin-cublas: GPU sgemm m=%d n=%d k=%d trans=%d,%d "
+                "ld=%d,%d,%d,%d tile=%u launch_rc=%d\n",
+                m, n, k, transa, transb, lda, ldb, ldc, ldd, tile, launch_rc);
+    }
+    return launch_rc == LANXIN_CUDA_SUCCESS ?
+           CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_NOT_SUPPORTED;
+}
 
 static size_t lanxin_dtype_size(cudaDataType type)
 {
@@ -358,6 +587,17 @@ static cublasStatus_t lanxin_gemm_one(cublasOperation_t transa, cublasOperation_
         lanxin_matrix_bytes(LANXIN_CUBLAS_OP_N, m, n, ldc, csz, &c_bytes) != 0 ||
         lanxin_matrix_bytes(LANXIN_CUBLAS_OP_N, m, n, ldd, dsz, &d_bytes) != 0) {
         return CUBLAS_STATUS_INVALID_VALUE;
+    }
+
+    cublasStatus_t gpu_status =
+        lanxin_gemm_gpu(transa, transb, m, n, k, alpha, A, Atype, lda,
+                        B, Btype, ldb, beta, C, Ctype, ldc,
+                        D, Dtype, ldd, computeType);
+    if (gpu_status == CUBLAS_STATUS_SUCCESS) {
+        return gpu_status;
+    }
+    if (lanxin_env_enabled("LANXIN_NVIDIA_CUBLAS_GPU_ONLY")) {
+        return gpu_status;
     }
 
     beta_value = beta != NULL ? lanxin_read_scalar(beta, computeType, Dtype) : 0.0;

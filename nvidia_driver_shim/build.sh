@@ -36,14 +36,64 @@ ln -sfn libcudart_nvidia.so.12 "$ROOT/lib64/libcudart.so"
   -Wl,-soname,libcublas.so.12 \
   -o "$ROOT/lib64/libcublas_nvidia.so.12" \
   "$ROOT/nvidia_driver_shim/libcublas_nvidia.c" \
-  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" -l:libcuda_nvidia.so.1
+  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" -l:libcuda_nvidia.so.1 -ldl -lpthread
 ln -sfn libcublas_nvidia.so.12 "$ROOT/lib64/libcublas.so.12"
 ln -sfn libcublas_nvidia.so.12 "$ROOT/lib64/libcublas.so"
+
+QEMU_X86_64="${LANXIN_QEMU_X86_64:-/mnt/probe_nvme0n1p4/models/.lanxin-build/qemu-user-riscv/root/usr/bin/qemu-x86_64}"
+CUDA_X86_SYSROOT="${LANXIN_CUDA_X86_64_SYSROOT:-/home/ubuntu/toolchains/cuda-x86_64-12.9/sysroot}"
+CUDA_X86_PTXAS="${LANXIN_CUDA_X86_64_PTXAS:-/home/ubuntu/toolchains/cuda-x86_64-12.9/usr/local/cuda-12.9/bin/ptxas}"
+SGEMM_CUBIN="$ROOT/nvidia_driver_shim/sm120_sgemm.cubin"
+HGEMM_CUBIN="$ROOT/nvidia_driver_shim/sm120_hgemm_wmma.cubin"
+if [[ -x "$QEMU_X86_64" && -x "$CUDA_X86_PTXAS" ]]; then
+  "$QEMU_X86_64" -L "$CUDA_X86_SYSROOT" "$CUDA_X86_PTXAS" \
+    -arch=sm_120a -o "$SGEMM_CUBIN" \
+    "$ROOT/nvidia_driver_shim/sm120_sgemm_probe.ptx"
+  "$QEMU_X86_64" -L "$CUDA_X86_SYSROOT" "$CUDA_X86_PTXAS" \
+    -arch=sm_120a -o "$HGEMM_CUBIN" \
+    "$ROOT/nvidia_driver_shim/sm120_hgemm_wmma.ptx"
+elif [[ ! -s "$SGEMM_CUBIN" || ! -s "$HGEMM_CUBIN" ]]; then
+  echo "missing SM120 assembler; set LANXIN_QEMU_X86_64 and LANXIN_CUDA_X86_64_PTXAS" >&2
+fi
 
 "$CC" -O2 -g -Wall -Wextra -I"$ROOT/include" \
   -o "$ROOT/nvidia_driver_shim/build/cuda_probe" \
   "$ROOT/nvidia_driver_shim/cuda_probe.c" \
   -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" -l:libcuda_nvidia.so.1
+
+"$CC" -O2 -g -Wall -Wextra -I"$ROOT/include" \
+  -o "$ROOT/nvidia_driver_shim/build/sm120_sgemm_probe" \
+  "$ROOT/nvidia_driver_shim/sm120_sgemm_probe.c" \
+  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" -l:libcuda_nvidia.so.1 -lm
+
+"$CC" -O2 -g -Wall -Wextra -I"$ROOT/include" \
+  -o "$ROOT/nvidia_driver_shim/build/sm120_hgemm_wmma_probe" \
+  "$ROOT/nvidia_driver_shim/sm120_hgemm_wmma_probe.c" \
+  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" -l:libcuda_nvidia.so.1 -lm
+
+"$CC" -O2 -g -Wall -Wextra -I"$ROOT/include" \
+  -o "$ROOT/nvidia_driver_shim/build/cublas_probe" \
+  "$ROOT/nvidia_driver_shim/cublas_probe.c" \
+  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" \
+  -l:libcublas_nvidia.so.12 -l:libcuda_nvidia.so.1 -lm
+
+"$CC" -O2 -g -Wall -Wextra -I"$ROOT/include" \
+  -o "$ROOT/nvidia_driver_shim/build/cublas_sgemm_bench" \
+  "$ROOT/nvidia_driver_shim/cublas_sgemm_bench.c" \
+  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" \
+  -l:libcublas_nvidia.so.12 -l:libcuda_nvidia.so.1 -lm
+
+"$CC" -O2 -g -Wall -Wextra -I"$ROOT/include" \
+  -o "$ROOT/nvidia_driver_shim/build/cublas_hgemm_bench" \
+  "$ROOT/nvidia_driver_shim/cublas_hgemm_bench.c" \
+  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" \
+  -l:libcublas_nvidia.so.12 -l:libcuda_nvidia.so.1 -lm
+
+"$CC" -O2 -g -Wall -Wextra -I"$ROOT/include" \
+  -o "$ROOT/nvidia_driver_shim/build/cublas_sgemm_transpose_probe" \
+  "$ROOT/nvidia_driver_shim/cublas_sgemm_transpose_probe.c" \
+  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" \
+  -l:libcublas_nvidia.so.12 -l:libcuda_nvidia.so.1 -lm
 
 "$CC" -O2 -g -Wall -Wextra -I"$ROOT/include" \
   -o "$ROOT/nvidia_driver_shim/build/launch_probe" \
@@ -93,6 +143,12 @@ echo "built $ROOT/nvidia_driver_shim/build/api_probe"
 echo "built $ROOT/nvidia_driver_shim/build/module_image_probe"
 echo "built $ROOT/nvidia_driver_shim/build/cubin_launch_probe"
 echo "built $ROOT/nvidia_driver_shim/build/sm120_qmd_probe"
+echo "built $ROOT/nvidia_driver_shim/build/sm120_sgemm_probe"
+echo "built $ROOT/nvidia_driver_shim/build/sm120_hgemm_wmma_probe"
+echo "built $ROOT/nvidia_driver_shim/build/cublas_probe"
+echo "built $ROOT/nvidia_driver_shim/build/cublas_sgemm_bench"
+echo "built $ROOT/nvidia_driver_shim/build/cublas_hgemm_bench"
+echo "built $ROOT/nvidia_driver_shim/build/cublas_sgemm_transpose_probe"
 echo "built $ROOT/nvidia_driver_shim/build/rm_probe"
 echo "built $ROOT/nvidia_driver_shim/build/channel_probe"
 echo "built $ROOT/nvidia_driver_shim/build/nvidia-smi"

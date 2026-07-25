@@ -1,0 +1,97 @@
+.version 8.8
+.target sm_120a
+.address_size 64
+
+.visible .entry sm120_hgemm_wmma(
+    .param .u64 matrix_a,
+    .param .u64 matrix_b,
+    .param .u64 matrix_c,
+    .param .u32 rows_m,
+    .param .u32 cols_n,
+    .param .u32 inner_k,
+    .param .u32 leading_a,
+    .param .u32 leading_b,
+    .param .u32 leading_c
+)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .b32 %a<8>;
+    .reg .b32 %b<8>;
+    .reg .f32 %c<8>;
+    .reg .f32 %d<8>;
+
+    ld.param.u64 %rd1, [matrix_a];
+    ld.param.u64 %rd2, [matrix_b];
+    ld.param.u64 %rd3, [matrix_c];
+    ld.param.u32 %r1, [rows_m];
+    ld.param.u32 %r2, [cols_n];
+    ld.param.u32 %r3, [inner_k];
+    ld.param.u32 %r4, [leading_a];
+    ld.param.u32 %r5, [leading_b];
+    ld.param.u32 %r6, [leading_c];
+
+    mov.u32 %r7, %tid.x;
+    shr.u32 %r8, %r7, 5;
+    mov.u32 %r9, %ctaid.x;
+    mad.lo.u32 %r10, %r9, 8, %r8;
+    shr.u32 %r11, %r1, 4;
+    shr.u32 %r12, %r2, 4;
+    mul.lo.u32 %r13, %r11, %r12;
+    setp.ge.u32 %p1, %r10, %r13;
+    @%p1 bra done;
+    rem.u32 %r14, %r10, %r11;
+    div.u32 %r15, %r10, %r11;
+    shl.b32 %r16, %r14, 4;
+    shl.b32 %r17, %r15, 4;
+
+    mov.f32 %c0, 0f00000000;
+    mov.f32 %c1, 0f00000000;
+    mov.f32 %c2, 0f00000000;
+    mov.f32 %c3, 0f00000000;
+    mov.f32 %c4, 0f00000000;
+    mov.f32 %c5, 0f00000000;
+    mov.f32 %c6, 0f00000000;
+    mov.f32 %c7, 0f00000000;
+    mov.u32 %r18, 0;
+
+k_loop:
+    mad.lo.u32 %r19, %r18, %r4, %r16;
+    mul.wide.u32 %rd4, %r19, 2;
+    add.s64 %rd5, %rd1, %rd4;
+    mad.lo.u32 %r20, %r17, %r5, %r18;
+    mul.wide.u32 %rd6, %r20, 2;
+    add.s64 %rd7, %rd2, %rd6;
+
+    wmma.load.a.sync.aligned.col.m16n16k16.global.f16
+        {%a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7}, [%rd5], %r4;
+    wmma.load.b.sync.aligned.col.m16n16k16.global.f16
+        {%b0, %b1, %b2, %b3, %b4, %b5, %b6, %b7}, [%rd7], %r5;
+    wmma.mma.sync.aligned.col.col.m16n16k16.f32.f32
+        {%d0, %d1, %d2, %d3, %d4, %d5, %d6, %d7},
+        {%a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7},
+        {%b0, %b1, %b2, %b3, %b4, %b5, %b6, %b7},
+        {%c0, %c1, %c2, %c3, %c4, %c5, %c6, %c7};
+    mov.f32 %c0, %d0;
+    mov.f32 %c1, %d1;
+    mov.f32 %c2, %d2;
+    mov.f32 %c3, %d3;
+    mov.f32 %c4, %d4;
+    mov.f32 %c5, %d5;
+    mov.f32 %c6, %d6;
+    mov.f32 %c7, %d7;
+
+    add.u32 %r18, %r18, 16;
+    setp.lt.u32 %p2, %r18, %r3;
+    @%p2 bra k_loop;
+
+    mad.lo.u32 %r21, %r17, %r6, %r16;
+    mul.wide.u32 %rd8, %r21, 4;
+    add.s64 %rd9, %rd3, %rd8;
+    wmma.store.d.sync.aligned.col.m16n16k16.global.f32
+        [%rd9], {%d0, %d1, %d2, %d3, %d4, %d5, %d6, %d7}, %r6;
+
+done:
+    ret;
+}

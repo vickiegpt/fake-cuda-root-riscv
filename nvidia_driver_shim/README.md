@@ -10,7 +10,9 @@ Current boundary:
 - Real RM object/pushbuffer scaffold: compute object allocation probes `BLACKWELL_COMPUTE_B/A`, falls back through Hopper/Ampere classes, calls `NV906F_CTRL_GET_CLASS_ENGINEID`, writes a C46F-format compute `SET_OBJECT` + `NO_OPERATION` + `PIPE_NOP` pushbuffer, submits a paired progress-tracker semaphore pushbuffer, and verifies HOST consumption through a completion record.
 - Real Blackwell launch path: `cuLaunchKernel` stages code, arguments, a 384-byte QMD 5.0 descriptor in a 64-slot ring, and completion state into RM memory mapped into the channel VASpace. It parses ELF `.text.<kernel>`, `.nv.info.<kernel>`, `.nv.constant0.<kernel>`, `EIATTR_PARAM_CBANK`, and `EIATTR_KPARAM_INFO`, so both standard `kernelParams` and `CU_LAUNCH_PARAM_BUFFER_*` ABIs use the cubin's declared argument layout. QMD submission uses Blackwell `SEND_PCAS_A` plus `SEND_SIGNALING_PCAS2_B`; a HOST WFI semaphore verifies that all preceding compute work completed.
 - Verified hardware result: an official CUDA 12.9 `ptxas` SM120 cubin launched through this path writes `42` to an RM-allocated GPU-visible pointer with both argument ABIs, including repeated launches. The transitional Blackwell loader patches the private global descriptor bit in staged simple global-memory SASS; this is enough for the probe but is not a substitute for complete CUDA relocation and descriptor handling.
-- Remaining performance boundary: `libcublas_nvidia.so.12` is still a CPU implementation and the shim does not yet implement the full CUDA stream, event, graph, texture, relocation, tensor-core, or cuBLAS semantics needed for RTX 5090 GEMM/LLM peak throughput. The verified path establishes real SM execution and completion, not theoretical tensor throughput.
+- Real GPU cuBLAS subset: `cublasSgemm`, FP32 `cublasGemmEx`, and FP32 `cublasLtMatmul` use a checked SM120 16x16 kernel for skinny matrices and a 64x64 register-tiled kernel for larger matrices. FP16-input/FP32-output `cublasGemmEx` uses SM120 WMMA when M/N/K are multiples of 16, both operands are non-transposed, and alpha/beta are 1/0. Set `LANXIN_NVIDIA_CUBLAS_GPU_ONLY=1` to fail closed instead of using the compatibility CPU path for unsupported combinations.
+- Verified performance on the Lanxin RTX 5090 path: the sustained GPU-only FP32 result reaches 15.0 TFLOP/s at 4096x4096x4096; FP16 WMMA through `cublasGemmEx` reaches 49.7 TFLOP/s at the same shape. Both results include completion synchronization and full output validation with zero mismatches. These kernels are bring-up implementations, not Blackwell TCGEN05/NVFP4 peak kernels.
+- Remaining performance boundary: the shim does not yet implement TCGEN05/NVFP4, full cubin relocation, complete CUDA stream/event/graph/texture semantics, or the complete cuBLAS surface needed for production RTX 5090 LLM peak throughput.
 - Known boundary: simple CPU BAR1 mapping of `NV01_MEMORY_LOCAL_USER` VRAM returns `NV_ERR_NOT_SUPPORTED` on this driver path, so current `cuMemAlloc` uses RM-backed sysmem rather than mappable VRAM.
 
 Build:
@@ -37,7 +39,16 @@ LANXIN_NVIDIA_CUDA_TRACE=1 LANXIN_NVIDIA_CUDA_CODE_STAGE_TEXT=1 LANXIN_NVIDIA_CU
 ./nvidia_driver_shim/llm_demo.sh
 LANXIN_LLM_TRACE=1 ./nvidia_driver_shim/llm_demo.sh
 ./nvidia_driver_shim/build/channel_probe
+LANXIN_NVIDIA_CUBLAS_GPU_ONLY=1 ./nvidia_driver_shim/build/cublas_probe
+LANXIN_NVIDIA_CUBLAS_GPU_ONLY=1 ./nvidia_driver_shim/build/cublas_sgemm_transpose_probe
+LANXIN_NVIDIA_CUBLAS_GPU_ONLY=1 ./nvidia_driver_shim/build/cublas_sgemm_bench 4096 4096 4096 3
+LANXIN_NVIDIA_CUBLAS_GPU_ONLY=1 ./nvidia_driver_shim/build/cublas_hgemm_bench 4096 4096 4096 5
 ```
+
+The build uses the official CUDA 12.9 x86-64 `ptxas` through user-mode QEMU on
+the RISC-V host. Override `LANXIN_QEMU_X86_64`,
+`LANXIN_CUDA_X86_64_SYSROOT`, and `LANXIN_CUDA_X86_64_PTXAS` when those
+tools are installed outside the Lanxin evaluation paths.
 
 Useful environment overrides:
 
