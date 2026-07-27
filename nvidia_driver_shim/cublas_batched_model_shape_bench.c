@@ -16,7 +16,7 @@ static double now_ms(void) {
 
 static int run_case(cublasHandle_t handle, int m, int n, int k,
                     cudaDataType output_type,
-                    cublasComputeType_t compute_type) {
+                    cublasComputeType_t compute_type, int iterations) {
     const size_t half_size = sizeof(uint16_t);
     const size_t output_size =
         output_type == CUDA_R_32F ? sizeof(float) : sizeof(uint16_t);
@@ -64,26 +64,54 @@ static int run_case(cublasHandle_t handle, int m, int n, int k,
     }
 
     double begin = now_ms();
-    cublasStatus_t status = cublasGemmBatchedEx(
-        handle, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, alpha,
-        (const void *const *)(uintptr_t)a_array, CUDA_R_16F, k,
-        (const void *const *)(uintptr_t)b_array, CUDA_R_16F, k, beta,
-        (void *const *)(uintptr_t)c_array, output_type, m, BATCH_COUNT,
-        compute_type, CUBLAS_GEMM_DEFAULT);
-    CUresult sync_status = cuCtxSynchronize();
+    cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+    CUresult sync_status = CUDA_SUCCESS;
+    int completed = 0;
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        status = cublasGemmBatchedEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, alpha,
+            (const void *const *)(uintptr_t)a_array, CUDA_R_16F, k,
+            (const void *const *)(uintptr_t)b_array, CUDA_R_16F, k, beta,
+            (void *const *)(uintptr_t)c_array, output_type, m, BATCH_COUNT,
+            compute_type, CUBLAS_GEMM_DEFAULT);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            break;
+        }
+        sync_status = cuCtxSynchronize();
+        if (sync_status != CUDA_SUCCESS) {
+            break;
+        }
+        ++completed;
+    }
     double elapsed_ms = now_ms() - begin;
     double gflops =
-        2.0 * (double)m * (double)n * (double)k * BATCH_COUNT /
+        2.0 * (double)m * (double)n * (double)k * BATCH_COUNT * completed /
         elapsed_ms / 1.0e6;
-    printf("m=%d n=%d k=%d batch=%d output=%s status=%d sync=%d "
+    printf("m=%d n=%d k=%d batch=%d iterations=%d completed=%d output=%s "
+           "status=%d sync=%d "
            "elapsed_ms=%.3f gflops=%.3f\n",
-           m, n, k, BATCH_COUNT,
+           m, n, k, BATCH_COUNT, iterations, completed,
            output_type == CUDA_R_32F ? "f32" : "f16",
            status, sync_status, elapsed_ms, gflops);
-    return status == CUBLAS_STATUS_SUCCESS && sync_status == CUDA_SUCCESS ? 0 : 5;
+    return completed == iterations ? 0 : 5;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    int iterations = 1;
+    if (argc > 2) {
+        fprintf(stderr, "usage: %s [iterations]\n", argv[0]);
+        return 64;
+    }
+    if (argc == 2) {
+        char *end = NULL;
+        long parsed = strtol(argv[1], &end, 10);
+        if (!end || *end || parsed < 1 || parsed > 10000) {
+            fprintf(stderr, "iterations must be between 1 and 10000\n");
+            return 64;
+        }
+        iterations = (int)parsed;
+    }
+
     CUdevice device;
     CUcontext context = NULL;
     cublasHandle_t handle = NULL;
@@ -94,10 +122,10 @@ int main(void) {
         return 1;
     }
     int rc = run_case(handle, 256, 32, 576, CUDA_R_32F,
-                      CUBLAS_COMPUTE_32F);
+                      CUBLAS_COMPUTE_32F, iterations);
     if (rc == 0) {
         rc = run_case(handle, 512, 32, 256, CUDA_R_16F,
-                      CUBLAS_COMPUTE_16F);
+                      CUBLAS_COMPUTE_16F, iterations);
     }
     return rc;
 }

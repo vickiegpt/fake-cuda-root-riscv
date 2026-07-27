@@ -45,6 +45,24 @@ LANXIN_NVIDIA_CUBLAS_GPU_ONLY=1 ./nvidia_driver_shim/build/cublas_sgemm_bench 40
 LANXIN_NVIDIA_CUBLAS_GPU_ONLY=1 ./nvidia_driver_shim/build/cublas_hgemm_bench 4096 4096 4096 5
 ```
 
+Kernel-path profiling:
+
+```sh
+sudo ./nvidia_driver_shim/profile_gpu_kernel_path.sh \
+  /tmp/lanxin_gpu_profile/model-shape -- \
+  env LD_LIBRARY_PATH="$PWD/lib64" \
+      LANXIN_NVIDIA_CUBLAS_BATCH_GPU=1 \
+      ./nvidia_driver_shim/build/cublas_batched_model_shape_bench 64
+```
+
+The optional benchmark argument repeats each model-shaped batched GEMM while
+keeping one CUDA/RM context alive. This separates one-time device-open/GSP
+cost from steady-state launch and completion cost. The profiler runs a direct
+timed sample, a `perf` CPU sample, and an ftrace/trace-cmd IRQ, IOMMU, and
+dma-fence sample. The output directory contains raw `perf.data` and
+`trace.dat`, flat and call-chain reports, PCIe state, IRQ/softirq deltas,
+`irq_latency.tsv`, and `kernel_event_counts.tsv`.
+
 The build uses the official CUDA 12.9 x86-64 `ptxas` through user-mode QEMU on
 the RISC-V host. Override `LANXIN_QEMU_X86_64`,
 `LANXIN_CUDA_X86_64_SYSROOT`, and `LANXIN_CUDA_X86_64_PTXAS` when those
