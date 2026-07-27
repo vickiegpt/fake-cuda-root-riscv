@@ -96,6 +96,18 @@ fi
   -l:libcublas_nvidia.so.12 -l:libcuda_nvidia.so.1 -lm
 
 "$CC" -O2 -g -Wall -Wextra -I"$ROOT/include" \
+  -o "$ROOT/nvidia_driver_shim/build/cublas_batched_device_array_probe" \
+  "$ROOT/nvidia_driver_shim/cublas_batched_device_array_probe.c" \
+  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" \
+  -l:libcublas_nvidia.so.12 -l:libcuda_nvidia.so.1 -lm
+
+"$CC" -O2 -g -Wall -Wextra -I"$ROOT/include" \
+  -o "$ROOT/nvidia_driver_shim/build/cublas_batched_model_shape_bench" \
+  "$ROOT/nvidia_driver_shim/cublas_batched_model_shape_bench.c" \
+  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" \
+  -l:libcublas_nvidia.so.12 -l:libcuda_nvidia.so.1 -lm
+
+"$CC" -O2 -g -Wall -Wextra -I"$ROOT/include" \
   -o "$ROOT/nvidia_driver_shim/build/launch_probe" \
   "$ROOT/nvidia_driver_shim/launch_probe.c" \
   -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" -l:libcuda_nvidia.so.1
@@ -149,6 +161,8 @@ echo "built $ROOT/nvidia_driver_shim/build/cublas_probe"
 echo "built $ROOT/nvidia_driver_shim/build/cublas_sgemm_bench"
 echo "built $ROOT/nvidia_driver_shim/build/cublas_hgemm_bench"
 echo "built $ROOT/nvidia_driver_shim/build/cublas_sgemm_transpose_probe"
+echo "built $ROOT/nvidia_driver_shim/build/cublas_batched_device_array_probe"
+echo "built $ROOT/nvidia_driver_shim/build/cublas_batched_model_shape_bench"
 echo "built $ROOT/nvidia_driver_shim/build/rm_probe"
 echo "built $ROOT/nvidia_driver_shim/build/channel_probe"
 echo "built $ROOT/nvidia_driver_shim/build/nvidia-smi"

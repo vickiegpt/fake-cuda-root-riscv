@@ -11,6 +11,7 @@ typedef uint64_t lanxin_CUdeviceptr;
 
 extern int cuMemcpyDtoH_v2(void *dstHost, lanxin_CUdeviceptr srcDevice, size_t ByteCount);
 extern int cuMemcpyHtoD_v2(lanxin_CUdeviceptr dstDevice, const void *srcHost, size_t ByteCount);
+extern int cuMemAlloc_v2(lanxin_CUdeviceptr *dptr, size_t bytesize);
 extern int cuModuleLoad(void **module, const char *fname);
 extern int cuModuleGetFunction(void **function, void *module, const char *name);
 extern int cuLaunchKernel(void *function,
@@ -60,6 +61,7 @@ typedef struct {
 #define LANXIN_CUBLAS_OP_T 1
 #define LANXIN_CUBLAS_OP_C 2
 
+#define LANXIN_CUBLAS_COMPUTE_16F 64
 #define LANXIN_CUBLAS_COMPUTE_32F 68
 #define LANXIN_CUBLAS_COMPUTE_64F 70
 
@@ -109,7 +111,14 @@ static void *lanxin_sgemm_wide_function;
 static int lanxin_sgemm_load_attempted;
 static void *lanxin_hgemm_module;
 static void *lanxin_hgemm_function;
+static void *lanxin_hgemm_batched_f32_function;
+static void *lanxin_hgemm_batched_f16_function;
+static void *lanxin_batched_f32_to_f16_function;
 static int lanxin_hgemm_load_attempted;
+static lanxin_CUdeviceptr lanxin_batched_f16_scratch;
+static lanxin_CUdeviceptr lanxin_batched_f16_pointer_array;
+static size_t lanxin_batched_f16_scratch_bytes;
+static int lanxin_batched_f16_pointer_capacity;
 
 static int lanxin_env_enabled(const char *name)
 {
@@ -195,15 +204,166 @@ static int lanxin_hgemm_load_locked(void)
     }
     if (cuModuleLoad(&lanxin_hgemm_module, path) != LANXIN_CUDA_SUCCESS ||
         cuModuleGetFunction(&lanxin_hgemm_function, lanxin_hgemm_module,
-                            "sm120_hgemm_wmma") != LANXIN_CUDA_SUCCESS) {
+                            "sm120_hgemm_wmma") != LANXIN_CUDA_SUCCESS ||
+        cuModuleGetFunction(&lanxin_hgemm_batched_f32_function, lanxin_hgemm_module,
+                            "sm120_hgemm_wmma_batched_f32") != LANXIN_CUDA_SUCCESS ||
+        cuModuleGetFunction(&lanxin_hgemm_batched_f16_function, lanxin_hgemm_module,
+                            "sm120_hgemm_wmma_batched_f16") != LANXIN_CUDA_SUCCESS ||
+        cuModuleGetFunction(&lanxin_batched_f32_to_f16_function, lanxin_hgemm_module,
+                            "sm120_batched_f32_to_f16") != LANXIN_CUDA_SUCCESS) {
         lanxin_hgemm_module = NULL;
         lanxin_hgemm_function = NULL;
+        lanxin_hgemm_batched_f32_function = NULL;
+        lanxin_hgemm_batched_f16_function = NULL;
+        lanxin_batched_f32_to_f16_function = NULL;
         return -1;
     }
     if (lanxin_cublas_trace_enabled()) {
         fprintf(stderr, "lanxin-cublas: loaded GPU HGEMM cubin %s\n", path);
     }
     return 0;
+}
+
+static cublasStatus_t lanxin_gemm_batched_gpu(cublasOperation_t transa,
+                                              cublasOperation_t transb,
+                                              int m, int n, int k,
+                                              const void *alpha,
+                                              const void *const Aarray[],
+                                              cudaDataType Atype, int lda,
+                                              const void *const Barray[],
+                                              cudaDataType Btype, int ldb,
+                                              const void *beta,
+                                              void *const Carray[],
+                                              cudaDataType Ctype, int ldc,
+                                              int batch_count,
+                                              cublasComputeType_t compute_type)
+{
+    if (!lanxin_env_enabled("LANXIN_NVIDIA_CUBLAS_BATCH_GPU")) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    if (m <= 0 || n <= 0 || k <= 0 || batch_count <= 0 ||
+        alpha == NULL || beta == NULL || Aarray == NULL ||
+        Barray == NULL || Carray == NULL ||
+        Atype != LANXIN_CUDA_R_16F || Btype != LANXIN_CUDA_R_16F ||
+        (transa != LANXIN_CUBLAS_OP_N && transa != LANXIN_CUBLAS_OP_T) ||
+        transb != LANXIN_CUBLAS_OP_N ||
+        (m & 15) != 0 || (n & 15) != 0 || (k & 15) != 0) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+
+    int output_f32 =
+        Ctype == LANXIN_CUDA_R_32F &&
+        compute_type == LANXIN_CUBLAS_COMPUTE_32F &&
+        *(const float *)alpha == 1.0f && *(const float *)beta == 0.0f;
+    int output_f16 =
+        Ctype == LANXIN_CUDA_R_16F &&
+        compute_type == LANXIN_CUBLAS_COMPUTE_16F &&
+        *(const uint16_t *)alpha == UINT16_C(0x3c00) &&
+        *(const uint16_t *)beta == UINT16_C(0x0000);
+    if (!output_f32 && !output_f16) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+
+    pthread_mutex_lock(&lanxin_gpu_kernel_lock);
+    int load_rc = lanxin_hgemm_load_locked();
+    pthread_mutex_unlock(&lanxin_gpu_kernel_lock);
+    if (load_rc != 0) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+
+    lanxin_CUdeviceptr device_a_array =
+        (lanxin_CUdeviceptr)(uintptr_t)Aarray;
+    lanxin_CUdeviceptr device_b_array =
+        (lanxin_CUdeviceptr)(uintptr_t)Barray;
+    lanxin_CUdeviceptr device_c_array =
+        (lanxin_CUdeviceptr)(uintptr_t)Carray;
+    uint32_t rows_m = (uint32_t)m;
+    uint32_t cols_n = (uint32_t)n;
+    uint32_t inner_k = (uint32_t)k;
+    uint32_t leading_a = (uint32_t)lda;
+    uint32_t leading_b = (uint32_t)ldb;
+    uint32_t leading_c = (uint32_t)ldc;
+    uint32_t transpose_a = transa == LANXIN_CUBLAS_OP_N ? 0U : 1U;
+    lanxin_CUdeviceptr gemm_output_array = device_c_array;
+    lanxin_CUdeviceptr *host_scratch_pointers = NULL;
+    size_t output_elements = (size_t)m * (size_t)n;
+    size_t scratch_bytes = output_elements * (size_t)batch_count * sizeof(float);
+    if (output_f16) {
+        pthread_mutex_lock(&lanxin_gpu_kernel_lock);
+        if (lanxin_batched_f16_scratch_bytes < scratch_bytes) {
+            lanxin_CUdeviceptr new_scratch = 0;
+            if (cuMemAlloc_v2(&new_scratch, scratch_bytes) != LANXIN_CUDA_SUCCESS) {
+                pthread_mutex_unlock(&lanxin_gpu_kernel_lock);
+                return CUBLAS_STATUS_ALLOC_FAILED;
+            }
+            lanxin_batched_f16_scratch = new_scratch;
+            lanxin_batched_f16_scratch_bytes = scratch_bytes;
+        }
+        if (lanxin_batched_f16_pointer_capacity < batch_count) {
+            lanxin_CUdeviceptr new_pointer_array = 0;
+            if (cuMemAlloc_v2(&new_pointer_array,
+                              (size_t)batch_count * sizeof(lanxin_CUdeviceptr)) !=
+                LANXIN_CUDA_SUCCESS) {
+                pthread_mutex_unlock(&lanxin_gpu_kernel_lock);
+                return CUBLAS_STATUS_ALLOC_FAILED;
+            }
+            lanxin_batched_f16_pointer_array = new_pointer_array;
+            lanxin_batched_f16_pointer_capacity = batch_count;
+        }
+        host_scratch_pointers =
+            (lanxin_CUdeviceptr *)malloc((size_t)batch_count *
+                                        sizeof(lanxin_CUdeviceptr));
+        if (host_scratch_pointers == NULL) {
+            pthread_mutex_unlock(&lanxin_gpu_kernel_lock);
+            return CUBLAS_STATUS_ALLOC_FAILED;
+        }
+        for (int batch = 0; batch < batch_count; ++batch) {
+            host_scratch_pointers[batch] =
+                lanxin_batched_f16_scratch +
+                (lanxin_CUdeviceptr)((size_t)batch * output_elements *
+                                     sizeof(float));
+        }
+        int copy_rc = cuMemcpyHtoD_v2(
+            lanxin_batched_f16_pointer_array, host_scratch_pointers,
+            (size_t)batch_count * sizeof(lanxin_CUdeviceptr));
+        free(host_scratch_pointers);
+        pthread_mutex_unlock(&lanxin_gpu_kernel_lock);
+        if (copy_rc != LANXIN_CUDA_SUCCESS) {
+            return CUBLAS_STATUS_INVALID_VALUE;
+        }
+        gemm_output_array = lanxin_batched_f16_pointer_array;
+    }
+
+    void *params[] = {
+        &device_a_array, &device_b_array, &gemm_output_array,
+        &rows_m, &cols_n, &inner_k,
+        &leading_a, &leading_b, &leading_c, &transpose_a
+    };
+    uint32_t tiles = (rows_m / 16U) * (cols_n / 16U);
+    int launch_rc = cuLaunchKernel(lanxin_hgemm_batched_f32_function,
+                                   (tiles + 7U) / 8U, 1, (uint32_t)batch_count,
+                                   256, 1, 1, 0, NULL, params, NULL);
+    int convert_rc = LANXIN_CUDA_SUCCESS;
+    if (launch_rc == LANXIN_CUDA_SUCCESS && output_f16) {
+        uint32_t element_count = (uint32_t)output_elements;
+        void *convert_params[] = {
+            &gemm_output_array, &device_c_array, &element_count
+        };
+        convert_rc = cuLaunchKernel(
+            lanxin_batched_f32_to_f16_function,
+            (element_count + 255U) / 256U, 1, (uint32_t)batch_count,
+            256, 1, 1, 0, NULL, convert_params, NULL);
+    }
+    if (lanxin_env_enabled("LANXIN_NVIDIA_CUBLAS_BATCH_TRACE")) {
+        fprintf(stderr,
+                "lanxin-cublas: GPU batched-hgemm m=%d n=%d k=%d batch=%d "
+                "output=%s launch_rc=%d convert_rc=%d\n",
+                m, n, k, batch_count, output_f32 ? "f32" : "f16",
+                launch_rc, convert_rc);
+    }
+    return launch_rc == LANXIN_CUDA_SUCCESS &&
+           convert_rc == LANXIN_CUDA_SUCCESS ?
+           CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_NOT_SUPPORTED;
 }
 
 static cublasStatus_t lanxin_gemm_gpu(cublasOperation_t transa,
@@ -840,19 +1000,63 @@ cublasStatus_t cublasGemmBatchedEx(cublasHandle_t handle, cublasOperation_t tran
 {
     (void)handle;
     (void)algo;
-    if (batchCount < 0 || Aarray == NULL || Barray == NULL || Carray == NULL) {
+    const void **host_a_array = NULL;
+    const void **host_b_array = NULL;
+    void **host_c_array = NULL;
+    cublasStatus_t status = CUBLAS_STATUS_ALLOC_FAILED;
+
+    if (batchCount < 0) {
         return CUBLAS_STATUS_INVALID_VALUE;
     }
+    if (batchCount == 0) {
+        return CUBLAS_STATUS_SUCCESS;
+    }
+    if (Aarray == NULL || Barray == NULL || Carray == NULL ||
+        (size_t)batchCount > SIZE_MAX / sizeof(void *)) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+
+    if (lanxin_env_enabled("LANXIN_NVIDIA_CUBLAS_BATCH_TRACE")) {
+        fprintf(stderr,
+                "lanxin-cublas: batched m=%d n=%d k=%d batch=%d "
+                "trans=%d,%d type=%d,%d->%d ld=%d,%d,%d compute=%d\n",
+                m, n, k, batchCount, transa, transb, Atype, Btype, Ctype,
+                lda, ldb, ldc, computeType);
+    }
+
+    status = lanxin_gemm_batched_gpu(transa, transb, m, n, k, alpha,
+                                     Aarray, Atype, lda, Barray, Btype, ldb,
+                                     beta, Carray, Ctype, ldc, batchCount,
+                                     computeType);
+    if (status == CUBLAS_STATUS_SUCCESS ||
+        lanxin_env_enabled("LANXIN_NVIDIA_CUBLAS_GPU_ONLY")) {
+        return status;
+    }
+
+    size_t pointer_bytes = (size_t)batchCount * sizeof(void *);
+    host_a_array = (const void **)lanxin_stage_from_device(Aarray, pointer_bytes);
+    host_b_array = (const void **)lanxin_stage_from_device(Barray, pointer_bytes);
+    host_c_array = (void **)lanxin_stage_from_device(Carray, pointer_bytes);
+    if (host_a_array == NULL || host_b_array == NULL || host_c_array == NULL) {
+        goto out;
+    }
+
     for (int batch = 0; batch < batchCount; batch++) {
-        cublasStatus_t st = lanxin_gemm_one(transa, transb, m, n, k, alpha, Aarray[batch],
-                                            Atype, lda, Barray[batch], Btype, ldb, beta,
-                                            Carray[batch], Ctype, ldc, Carray[batch], Ctype,
+        status = lanxin_gemm_one(transa, transb, m, n, k, alpha, host_a_array[batch],
+                                            Atype, lda, host_b_array[batch], Btype, ldb, beta,
+                                            host_c_array[batch], Ctype, ldc, host_c_array[batch], Ctype,
                                             ldc, computeType);
-        if (st != CUBLAS_STATUS_SUCCESS) {
-            return st;
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            goto out;
         }
     }
-    return CUBLAS_STATUS_SUCCESS;
+    status = CUBLAS_STATUS_SUCCESS;
+
+out:
+    free(host_a_array);
+    free(host_b_array);
+    free(host_c_array);
+    return status;
 }
 
 cublasStatus_t cublasStrsmBatched(cublasHandle_t handle, cublasSideMode_t side, cublasFillMode_t uplo,

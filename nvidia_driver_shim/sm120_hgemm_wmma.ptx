@@ -95,3 +95,293 @@ k_loop:
 done:
     ret;
 }
+
+.visible .entry sm120_hgemm_wmma_batched_f32(
+    .param .u64 matrix_a_array,
+    .param .u64 matrix_b_array,
+    .param .u64 matrix_c_array,
+    .param .u32 rows_m,
+    .param .u32 cols_n,
+    .param .u32 inner_k,
+    .param .u32 leading_a,
+    .param .u32 leading_b,
+    .param .u32 leading_c,
+    .param .u32 transpose_a
+)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<36>;
+    .reg .b64 %rd<24>;
+    .reg .b32 %a<8>;
+    .reg .b32 %b<8>;
+    .reg .f32 %c<8>;
+    .reg .f32 %d<8>;
+
+    ld.param.u64 %rd1, [matrix_a_array];
+    ld.param.u64 %rd2, [matrix_b_array];
+    ld.param.u64 %rd3, [matrix_c_array];
+    ld.param.u32 %r1, [rows_m];
+    ld.param.u32 %r2, [cols_n];
+    ld.param.u32 %r3, [inner_k];
+    ld.param.u32 %r4, [leading_a];
+    ld.param.u32 %r5, [leading_b];
+    ld.param.u32 %r6, [leading_c];
+    ld.param.u32 %r23, [transpose_a];
+
+    mov.u32 %r22, %ctaid.z;
+    mul.wide.u32 %rd10, %r22, 8;
+    add.s64 %rd11, %rd1, %rd10;
+    add.s64 %rd12, %rd2, %rd10;
+    add.s64 %rd13, %rd3, %rd10;
+    ld.global.u64 %rd14, [%rd11];
+    ld.global.u64 %rd15, [%rd12];
+    ld.global.u64 %rd16, [%rd13];
+
+    mov.u32 %r7, %tid.x;
+    shr.u32 %r8, %r7, 5;
+    mov.u32 %r9, %ctaid.x;
+    mad.lo.u32 %r10, %r9, 8, %r8;
+    shr.u32 %r11, %r1, 4;
+    shr.u32 %r12, %r2, 4;
+    mul.lo.u32 %r13, %r11, %r12;
+    setp.ge.u32 %p1, %r10, %r13;
+    @%p1 bra batched_f32_done;
+    rem.u32 %r14, %r10, %r11;
+    div.u32 %r15, %r10, %r11;
+    shl.b32 %r16, %r14, 4;
+    shl.b32 %r17, %r15, 4;
+
+    mov.f32 %c0, 0f00000000;
+    mov.f32 %c1, 0f00000000;
+    mov.f32 %c2, 0f00000000;
+    mov.f32 %c3, 0f00000000;
+    mov.f32 %c4, 0f00000000;
+    mov.f32 %c5, 0f00000000;
+    mov.f32 %c6, 0f00000000;
+    mov.f32 %c7, 0f00000000;
+    mov.u32 %r18, 0;
+
+batched_f32_k_loop:
+    setp.eq.u32 %p3, %r23, 0;
+    @%p3 bra batched_f32_a_col;
+    mad.lo.u32 %r19, %r16, %r4, %r18;
+    mul.wide.u32 %rd4, %r19, 2;
+    add.s64 %rd5, %rd14, %rd4;
+    wmma.load.a.sync.aligned.row.m16n16k16.global.f16
+        {%a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7}, [%rd5], %r4;
+    bra batched_f32_a_loaded;
+
+batched_f32_a_col:
+    mad.lo.u32 %r19, %r18, %r4, %r16;
+    mul.wide.u32 %rd4, %r19, 2;
+    add.s64 %rd5, %rd14, %rd4;
+    wmma.load.a.sync.aligned.col.m16n16k16.global.f16
+        {%a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7}, [%rd5], %r4;
+
+batched_f32_a_loaded:
+    mad.lo.u32 %r20, %r17, %r5, %r18;
+    mul.wide.u32 %rd6, %r20, 2;
+    add.s64 %rd7, %rd15, %rd6;
+
+    wmma.load.b.sync.aligned.col.m16n16k16.global.f16
+        {%b0, %b1, %b2, %b3, %b4, %b5, %b6, %b7}, [%rd7], %r5;
+    @%p3 bra batched_f32_mma_col;
+    wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32
+        {%d0, %d1, %d2, %d3, %d4, %d5, %d6, %d7},
+        {%a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7},
+        {%b0, %b1, %b2, %b3, %b4, %b5, %b6, %b7},
+        {%c0, %c1, %c2, %c3, %c4, %c5, %c6, %c7};
+    bra batched_f32_mma_done;
+
+batched_f32_mma_col:
+    wmma.mma.sync.aligned.col.col.m16n16k16.f32.f32
+        {%d0, %d1, %d2, %d3, %d4, %d5, %d6, %d7},
+        {%a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7},
+        {%b0, %b1, %b2, %b3, %b4, %b5, %b6, %b7},
+        {%c0, %c1, %c2, %c3, %c4, %c5, %c6, %c7};
+
+batched_f32_mma_done:
+    mov.f32 %c0, %d0;
+    mov.f32 %c1, %d1;
+    mov.f32 %c2, %d2;
+    mov.f32 %c3, %d3;
+    mov.f32 %c4, %d4;
+    mov.f32 %c5, %d5;
+    mov.f32 %c6, %d6;
+    mov.f32 %c7, %d7;
+
+    add.u32 %r18, %r18, 16;
+    setp.lt.u32 %p2, %r18, %r3;
+    @%p2 bra batched_f32_k_loop;
+
+    mad.lo.u32 %r21, %r17, %r6, %r16;
+    mul.wide.u32 %rd8, %r21, 4;
+    add.s64 %rd9, %rd16, %rd8;
+    wmma.store.d.sync.aligned.col.m16n16k16.global.f32
+        [%rd9], {%d0, %d1, %d2, %d3, %d4, %d5, %d6, %d7}, %r6;
+
+batched_f32_done:
+    ret;
+}
+
+.visible .entry sm120_hgemm_wmma_batched_f16(
+    .param .u64 matrix_a_array,
+    .param .u64 matrix_b_array,
+    .param .u64 matrix_c_array,
+    .param .u32 rows_m,
+    .param .u32 cols_n,
+    .param .u32 inner_k,
+    .param .u32 leading_a,
+    .param .u32 leading_b,
+    .param .u32 leading_c,
+    .param .u32 transpose_a
+)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<36>;
+    .reg .b64 %rd<24>;
+    .reg .b32 %a<8>;
+    .reg .b32 %b<8>;
+    .reg .b32 %c<4>;
+    .reg .b32 %d<4>;
+
+    ld.param.u64 %rd1, [matrix_a_array];
+    ld.param.u64 %rd2, [matrix_b_array];
+    ld.param.u64 %rd3, [matrix_c_array];
+    ld.param.u32 %r1, [rows_m];
+    ld.param.u32 %r2, [cols_n];
+    ld.param.u32 %r3, [inner_k];
+    ld.param.u32 %r4, [leading_a];
+    ld.param.u32 %r5, [leading_b];
+    ld.param.u32 %r6, [leading_c];
+    ld.param.u32 %r23, [transpose_a];
+
+    mov.u32 %r22, %ctaid.z;
+    mul.wide.u32 %rd10, %r22, 8;
+    add.s64 %rd11, %rd1, %rd10;
+    add.s64 %rd12, %rd2, %rd10;
+    add.s64 %rd13, %rd3, %rd10;
+    ld.global.u64 %rd14, [%rd11];
+    ld.global.u64 %rd15, [%rd12];
+    ld.global.u64 %rd16, [%rd13];
+
+    mov.u32 %r7, %tid.x;
+    shr.u32 %r8, %r7, 5;
+    mov.u32 %r9, %ctaid.x;
+    mad.lo.u32 %r10, %r9, 8, %r8;
+    shr.u32 %r11, %r1, 4;
+    shr.u32 %r12, %r2, 4;
+    mul.lo.u32 %r13, %r11, %r12;
+    setp.ge.u32 %p1, %r10, %r13;
+    @%p1 bra batched_f16_done;
+    rem.u32 %r14, %r10, %r11;
+    div.u32 %r15, %r10, %r11;
+    shl.b32 %r16, %r14, 4;
+    shl.b32 %r17, %r15, 4;
+
+    mov.b32 %c0, 0;
+    mov.b32 %c1, 0;
+    mov.b32 %c2, 0;
+    mov.b32 %c3, 0;
+    mov.u32 %r18, 0;
+
+batched_f16_k_loop:
+    setp.eq.u32 %p3, %r23, 0;
+    @%p3 bra batched_f16_a_col;
+    mad.lo.u32 %r19, %r16, %r4, %r18;
+    mul.wide.u32 %rd4, %r19, 2;
+    add.s64 %rd5, %rd14, %rd4;
+    wmma.load.a.sync.aligned.row.m16n16k16.global.f16
+        {%a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7}, [%rd5], %r4;
+    bra batched_f16_a_loaded;
+
+batched_f16_a_col:
+    mad.lo.u32 %r19, %r18, %r4, %r16;
+    mul.wide.u32 %rd4, %r19, 2;
+    add.s64 %rd5, %rd14, %rd4;
+    wmma.load.a.sync.aligned.col.m16n16k16.global.f16
+        {%a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7}, [%rd5], %r4;
+
+batched_f16_a_loaded:
+    mad.lo.u32 %r20, %r17, %r5, %r18;
+    mul.wide.u32 %rd6, %r20, 2;
+    add.s64 %rd7, %rd15, %rd6;
+
+    wmma.load.b.sync.aligned.col.m16n16k16.global.f16
+        {%b0, %b1, %b2, %b3, %b4, %b5, %b6, %b7}, [%rd7], %r5;
+    @%p3 bra batched_f16_mma_col;
+    wmma.mma.sync.aligned.row.col.m16n16k16.f16.f16
+        {%d0, %d1, %d2, %d3},
+        {%a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7},
+        {%b0, %b1, %b2, %b3, %b4, %b5, %b6, %b7},
+        {%c0, %c1, %c2, %c3};
+    bra batched_f16_mma_done;
+
+batched_f16_mma_col:
+    wmma.mma.sync.aligned.col.col.m16n16k16.f16.f16
+        {%d0, %d1, %d2, %d3},
+        {%a0, %a1, %a2, %a3, %a4, %a5, %a6, %a7},
+        {%b0, %b1, %b2, %b3, %b4, %b5, %b6, %b7},
+        {%c0, %c1, %c2, %c3};
+
+batched_f16_mma_done:
+    mov.b32 %c0, %d0;
+    mov.b32 %c1, %d1;
+    mov.b32 %c2, %d2;
+    mov.b32 %c3, %d3;
+
+    add.u32 %r18, %r18, 16;
+    setp.lt.u32 %p2, %r18, %r3;
+    @%p2 bra batched_f16_k_loop;
+
+    mad.lo.u32 %r21, %r17, %r6, %r16;
+    mul.wide.u32 %rd8, %r21, 2;
+    add.s64 %rd9, %rd16, %rd8;
+    wmma.store.d.sync.aligned.col.m16n16k16.global.f16
+        [%rd9], {%d0, %d1, %d2, %d3}, %r6;
+
+batched_f16_done:
+    ret;
+}
+
+.visible .entry sm120_batched_f32_to_f16(
+    .param .u64 source_array,
+    .param .u64 destination_array,
+    .param .u32 element_count
+)
+{
+    .reg .pred %p<2>;
+    .reg .b16 %h<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<2>;
+
+    ld.param.u64 %rd1, [source_array];
+    ld.param.u64 %rd2, [destination_array];
+    ld.param.u32 %r1, [element_count];
+
+    mov.u32 %r2, %ctaid.z;
+    mul.wide.u32 %rd3, %r2, 8;
+    add.s64 %rd4, %rd1, %rd3;
+    add.s64 %rd5, %rd2, %rd3;
+    ld.global.u64 %rd6, [%rd4];
+    ld.global.u64 %rd7, [%rd5];
+
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.u32 %r6, %r3, %r4, %r5;
+    setp.ge.u32 %p1, %r6, %r1;
+    @%p1 bra convert_done;
+
+    mul.wide.u32 %rd8, %r6, 4;
+    add.s64 %rd9, %rd6, %rd8;
+    ld.global.f32 %f1, [%rd9];
+    cvt.rn.f16.f32 %h1, %f1;
+    mul.wide.u32 %rd10, %r6, 2;
+    add.s64 %rd11, %rd7, %rd10;
+    st.global.u16 [%rd11], %h1;
+
+convert_done:
+    ret;
+}
