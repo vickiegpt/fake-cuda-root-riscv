@@ -63,6 +63,37 @@ dma-fence sample. The output directory contains raw `perf.data` and
 `trace.dat`, flat and call-chain reports, PCIe state, IRQ/softirq deltas,
 `irq_latency.tsv`, and `kernel_event_counts.tsv`.
 
+For syscall and scheduler latency, run the eBPF profiles with the workload as
+the `-c` child:
+
+```sh
+sudo bpftrace -c \
+  'env LD_LIBRARY_PATH=/home/ubuntu/fake_cuda/lib64 LANXIN_NVIDIA_CUBLAS_BATCH_GPU=1 /tmp/cublas_batched_model_shape_bench64 4096' \
+  ./nvidia_driver_shim/profile_gpu_os_path.bt
+sudo bpftrace -c \
+  'env LD_LIBRARY_PATH=/home/ubuntu/fake_cuda/lib64 LANXIN_NVIDIA_CUBLAS_BATCH_GPU=1 /tmp/cublas_batched_model_shape_bench64 4096' \
+  ./nvidia_driver_shim/profile_gpu_os_detail.bt
+```
+
+`profile_gpu_os_path.bt` reports syscall and off-CPU latency distributions.
+`profile_gpu_os_detail.bt` groups `openat` latency by path and RM ioctl latency
+by command. Both require bpftrace and tracefs access.
+
+The open driver tears down RM/GSP after the final GPU descriptor closes. Keep
+one descriptor open to avoid paying the roughly one-second initialization on
+every short process:
+
+```sh
+sudo install -m 0755 \
+  ./nvidia_driver_shim/nvidia_persistence_holder.py \
+  /usr/local/bin/lanxin-nvidia-persistence
+sudo install -m 0644 \
+  ./nvidia_driver_shim/systemd/lanxin-nvidia-persistence.service \
+  /etc/systemd/system/lanxin-nvidia-persistence.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now lanxin-nvidia-persistence.service
+```
+
 The build uses the official CUDA 12.9 x86-64 `ptxas` through user-mode QEMU on
 the RISC-V host. Override `LANXIN_QEMU_X86_64`,
 `LANXIN_CUDA_X86_64_SYSROOT`, and `LANXIN_CUDA_X86_64_PTXAS` when those

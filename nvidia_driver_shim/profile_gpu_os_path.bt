@@ -1,0 +1,54 @@
+#!/usr/bin/env bpftrace
+
+BEGIN
+{
+    printf("target_pid=%d\n", cpid);
+}
+
+tracepoint:syscalls:sys_enter_openat,
+tracepoint:syscalls:sys_enter_close,
+tracepoint:syscalls:sys_enter_read,
+tracepoint:syscalls:sys_enter_write,
+tracepoint:syscalls:sys_enter_ioctl,
+tracepoint:syscalls:sys_enter_mmap,
+tracepoint:syscalls:sys_enter_munmap
+/pid == cpid/
+{
+    @syscall_start[tid] = nsecs;
+}
+
+tracepoint:syscalls:sys_exit_openat,
+tracepoint:syscalls:sys_exit_close,
+tracepoint:syscalls:sys_exit_read,
+tracepoint:syscalls:sys_exit_write,
+tracepoint:syscalls:sys_exit_ioctl,
+tracepoint:syscalls:sys_exit_mmap,
+tracepoint:syscalls:sys_exit_munmap
+/pid == cpid && @syscall_start[tid]/
+{
+    $duration_us = (nsecs - @syscall_start[tid]) / 1000;
+    @syscall_us[probe] = stats($duration_us);
+    @syscall_hist_us[probe] = hist($duration_us);
+    delete(@syscall_start[tid]);
+}
+
+tracepoint:sched:sched_switch
+/args.prev_pid == (int32)cpid/
+{
+    @offcpu_start[cpid] = nsecs;
+}
+
+tracepoint:sched:sched_switch
+/args.next_pid == (int32)cpid && @offcpu_start[cpid]/
+{
+    $duration_us = (nsecs - @offcpu_start[cpid]) / 1000;
+    @offcpu_us = stats($duration_us);
+    @offcpu_hist_us = hist($duration_us);
+    delete(@offcpu_start[cpid]);
+}
+
+END
+{
+    clear(@syscall_start);
+    clear(@offcpu_start);
+}
