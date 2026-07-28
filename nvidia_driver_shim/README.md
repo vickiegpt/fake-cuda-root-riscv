@@ -5,7 +5,7 @@ This is the native RISC-V `libcuda.so.1` layer for Lanxin bring-up. It opens the
 Current boundary:
 
 - Real: NVIDIA device-node open, RM client/device/subdevice alloc, RM-backed sysmem alloc/map/free for `cuMemAlloc`, device enumeration, context handles, stream/event handles, CUDA memory accounting, `cuMemcpy*`, `cuMemset*`, pointer attributes, module/link/library/kernel code-load handles, and `cuGetProcAddress`.
-- Real management surface: a minimal `libnvidia-ml.so.1` plus `bin/nvidia-smi` now report driver/CUDA version, GPU name, UUID, PCI bus ID, memory totals/free/used from the shim accounting path, PCIe link information from sysfs, and process discovery by scanning `/proc/*/fd` for NVIDIA device nodes.
+- Real management surface: a minimal `libnvidia-ml.so.1` plus `bin/nvidia-smi` now report driver/CUDA version, GPU name, UUID, PCI bus ID, memory totals/free/used from the shim accounting path, PCIe link information from sysfs, and process discovery by scanning `/proc/*/fd` for NVIDIA device nodes. GPU utilization is the union of real QMD doorbell-to-hardware-completion busy intervals in the latest sampling window; it no longer substitutes process CPU usage.
 - Real RM channel path: `NV01_MEMORY_VIRTUAL` GPU VA, notifier sysmem + error ctxdma, write-combined GPFIFO CPU/GPU mapping, persistent local-memory UserD, `BLACKWELL_USERMODE_A` doorbell mapping, `BLACKWELL_CHANNEL_GPFIFO_B` allocation/bind/schedule, refreshed work-submit tokens, and DoorbellKickoff-style submission by writing UserD `GPPut` then the USERMODE doorbell token. UserD and USERMODE use independent `/dev/nvidia0` file descriptions, which is required by this RM path.
 - Real RM object/pushbuffer scaffold: compute object allocation probes `BLACKWELL_COMPUTE_B/A`, falls back through Hopper/Ampere classes, calls `NV906F_CTRL_GET_CLASS_ENGINEID`, writes a C46F-format compute `SET_OBJECT` + `NO_OPERATION` + `PIPE_NOP` pushbuffer, submits a paired progress-tracker semaphore pushbuffer, and verifies HOST consumption through a completion record.
 - Real Blackwell launch path: `cuLaunchKernel` stages code, arguments, a 384-byte QMD 5.0 descriptor in a 64-slot ring, and completion state into RM memory mapped into the channel VASpace. It parses ELF `.text.<kernel>`, `.nv.info.<kernel>`, `.nv.constant0.<kernel>`, `EIATTR_PARAM_CBANK`, and `EIATTR_KPARAM_INFO`, so both standard `kernelParams` and `CU_LAUNCH_PARAM_BUFFER_*` ABIs use the cubin's declared argument layout. QMD submission uses Blackwell `SEND_PCAS_A` plus `SEND_SIGNALING_PCAS2_B`; a HOST WFI semaphore verifies that all preceding compute work completed.
@@ -44,6 +44,10 @@ LANXIN_NVIDIA_CUBLAS_GPU_ONLY=1 ./nvidia_driver_shim/build/cublas_sgemm_transpos
 LANXIN_NVIDIA_CUBLAS_GPU_ONLY=1 ./nvidia_driver_shim/build/cublas_sgemm_bench 4096 4096 4096 3
 LANXIN_NVIDIA_CUBLAS_GPU_ONLY=1 ./nvidia_driver_shim/build/cublas_hgemm_bench 4096 4096 4096 5
 ```
+
+The build installs `libcuda.so.1` as a symlink to the native
+`libcuda_nvidia.so.1`; keep that symlink ahead of the system CUDA library in
+`LD_LIBRARY_PATH` when validating this port.
 
 Kernel-path profiling:
 
@@ -104,6 +108,7 @@ Useful environment overrides:
 - `LANXIN_NVIDIA_CUDA_TRACE=1` prints shim calls.
 - `LANXIN_NVIDIA_CUDA_TOTAL_MEM_MB=32768` overrides reported memory size.
 - `LANXIN_NVIDIA_CUDA_SM_COUNT=170` overrides reported SM count.
+- `LANXIN_NVIDIA_CUDA_UTIL_WINDOW_MS=1000` selects the NVML QMD busy-time sampling window (100-10000 ms).
 - `LANXIN_NVIDIA_CUDA_NOOP_KERNEL=1` makes `cuLaunchKernel` submit a real RM GPFIFO NOP and return success.
 - `LANXIN_NVIDIA_CUDA_RM_SUBMIT=1` makes `cuLaunchKernel` submit the same RM GPFIFO NOP but keep returning `CUDA_ERROR_NOT_SUPPORTED`.
 - `LANXIN_NVIDIA_CUDA_PB_SUBMIT=0` disables the default compute pushbuffer submit path.

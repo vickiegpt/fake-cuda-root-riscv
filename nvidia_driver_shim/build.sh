@@ -13,6 +13,7 @@ mkdir -p "$ROOT/lib64" "$ROOT/nvidia_driver_shim/build"
   -o "$ROOT/lib64/libcuda_nvidia.so.1" \
   "$ROOT/nvidia_driver_shim/libcuda_nvidia.c" \
   -lpthread
+ln -sfn libcuda_nvidia.so.1 "$ROOT/lib64/libcuda.so.1"
 
 "$CC" -shared -fPIC -O2 -g -Wall -Wextra -Wno-unused-parameter \
   -I"$ROOT/include" $CFLAGS \

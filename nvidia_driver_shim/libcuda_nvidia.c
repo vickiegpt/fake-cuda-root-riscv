@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "../include/cuda.h"
+#include "gpu_util_accounting.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -646,6 +647,7 @@ struct launch_staging {
     struct rm_stage_buffer completion;
     unsigned long long launch_id;
     size_t qmd_offset;
+    bool util_accounted;
 };
 
 struct launch_request {
@@ -833,6 +835,8 @@ struct driver_state {
 };
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_gpu_util_fd = -1;
+static struct lanxin_gpu_util_accounting *g_gpu_util_page;
 static struct driver_state g = {
     .ctl_fd = -1,
     .gpu_fd = -1,
@@ -861,6 +865,7 @@ static void rm_trace_launch_pointer_data_locked(CUfunction f,
 static rm_u32 rm_effective_local_mem_bytes(CUfunction f);
 static rm_u32 rm_effective_local_stack_bytes(CUfunction f);
 static rm_u32 rm_effective_slm_bytes_per_lane(CUfunction f);
+static rm_u64 now_ns(void);
 
 static const char *accounting_dir(void)
 {
@@ -889,13 +894,143 @@ static void update_process_memory_accounting_locked(void)
     fclose(fp);
 }
 
-__attribute__((destructor)) static void cleanup_process_memory_accounting(void)
+static int ensure_process_gpu_util_accounting_locked(void)
+{
+    if (g_gpu_util_page != NULL) {
+        return 0;
+    }
+
+    const char *dir = accounting_dir();
+    if (mkdir(dir, 0777) != 0 && errno != EEXIST) {
+        return -1;
+    }
+
+    char path[PATH_MAX];
+    int written = snprintf(path, sizeof(path), "%s/%ld.util", dir, (long)getpid());
+    if (written <= 0 || (size_t)written >= sizeof(path)) {
+        return -1;
+    }
+
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return -1;
+    }
+    if (ftruncate(fd, (off_t)sizeof(struct lanxin_gpu_util_accounting)) != 0) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+
+    void *mapping = mmap(NULL, sizeof(struct lanxin_gpu_util_accounting),
+                         PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapping == MAP_FAILED) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+
+    struct lanxin_gpu_util_accounting *page =
+        (struct lanxin_gpu_util_accounting *)mapping;
+    memset(page, 0, sizeof(*page));
+    __atomic_store_n(&page->sequence, 1, __ATOMIC_RELEASE);
+    page->magic = LANXIN_GPU_UTIL_ACCOUNTING_MAGIC;
+    page->version = LANXIN_GPU_UTIL_ACCOUNTING_VERSION;
+    page->size = sizeof(*page);
+    page->pid = (uint64_t)getpid();
+    page->epoch_ns = now_ns();
+    __atomic_store_n(&page->sequence, 2, __ATOMIC_RELEASE);
+
+    g_gpu_util_fd = fd;
+    g_gpu_util_page = page;
+    return 0;
+}
+
+static uint64_t gpu_util_write_begin_locked(void)
+{
+    uint64_t sequence = __atomic_load_n(&g_gpu_util_page->sequence, __ATOMIC_RELAXED);
+    if ((sequence & 1U) != 0) {
+        sequence++;
+    }
+    __atomic_store_n(&g_gpu_util_page->sequence, sequence + 1U, __ATOMIC_RELEASE);
+    return sequence + 2U;
+}
+
+static void gpu_util_write_end_locked(uint64_t sequence)
+{
+    __atomic_store_n(&g_gpu_util_page->sequence, sequence, __ATOMIC_RELEASE);
+}
+
+static void gpu_util_submit_locked(struct launch_staging *launch)
+{
+    if (launch == NULL || launch->util_accounted ||
+        ensure_process_gpu_util_accounting_locked() != 0) {
+        return;
+    }
+
+    uint64_t timestamp_ns = now_ns();
+    uint64_t sequence = gpu_util_write_begin_locked();
+    if (g_gpu_util_page->inflight == 0) {
+        g_gpu_util_page->active_start_ns = timestamp_ns;
+    }
+    g_gpu_util_page->inflight++;
+    g_gpu_util_page->submits++;
+    g_gpu_util_page->last_submit_ns = timestamp_ns;
+    gpu_util_write_end_locked(sequence);
+    launch->util_accounted = true;
+}
+
+static void gpu_util_complete_locked(struct launch_staging *launch, bool timed_out)
+{
+    if (launch == NULL || !launch->util_accounted || g_gpu_util_page == NULL) {
+        return;
+    }
+
+    uint64_t timestamp_ns = now_ns();
+    uint64_t sequence = gpu_util_write_begin_locked();
+    if (g_gpu_util_page->inflight != 0) {
+        g_gpu_util_page->inflight--;
+    }
+    if (timed_out) {
+        g_gpu_util_page->timeouts++;
+    } else {
+        g_gpu_util_page->completes++;
+    }
+    g_gpu_util_page->last_complete_ns = timestamp_ns;
+
+    if (g_gpu_util_page->inflight == 0 && g_gpu_util_page->active_start_ns != 0) {
+        uint32_t slot = g_gpu_util_page->interval_head;
+        g_gpu_util_page->intervals[slot].start_ns = g_gpu_util_page->active_start_ns;
+        g_gpu_util_page->intervals[slot].end_ns = timestamp_ns;
+        g_gpu_util_page->interval_head =
+            (slot + 1U) % LANXIN_GPU_UTIL_INTERVAL_CAPACITY;
+        if (g_gpu_util_page->interval_count < LANXIN_GPU_UTIL_INTERVAL_CAPACITY) {
+            g_gpu_util_page->interval_count++;
+        }
+        g_gpu_util_page->active_start_ns = 0;
+    }
+    gpu_util_write_end_locked(sequence);
+    launch->util_accounted = false;
+}
+
+__attribute__((destructor)) static void cleanup_process_accounting(void)
 {
     const char *dir = accounting_dir();
     char path[PATH_MAX];
     int written = snprintf(path, sizeof(path), "%s/%ld.mem", dir, (long)getpid());
     if (written > 0 && (size_t)written < sizeof(path)) {
         unlink(path);
+    }
+    written = snprintf(path, sizeof(path), "%s/%ld.util", dir, (long)getpid());
+    if (written > 0 && (size_t)written < sizeof(path)) {
+        unlink(path);
+    }
+    if (g_gpu_util_page != NULL) {
+        munmap(g_gpu_util_page, sizeof(*g_gpu_util_page));
+        g_gpu_util_page = NULL;
+    }
+    if (g_gpu_util_fd >= 0) {
+        close(g_gpu_util_fd);
+        g_gpu_util_fd = -1;
     }
 }
 
@@ -3291,6 +3426,7 @@ static int rm_poll_launch_completion_locked(struct launch_staging *launch,
                    require_qmd_release ? 1 : 0,
                    (unsigned long long)completion->reserved[0]);
             rm_trace_channel_state_locked("completion-timeout");
+            gpu_util_complete_locked(launch, true);
             return -1;
         }
         if (elapsed_ns < spin_us * 1000ULL) {
@@ -3309,6 +3445,7 @@ static int rm_poll_launch_completion_locked(struct launch_staging *launch,
            completion->qmd_done, completion->expected_qmd_done,
            require_qmd_release ? 1 : 0,
            (unsigned long long)completion->reserved[0]);
+    gpu_util_complete_locked(launch, completion->status != LANXIN_COMPLETION_DONE);
     return completion->status == LANXIN_COMPLETION_DONE ? 0 : -1;
 }
 
@@ -3338,12 +3475,14 @@ static int rm_wait_all_launches_locked(void)
 static void rm_release_launch_slots_locked(void)
 {
     for (size_t slot = 0; slot < LANXIN_LAUNCH_SLOTS; slot++) {
+        gpu_util_complete_locked(&g.rm_launch[slot], true);
         rm_stage_release_locked(&g.rm_launch[slot].pushbuffer);
         rm_stage_release_locked(&g.rm_launch[slot].qmd);
         rm_stage_release_locked(&g.rm_launch[slot].params);
         rm_stage_release_locked(&g.rm_launch[slot].completion);
         g.rm_launch[slot].launch_id = 0;
         g.rm_launch[slot].qmd_offset = 0;
+        g.rm_launch[slot].util_accounted = false;
         g.rm_launch_pending[slot] = false;
     }
 }
@@ -3704,6 +3843,9 @@ static int rm_submit_compute_set_object_locked(CUfunction f, const struct launch
     rm_channel_kickoff_locked(old_put, g.rm_gpfifo_put);
     if (qmd_requested && qmd_ready) {
         g.rm_launch_pending[launch_slot] = true;
+        if (completion != NULL && completion->qmd_submitted != 0) {
+            gpu_util_submit_locked(launch);
+        }
     }
     tracef("RM submitted compute PB channel=0x%x compute=0x%x class=0x%x put=%u entry=%u/%u words=%u/%u pb=0x%llx progress=0x%llx token=0x%08x doorbell=0x%08x qmd_ready=%d qmd_requested=%d qmd_submitted=%d",
            g.rm_channel, g.rm_compute, g.rm_compute_class, g.rm_gpfifo_put,

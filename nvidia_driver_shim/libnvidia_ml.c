@@ -1,16 +1,22 @@
 #define _GNU_SOURCE
 #include "../include/nvml.h"
 #include "../include/cuda.h"
+#include "gpu_util_accounting.h"
 
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -21,8 +27,10 @@
 
 #define MAX_NVML_DEVICES 16U
 #define MAX_NVML_PROCS 256U
-#define MAX_UTIL_TRACKED_PROCS 512U
 #define DEFAULT_ACCOUNTING_DIR "/tmp/lanxin_nvidia_cuda_accounting"
+#define DEFAULT_UTIL_WINDOW_MS 1000ULL
+#define MIN_UTIL_WINDOW_MS 100ULL
+#define MAX_UTIL_WINDOW_MS 10000ULL
 
 struct nvmlDevice_st {
     unsigned int index;
@@ -41,17 +49,9 @@ typedef struct {
     unsigned int decUtil;
 } nvmlProcessUtilizationSample_t;
 
-struct util_sample {
-    pid_t pid;
-    unsigned long long cpu_ticks;
-    double uptime_seconds;
-    unsigned int last_util;
-};
-
-static struct util_sample g_util_samples[MAX_UTIL_TRACKED_PROCS];
-
 static int process_has_nvidia_fd(pid_t pid);
 static int process_is_monitor(pid_t pid);
+static const char *accounting_dir(void);
 
 static void trim(char *s)
 {
@@ -113,74 +113,6 @@ static int read_hex_file(const char *path, unsigned int *value)
     return 0;
 }
 
-static double read_uptime_seconds(void)
-{
-    FILE *f = fopen("/proc/uptime", "r");
-    if (f == NULL) {
-        return 0.0;
-    }
-    double uptime = 0.0;
-    if (fscanf(f, "%lf", &uptime) != 1) {
-        uptime = 0.0;
-    }
-    fclose(f);
-    return uptime;
-}
-
-static int read_process_cpu_ticks(pid_t pid, unsigned long long *cpu_ticks, double *age_seconds)
-{
-    if (cpu_ticks == NULL || age_seconds == NULL) {
-        return -1;
-    }
-
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
-    FILE *f = fopen(path, "r");
-    if (f == NULL) {
-        return -1;
-    }
-    char line[4096];
-    if (fgets(line, sizeof(line), f) == NULL) {
-        fclose(f);
-        return -1;
-    }
-    fclose(f);
-
-    char *rp = strrchr(line, ')');
-    if (rp == NULL || rp[1] == '\0') {
-        return -1;
-    }
-
-    unsigned long long utime = 0;
-    unsigned long long stime = 0;
-    unsigned long long starttime = 0;
-    unsigned int field = 3;
-    char *save = NULL;
-    for (char *tok = strtok_r(rp + 2, " ", &save); tok != NULL; tok = strtok_r(NULL, " ", &save), field++) {
-        if (field == 14) {
-            utime = strtoull(tok, NULL, 10);
-        } else if (field == 15) {
-            stime = strtoull(tok, NULL, 10);
-        } else if (field == 22) {
-            starttime = strtoull(tok, NULL, 10);
-            break;
-        }
-    }
-    if (utime == 0 && stime == 0 && starttime == 0) {
-        return -1;
-    }
-
-    long hz = sysconf(_SC_CLK_TCK);
-    if (hz <= 0) {
-        hz = 100;
-    }
-    double uptime = read_uptime_seconds();
-    double process_start = (double)starttime / (double)hz;
-    *cpu_ticks = utime + stime;
-    *age_seconds = uptime > process_start ? uptime - process_start : 0.0;
-    return 0;
-}
-
 static unsigned int clamp_percent(double value)
 {
     if (value <= 0.0) {
@@ -192,50 +124,221 @@ static unsigned int clamp_percent(double value)
     return (unsigned int)(value + 0.5);
 }
 
-static unsigned int estimate_process_gpu_util(pid_t pid)
+static uint64_t now_monotonic_ns(void)
 {
-    unsigned long long cpu_ticks = 0;
-    double age_seconds = 0.0;
-    if (read_process_cpu_ticks(pid, &cpu_ticks, &age_seconds) != 0) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t gpu_util_window_ns(void)
+{
+    unsigned long long window_ms = DEFAULT_UTIL_WINDOW_MS;
+    const char *value = getenv("LANXIN_NVIDIA_CUDA_UTIL_WINDOW_MS");
+    if (value != NULL && value[0] != '\0') {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(value, &end, 0);
+        if (errno == 0 && end != value) {
+            window_ms = parsed;
+        }
+    }
+    if (window_ms < MIN_UTIL_WINDOW_MS) {
+        window_ms = MIN_UTIL_WINDOW_MS;
+    } else if (window_ms > MAX_UTIL_WINDOW_MS) {
+        window_ms = MAX_UTIL_WINDOW_MS;
+    }
+    return window_ms * 1000000ULL;
+}
+
+struct busy_range {
+    uint64_t start_ns;
+    uint64_t end_ns;
+};
+
+struct busy_ranges {
+    struct busy_range *items;
+    size_t count;
+    size_t capacity;
+};
+
+static int append_busy_range(struct busy_ranges *ranges, uint64_t start_ns,
+                             uint64_t end_ns, uint64_t window_start_ns,
+                             uint64_t now_ns)
+{
+    if (end_ns > now_ns) {
+        end_ns = now_ns;
+    }
+    if (start_ns < window_start_ns) {
+        start_ns = window_start_ns;
+    }
+    if (start_ns >= end_ns) {
+        return 0;
+    }
+    if (ranges->count == ranges->capacity) {
+        size_t new_capacity = ranges->capacity == 0 ? 128U : ranges->capacity * 2U;
+        struct busy_range *new_items =
+            realloc(ranges->items, new_capacity * sizeof(*new_items));
+        if (new_items == NULL) {
+            return -1;
+        }
+        ranges->items = new_items;
+        ranges->capacity = new_capacity;
+    }
+    ranges->items[ranges->count].start_ns = start_ns;
+    ranges->items[ranges->count].end_ns = end_ns;
+    ranges->count++;
+    return 0;
+}
+
+static int read_process_gpu_util_accounting(pid_t pid,
+                                            struct lanxin_gpu_util_accounting *snapshot)
+{
+    char path[PATH_MAX];
+    int written = snprintf(path, sizeof(path), "%s/%ld.util",
+                           accounting_dir(), (long)pid);
+    if (written <= 0 || (size_t)written >= sizeof(path)) {
+        return -1;
+    }
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(*snapshot)) {
+        close(fd);
+        return -1;
+    }
+    void *mapping = mmap(NULL, sizeof(*snapshot), PROT_READ, MAP_SHARED, fd, 0);
+    if (mapping == MAP_FAILED) {
+        close(fd);
+        return -1;
+    }
+
+    const struct lanxin_gpu_util_accounting *page =
+        (const struct lanxin_gpu_util_accounting *)mapping;
+    int result = -1;
+    for (unsigned int attempt = 0; attempt < 5; attempt++) {
+        uint64_t sequence_before =
+            __atomic_load_n(&page->sequence, __ATOMIC_ACQUIRE);
+        if ((sequence_before & 1U) != 0) {
+            sched_yield();
+            continue;
+        }
+        memcpy(snapshot, page, sizeof(*snapshot));
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        uint64_t sequence_after =
+            __atomic_load_n(&page->sequence, __ATOMIC_ACQUIRE);
+        if (sequence_before != sequence_after || (sequence_after & 1U) != 0) {
+            continue;
+        }
+        if (snapshot->magic == LANXIN_GPU_UTIL_ACCOUNTING_MAGIC &&
+            snapshot->version == LANXIN_GPU_UTIL_ACCOUNTING_VERSION &&
+            snapshot->size == sizeof(*snapshot) &&
+            snapshot->pid == (uint64_t)pid) {
+            result = 0;
+        }
+        break;
+    }
+    munmap(mapping, sizeof(*snapshot));
+    close(fd);
+    return result;
+}
+
+static int collect_process_busy_ranges(pid_t pid, uint64_t now_ns,
+                                       uint64_t window_start_ns,
+                                       struct busy_ranges *ranges)
+{
+    struct lanxin_gpu_util_accounting snapshot;
+    if (read_process_gpu_util_accounting(pid, &snapshot) != 0) {
         return 0;
     }
 
-    long hz = sysconf(_SC_CLK_TCK);
-    if (hz <= 0) {
-        hz = 100;
+    uint32_t count = snapshot.interval_count;
+    if (count > LANXIN_GPU_UTIL_INTERVAL_CAPACITY) {
+        count = LANXIN_GPU_UTIL_INTERVAL_CAPACITY;
     }
-    double uptime = read_uptime_seconds();
-    struct util_sample *slot = NULL;
-    struct util_sample *empty = NULL;
-    for (unsigned int i = 0; i < MAX_UTIL_TRACKED_PROCS; i++) {
-        if (g_util_samples[i].pid == pid) {
-            slot = &g_util_samples[i];
-            break;
+    uint32_t first =
+        (snapshot.interval_head + LANXIN_GPU_UTIL_INTERVAL_CAPACITY - count) %
+        LANXIN_GPU_UTIL_INTERVAL_CAPACITY;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t slot = (first + i) % LANXIN_GPU_UTIL_INTERVAL_CAPACITY;
+        if (append_busy_range(ranges,
+                              snapshot.intervals[slot].start_ns,
+                              snapshot.intervals[slot].end_ns,
+                              window_start_ns, now_ns) != 0) {
+            return -1;
         }
-        if (empty == NULL && g_util_samples[i].pid == 0) {
-            empty = &g_util_samples[i];
+    }
+    if (snapshot.inflight != 0 && snapshot.active_start_ns != 0) {
+        return append_busy_range(ranges, snapshot.active_start_ns, now_ns,
+                                 window_start_ns, now_ns);
+    }
+    return 0;
+}
+
+static int compare_busy_ranges(const void *lhs, const void *rhs)
+{
+    const struct busy_range *a = lhs;
+    const struct busy_range *b = rhs;
+    if (a->start_ns < b->start_ns) {
+        return -1;
+    }
+    if (a->start_ns > b->start_ns) {
+        return 1;
+    }
+    if (a->end_ns < b->end_ns) {
+        return -1;
+    }
+    return a->end_ns > b->end_ns;
+}
+
+static uint64_t union_busy_ns(struct busy_ranges *ranges)
+{
+    if (ranges->count == 0) {
+        return 0;
+    }
+    qsort(ranges->items, ranges->count, sizeof(*ranges->items),
+          compare_busy_ranges);
+    uint64_t total = 0;
+    uint64_t start = ranges->items[0].start_ns;
+    uint64_t end = ranges->items[0].end_ns;
+    for (size_t i = 1; i < ranges->count; i++) {
+        if (ranges->items[i].start_ns <= end) {
+            if (ranges->items[i].end_ns > end) {
+                end = ranges->items[i].end_ns;
+            }
+            continue;
         }
+        total += end - start;
+        start = ranges->items[i].start_ns;
+        end = ranges->items[i].end_ns;
     }
-    if (slot == NULL) {
-        slot = empty != NULL ? empty : &g_util_samples[(unsigned int)pid % MAX_UTIL_TRACKED_PROCS];
-        memset(slot, 0, sizeof(*slot));
-        slot->pid = pid;
-    }
+    return total + end - start;
+}
 
-    double util = 0.0;
-    double elapsed = uptime - slot->uptime_seconds;
-    if (slot->uptime_seconds > 0.0 && elapsed >= 0.05 && cpu_ticks >= slot->cpu_ticks) {
-        util = ((double)(cpu_ticks - slot->cpu_ticks) / (double)hz) * 100.0 / elapsed;
-    } else if (slot->uptime_seconds > 0.0 && elapsed < 0.05) {
-        util = (double)slot->last_util;
-    } else if (age_seconds > 0.0) {
-        util = ((double)cpu_ticks / (double)hz) * 100.0 / age_seconds;
-    }
+static unsigned int ranges_to_util(struct busy_ranges *ranges, uint64_t window_ns)
+{
+    uint64_t busy_ns = union_busy_ns(ranges);
+    return clamp_percent((double)busy_ns * 100.0 / (double)window_ns);
+}
 
-    slot->cpu_ticks = cpu_ticks;
-    slot->uptime_seconds = uptime;
-    slot->last_util = clamp_percent(util);
-    return slot->last_util;
+static unsigned int process_gpu_util(pid_t pid)
+{
+    uint64_t now_ns = now_monotonic_ns();
+    uint64_t window_ns = gpu_util_window_ns();
+    uint64_t window_start_ns = now_ns > window_ns ? now_ns - window_ns : 0;
+    struct busy_ranges ranges = {0};
+    if (collect_process_busy_ranges(pid, now_ns, window_start_ns, &ranges) != 0) {
+        free(ranges.items);
+        return 0;
+    }
+    unsigned int util = ranges_to_util(&ranges, window_ns);
+    free(ranges.items);
+    return util;
 }
 
 static unsigned int scan_total_process_gpu_util(void)
@@ -245,7 +348,10 @@ static unsigned int scan_total_process_gpu_util(void)
         return 0;
     }
 
-    unsigned int total = 0;
+    uint64_t now_ns = now_monotonic_ns();
+    uint64_t window_ns = gpu_util_window_ns();
+    uint64_t window_start_ns = now_ns > window_ns ? now_ns - window_ns : 0;
+    struct busy_ranges ranges = {0};
     pid_t self = getpid();
     struct dirent *de = NULL;
     while ((de = readdir(dir)) != NULL) {
@@ -254,21 +360,25 @@ static unsigned int scan_total_process_gpu_util(void)
         }
         char *end = NULL;
         long parsed = strtol(de->d_name, &end, 10);
-        if (end == de->d_name || *end != '\0' || parsed <= 0 || parsed == (long)self) {
+        if (end == de->d_name || *end != '\0' || parsed <= 0 ||
+            parsed == (long)self) {
             continue;
         }
         pid_t pid = (pid_t)parsed;
         if (process_is_monitor(pid) || !process_has_nvidia_fd(pid)) {
             continue;
         }
-        total += estimate_process_gpu_util(pid);
-        if (total >= 100) {
-            total = 100;
-            break;
+        if (collect_process_busy_ranges(pid, now_ns, window_start_ns,
+                                        &ranges) != 0) {
+            free(ranges.items);
+            closedir(dir);
+            return 0;
         }
     }
     closedir(dir);
-    return total;
+    unsigned int util = ranges_to_util(&ranges, window_ns);
+    free(ranges.items);
+    return util;
 }
 
 static unsigned long long now_timestamp_us(void)
@@ -998,7 +1108,7 @@ nvmlReturn_t nvmlDeviceGetProcessUtilization(nvmlDevice_t device, nvmlProcessUti
             memset(&utilization[found], 0, sizeof(utilization[found]));
             utilization[found].pid = (unsigned int)pid;
             utilization[found].timeStamp = timestamp;
-            utilization[found].smUtil = estimate_process_gpu_util(pid);
+            utilization[found].smUtil = process_gpu_util(pid);
             utilization[found].memUtil = bytes != NVML_VALUE_NOT_AVAILABLE && bytes != 0 ? 1U : 0U;
         }
         found++;
