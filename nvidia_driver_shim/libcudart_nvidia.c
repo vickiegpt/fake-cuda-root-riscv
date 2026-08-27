@@ -26,6 +26,12 @@
 #ifdef cudaGetDeviceProperties
 #undef cudaGetDeviceProperties
 #endif
+#ifdef cudaGetDriverEntryPoint
+#undef cudaGetDriverEntryPoint
+#endif
+#ifdef cudaGetDriverEntryPointByVersion
+#undef cudaGetDriverEntryPointByVersion
+#endif
 
 #define LANXIN_CUDART_STREAM_MAGIC 0x4c584e5643545351ULL
 #define LANXIN_CUDART_EVENT_MAGIC  0x4c584e5643544551ULL
@@ -305,6 +311,44 @@ cudaError_t CUDARTAPI cudaGetDeviceCount(int *count)
     }
     *count = err == cudaSuccess ? n : 0;
     return set_last(err);
+}
+
+static cudaError_t get_driver_entry_point(
+    const char *symbol,
+    void **func_ptr,
+    unsigned int cuda_version,
+    unsigned long long flags,
+    enum cudaDriverEntryPointQueryResult *driver_status)
+{
+    if (symbol == NULL || func_ptr == NULL) {
+        return set_last(cudaErrorInvalidValue);
+    }
+    CUdriverProcAddressQueryResult status = CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND;
+    CUresult result = cuGetProcAddress_v2(
+        symbol, func_ptr, (int)cuda_version, (cuuint64_t)flags, &status);
+    if (driver_status != NULL) {
+        *driver_status = (enum cudaDriverEntryPointQueryResult)status;
+    }
+    return set_last(from_cu(result));
+}
+
+cudaError_t CUDARTAPI cudaGetDriverEntryPoint(
+    const char *symbol,
+    void **funcPtr,
+    unsigned long long flags,
+    enum cudaDriverEntryPointQueryResult *driverStatus)
+{
+    return get_driver_entry_point(symbol, funcPtr, 12090U, flags, driverStatus);
+}
+
+cudaError_t CUDARTAPI cudaGetDriverEntryPointByVersion(
+    const char *symbol,
+    void **funcPtr,
+    unsigned int cudaVersion,
+    unsigned long long flags,
+    enum cudaDriverEntryPointQueryResult *driverStatus)
+{
+    return get_driver_entry_point(symbol, funcPtr, cudaVersion, flags, driverStatus);
 }
 
 cudaError_t CUDARTAPI cudaGetDevice(int *device)

@@ -106,6 +106,7 @@ exec "$CLANG" \
     --cuda-path="$CUDA_HOME" \
     -I"$CUDA_HOME/include" \
     --gcc-install-dir=/usr/lib/gcc/riscv64-linux-gnu/13 \
+    -w \
     -Wno-unknown-cuda-version \
     -Wno-unknown-warning-option \
     "${ARGS[@]}"

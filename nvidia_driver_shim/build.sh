@@ -3,7 +3,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CC="${CC:-gcc}"
+AR="${AR:-ar}"
 CFLAGS="${CFLAGS:-}"
+
+compat_link=()
+if [[ -f "$ROOT/lib64/libcuda_compat_stubs.so" ]]; then
+  compat_link=(
+    -L"$ROOT/lib64"
+    -Wl,--no-as-needed
+    -l:libcuda_compat_stubs.so
+    -Wl,--as-needed
+  )
+fi
 
 mkdir -p "$ROOT/lib64" "$ROOT/nvidia_driver_shim/build"
 
@@ -12,7 +23,9 @@ mkdir -p "$ROOT/lib64" "$ROOT/nvidia_driver_shim/build"
   -Wl,-soname,libcuda.so.1 \
   -o "$ROOT/lib64/libcuda_nvidia.so.1" \
   "$ROOT/nvidia_driver_shim/libcuda_nvidia.c" \
-  -lpthread
+  -lpthread -lm
+ln -sfn libcuda_nvidia.so.1 "$ROOT/lib64/libcuda.so.1"
+ln -sfn libcuda_nvidia.so.1 "$ROOT/lib64/libcuda.so"
 
 "$CC" -shared -fPIC -O2 -g -Wall -Wextra -Wno-unused-parameter \
   -I"$ROOT/include" $CFLAGS \
@@ -27,9 +40,15 @@ ln -sfn libnvidia-ml.so.1 "$ROOT/lib64/libnvidia-ml.so"
   -Wl,-soname,libcudart.so.12 \
   -o "$ROOT/lib64/libcudart_nvidia.so.12" \
   "$ROOT/nvidia_driver_shim/libcudart_nvidia.c" \
-  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" -l:libcuda_nvidia.so.1 -lpthread
+  -L"$ROOT/lib64" -Wl,-rpath,"$ROOT/lib64" -l:libcuda_nvidia.so.1 \
+  "${compat_link[@]}" -lpthread
 ln -sfn libcudart_nvidia.so.12 "$ROOT/lib64/libcudart.so.12"
 ln -sfn libcudart_nvidia.so.12 "$ROOT/lib64/libcudart.so"
+# CMake's CUDA runtime target links these archives in addition to libcudart.so.
+# The fake runtime implements registration/runtime APIs in the shared shim, so
+# compatibility archives only need to exist for the standard linker contract.
+"$AR" rcs "$ROOT/lib64/libcudadevrt.a"
+"$AR" rcs "$ROOT/lib64/libcudart_static.a"
 
 "$CC" -shared -fPIC -O2 -g -Wall -Wextra -Wno-unused-parameter \
   -I"$ROOT/include" $CFLAGS \
@@ -80,6 +99,8 @@ ln -sfn libcublas_nvidia.so.12 "$ROOT/lib64/libcublas.so"
 echo "built $ROOT/lib64/libcuda_nvidia.so.1"
 echo "built $ROOT/lib64/libnvidia-ml.so.1"
 echo "built $ROOT/lib64/libcudart_nvidia.so.12"
+echo "built $ROOT/lib64/libcudadevrt.a"
+echo "built $ROOT/lib64/libcudart_static.a"
 echo "built $ROOT/lib64/libcublas_nvidia.so.12"
 echo "built $ROOT/nvidia_driver_shim/build/cuda_probe"
 echo "built $ROOT/nvidia_driver_shim/build/launch_probe"
